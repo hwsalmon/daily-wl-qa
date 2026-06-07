@@ -15,6 +15,7 @@ subtracted from all cardinal-angle displacements to isolate true mechanical walk
 
 import os
 import sys
+import sqlite3
 import datetime
 import numpy as np
 from pathlib import Path
@@ -98,6 +99,20 @@ VOID_AREA_MAX_RATIO = 4.0
 
 MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
+
+MACHINES = [
+    "Elekta VersaHD 153991",
+    "Elekta VersaHD 156724",
+    "Elekta VersaHD 154613",
+]
+
+PHYSICISTS = [
+    "Howard W. Salmon, PhD, DABR",
+    "Shawn Hollars, MS, DABR",
+    "Logen Hall, MS, DABR",
+]
+
+DB_PATH = Path(__file__).parent / "wl_qa_history.db"
 
 
 # ── DICOM loading ─────────────────────────────────────────────────────────────
@@ -675,8 +690,8 @@ class WLApp(ctk.CTk):
         super().__init__()
 
         self.title("Winston-Lutz Daily QA  —  Elekta Versa HD / MIMI Phantom")
-        self.geometry("960x680")
-        self.minsize(820, 600)
+        self.geometry("1160x860")
+        self.minsize(960, 720)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -685,8 +700,15 @@ class WLApp(ctk.CTk):
         self._image_results = None
         self._loaded_dir    = None
         self._diag_fig_path = None
+        self._dicom_date    = None   # datetime.date from DICOM header
         self._table_labels: dict = {}
+        self._diag_ctk_img  = None   # keep CTkImage reference to prevent GC
 
+        # Selections (defaulting to first option)
+        self._machine_var   = tk.StringVar(value=MACHINES[0])
+        self._physicist_var = tk.StringVar(value=PHYSICISTS[0])
+
+        _init_db()
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -694,47 +716,80 @@ class WLApp(ctk.CTk):
     def _build_ui(self):
         # ── Top bar ──────────────────────────────────────────────────────────
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=20, pady=(18, 8))
+        top.pack(fill="x", padx=20, pady=(18, 6))
 
         ctk.CTkLabel(
             top,
             text="Winston-Lutz Daily QA",
-            font=ctk.CTkFont(size=22, weight="bold"),
+            font=ctk.CTkFont(size=24, weight="bold"),
         ).pack(side="left")
 
         self._load_btn = ctk.CTkButton(
             top,
             text="Load DICOM Directory",
             command=self._load_directory,
-            width=190,
-            font=ctk.CTkFont(size=13),
+            width=210,
+            font=ctk.CTkFont(size=14),
         )
         self._load_btn.pack(side="right")
 
         self._dir_label = ctk.CTkLabel(
             top,
             text="No directory loaded",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray",
         )
-        self._dir_label.pack(side="right", padx=12)
+        self._dir_label.pack(side="right", padx=14)
+
+        # ── Selector bar (machine + physicist) ───────────────────────────────
+        sel = ctk.CTkFrame(self, fg_color="transparent")
+        sel.pack(fill="x", padx=20, pady=(0, 6))
+
+        ctk.CTkLabel(sel, text="Machine:",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        ctk.CTkOptionMenu(
+            sel,
+            values=MACHINES,
+            variable=self._machine_var,
+            width=240,
+            font=ctk.CTkFont(size=14),
+            dropdown_font=ctk.CTkFont(size=14),
+        ).pack(side="left", padx=(6, 24))
+
+        ctk.CTkLabel(sel, text="Physicist:",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        ctk.CTkOptionMenu(
+            sel,
+            values=PHYSICISTS,
+            variable=self._physicist_var,
+            width=300,
+            font=ctk.CTkFont(size=14),
+            dropdown_font=ctk.CTkFont(size=14),
+        ).pack(side="left", padx=(6, 0))
 
         # ── PASS / FAIL banner ────────────────────────────────────────────────
-        self._pf_frame = ctk.CTkFrame(self, corner_radius=10, height=72)
+        self._pf_frame = ctk.CTkFrame(self, corner_radius=10, height=85)
         self._pf_frame.pack(fill="x", padx=20, pady=4)
         self._pf_frame.pack_propagate(False)
 
         self._pf_label = ctk.CTkLabel(
             self._pf_frame,
             text="—  AWAITING DATA  —",
-            font=ctk.CTkFont(size=26, weight="bold"),
+            font=ctk.CTkFont(size=30, weight="bold"),
             text_color="gray",
         )
         self._pf_label.pack(expand=True)
 
-        # ── Results tables ────────────────────────────────────────────────────
-        tables_row = ctk.CTkFrame(self, fg_color="transparent")
-        tables_row.pack(fill="both", expand=True, padx=20, pady=6)
+        # ── Tab view: Results | Portal Images ────────────────────────────────
+        self._tabview = ctk.CTkTabview(self, anchor="nw")
+        self._tabview.pack(fill="both", expand=True, padx=20, pady=6)
+
+        tab_res = self._tabview.add("Results")
+        tab_img = self._tabview.add("Portal Images")
+
+        # ── Results tab: two displacement cards side by side ─────────────────
+        tables_row = ctk.CTkFrame(tab_res, fg_color="transparent")
+        tables_row.pack(fill="both", expand=True)
 
         left_card = ctk.CTkFrame(tables_row, corner_radius=10)
         left_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
@@ -742,12 +797,12 @@ class WLApp(ctk.CTk):
         ctk.CTkLabel(
             left_card,
             text="Raw Displacements  (Field → Void)",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(pady=(12, 2))
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(pady=(14, 2))
         ctk.CTkLabel(
             left_card,
             text="Includes CBCT setup error",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color="gray",
         ).pack(pady=(0, 6))
 
@@ -761,18 +816,31 @@ class WLApp(ctk.CTk):
         ctk.CTkLabel(
             right_card,
             text="Corrected Displacements  (MEC setup error removed)",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(pady=(12, 2))
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(pady=(14, 2))
         ctk.CTkLabel(
             right_card,
             text="Mechanical walk  (all 4 angles used to estimate setup error)",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color="gray",
         ).pack(pady=(0, 6))
 
         corr_tbl = ctk.CTkFrame(right_card, fg_color="transparent")
         corr_tbl.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         self._build_result_table(corr_tbl, prefix="corr")
+
+        # ── Portal Images tab ─────────────────────────────────────────────────
+        img_outer = ctk.CTkFrame(tab_img, fg_color="transparent")
+        img_outer.pack(fill="both", expand=True, padx=6, pady=6)
+        # Plain tk.Label — works with tk.PhotoImage without requiring PIL.ImageTk
+        self._diag_img_label = tk.Label(
+            img_outer,
+            text="Load a DICOM directory to view portal images",
+            font=("Helvetica", 14),
+            fg="#888888",
+            bg="#2b2b2b",
+        )
+        self._diag_img_label.pack(expand=True, pady=40)
 
         # ── Bottom bar ────────────────────────────────────────────────────────
         bottom = ctk.CTkFrame(self, fg_color="transparent")
@@ -781,7 +849,7 @@ class WLApp(ctk.CTk):
         self._walk_label = ctk.CTkLabel(
             bottom,
             text=f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=15),
         )
         self._walk_label.pack(side="left")
 
@@ -789,11 +857,20 @@ class WLApp(ctk.CTk):
             bottom,
             text="Generate Daily Report (PDF)",
             command=self._generate_report,
-            width=210,
+            width=230,
             state="disabled",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=14),
         )
         self._report_btn.pack(side="right")
+
+        self._trends_btn = ctk.CTkButton(
+            bottom,
+            text="View Trends",
+            command=self._show_trends,
+            width=150,
+            font=ctk.CTkFont(size=14),
+        )
+        self._trends_btn.pack(side="right", padx=(0, 10))
 
     def _build_result_table(self, parent: ctk.CTkFrame, prefix: str):
         headers = ["Angle", "ΔX (mm)", "ΔY (mm)", "|ΔR| (mm)"]
@@ -802,9 +879,9 @@ class WLApp(ctk.CTk):
             ctk.CTkLabel(
                 parent,
                 text=h,
-                font=ctk.CTkFont(size=11, weight="bold"),
+                font=ctk.CTkFont(size=15, weight="bold"),
                 text_color="#aaaaaa",
-            ).grid(row=0, column=c, sticky="ew", padx=4, pady=2)
+            ).grid(row=0, column=c, sticky="ew", padx=4, pady=4)
 
         sep = ctk.CTkFrame(parent, height=1, fg_color="#3a3a3a")
         sep.grid(row=1, column=0, columnspan=4, sticky="ew", padx=2, pady=3)
@@ -814,17 +891,17 @@ class WLApp(ctk.CTk):
             ctk.CTkLabel(
                 parent,
                 text=f"G{angle:03d}°",
-                font=ctk.CTkFont(size=13, weight="bold"),
-            ).grid(row=row, column=0, sticky="ew", padx=4, pady=7)
+                font=ctk.CTkFont(size=17, weight="bold"),
+            ).grid(row=row, column=0, sticky="ew", padx=4, pady=9)
 
             for c, suffix in enumerate(["dx", "dy", "dr"], start=1):
                 key = f"{prefix}_{angle}_{suffix}"
                 lbl = ctk.CTkLabel(
                     parent,
                     text="—",
-                    font=ctk.CTkFont(size=13, family="Courier"),
+                    font=ctk.CTkFont(size=17, family="Courier"),
                 )
-                lbl.grid(row=row, column=c, sticky="ew", padx=4, pady=7)
+                lbl.grid(row=row, column=c, sticky="ew", padx=4, pady=9)
                 self._table_labels[key] = lbl
 
     # ── Event handlers ────────────────────────────────────────────────────────
@@ -843,6 +920,22 @@ class WLApp(ctk.CTk):
             dcm_images      = load_dicom_images(directory)
             image_results   = {a: analyze_image(ds) for a, ds in dcm_images.items()}
             wl_results      = compute_wl_results(image_results)
+
+            # Extract acquisition date from DICOM header (YYYYMMDD → datetime.date)
+            self._dicom_date = None
+            for ds in dcm_images.values():
+                for tag in ("AcquisitionDate", "StudyDate", "ContentDate"):
+                    raw = getattr(ds, tag, None)
+                    if raw and len(str(raw)) == 8:
+                        try:
+                            self._dicom_date = datetime.datetime.strptime(
+                                str(raw), "%Y%m%d"
+                            ).date()
+                        except ValueError:
+                            pass
+                        break
+                if self._dicom_date:
+                    break
 
             self._image_results   = image_results
             self._wl_results      = wl_results
@@ -916,12 +1009,46 @@ class WLApp(ctk.CTk):
                 text=f"{corr_dr:.3f}", text_color=_color(corr_dr)
             )
 
+        self._update_diag_image()
+
+    def _update_diag_image(self):
+        """Render the diagnostic figure PNG into the Portal Images tab.
+
+        Uses tk.PhotoImage(data=<base64 PNG>) so PIL.ImageTk is not required —
+        only PIL.Image (which is always present via the reportlab dependency).
+        """
+        if not self._diag_fig_path or not os.path.exists(self._diag_fig_path):
+            return
+        try:
+            import io, base64
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(self._diag_fig_path)
+            self.update_idletasks()
+            avail_w = max(900, self.winfo_width() - 60)
+            scale_h = int(pil_img.height * avail_w / pil_img.width)
+            pil_img = pil_img.resize((avail_w, scale_h), PILImage.LANCZOS)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            tk_img = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+            self._diag_ctk_img = tk_img   # prevent garbage collection
+            self._diag_img_label.configure(image=tk_img, text="", bg="#111111")
+        except Exception as exc:
+            self._diag_img_label.configure(
+                text=f"Image display error:\n{exc}", image=""
+            )
+
     def _generate_report(self):
         if self._wl_results is None:
             messagebox.showwarning("No Data", "Load DICOM images first.")
             return
 
-        default_name = f"WL_QA_{datetime.date.today().strftime('%Y%m%d')}.pdf"
+        machine   = self._machine_var.get()
+        physicist = self._physicist_var.get()
+
+        default_name = (
+            f"WL_QA_{machine.replace(' ', '_')}_"
+            f"{datetime.date.today().strftime('%Y%m%d')}.pdf"
+        )
         save_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
@@ -937,10 +1064,182 @@ class WLApp(ctk.CTk):
                 self._image_results,
                 save_path,
                 diag_fig_path=self._diag_fig_path,
+                machine_name=machine,
+                physicist_name=physicist,
+                dicom_date=self._dicom_date,
             )
+            _save_to_db(self._wl_results, self._image_results, machine, physicist)
             messagebox.showinfo("Report Saved", f"Report saved to:\n{save_path}")
         except Exception as exc:
             messagebox.showerror("Report Error", str(exc))
+
+    def _show_trends(self):
+        """Open a window showing walk-circle-radius trend per machine."""
+        import tkinter as _tk
+        top = ctk.CTkToplevel(self)
+        top.title("Winston-Lutz Trend Analysis")
+        top.geometry("1000x680")
+
+        # Fetch data from DB
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur  = conn.cursor()
+            cur.execute(
+                "SELECT date, machine_name, walk_circle_r, pass_fail "
+                "FROM wl_records ORDER BY date ASC"
+            )
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as exc:
+            ctk.CTkLabel(top, text=f"Database error: {exc}",
+                         font=ctk.CTkFont(size=14)).pack(expand=True)
+            return
+
+        if not rows:
+            ctk.CTkLabel(
+                top,
+                text="No records in database yet.\nGenerate a report to save the first record.",
+                font=ctk.CTkFont(size=15),
+            ).pack(expand=True)
+            return
+
+        # Build per-machine data
+        from collections import defaultdict
+        machine_data: dict = defaultdict(list)
+        for date_str, mname, walk_r, pf in rows:
+            machine_data[mname].append((date_str, walk_r, bool(pf)))
+
+        machine_colors = ["#64b5f6", "#81c784", "#ffb74d", "#f06292", "#ce93d8"]
+
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#111111")
+        ax.set_facecolor("#1e1e1e")
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555555")
+        ax.set_xlabel("Date", color="white", fontsize=11)
+        ax.set_ylabel("Walk Circle Radius (mm)", color="white", fontsize=11)
+        ax.set_title("Winston-Lutz Walk Circle Radius — Trend by Machine",
+                     color="white", fontsize=13, fontweight="bold")
+
+        ax.axhline(TOLERANCE_MM, color="#ef5350", linewidth=1.5, linestyle="--",
+                   label=f"Tolerance ≤ {TOLERANCE_MM:.1f} mm")
+        ax.axhline(0.5, color="#ffa726", linewidth=1.0, linestyle=":",
+                   label="0.5 mm advisory")
+
+        for idx, (mname, pts) in enumerate(sorted(machine_data.items())):
+            col = machine_colors[idx % len(machine_colors)]
+            dates = [p[0] for p in pts]
+            vals  = [p[1] for p in pts]
+            passes = [p[2] for p in pts]
+            ax.plot(dates, vals, color=col, linewidth=1.5, marker="o",
+                    markersize=6, label=mname)
+            for x, y, ok in zip(dates, vals, passes):
+                ax.scatter([x], [y], color="#66bb6a" if ok else "#ef5350",
+                           s=55, zorder=5, edgecolors=col, linewidths=1)
+
+        ax.legend(facecolor="#2b2b2b", edgecolor="#555555", labelcolor="white",
+                  fontsize=9, loc="upper left")
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8,
+                 color="white")
+        fig.tight_layout()
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        canvas = FigureCanvasTkAgg(fig, master=top)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Records table below the chart
+        tbl_frame = ctk.CTkScrollableFrame(top, height=160)
+        tbl_frame.pack(fill="x", padx=10, pady=(0, 10))
+        hdrs = ["Date", "Machine", "Physicist", "Walk r (mm)", "Result"]
+        for c, h in enumerate(hdrs):
+            ctk.CTkLabel(tbl_frame, text=h,
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color="#aaaaaa").grid(
+                row=0, column=c, padx=8, pady=4, sticky="ew")
+            tbl_frame.columnconfigure(c, weight=1)
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur  = conn.cursor()
+            cur.execute(
+                "SELECT date, machine_name, physicist_name, walk_circle_r, pass_fail "
+                "FROM wl_records ORDER BY date DESC"
+            )
+            all_rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            all_rows = []
+
+        for ri, row in enumerate(all_rows, start=1):
+            date_s, mname, phys, walk_r, pf = row
+            vals_disp = [date_s, mname, phys, f"{walk_r:.3f}",
+                         "PASS" if pf else "FAIL"]
+            for c, val in enumerate(vals_disp):
+                col = "#66bb6a" if (c == 4 and pf) else ("#ef5350" if c == 4 else "white")
+                ctk.CTkLabel(tbl_frame, text=val,
+                             font=ctk.CTkFont(size=13),
+                             text_color=col).grid(
+                    row=ri, column=c, padx=8, pady=3, sticky="ew")
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+def _init_db():
+    """Create the wl_records table if it does not already exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wl_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            TEXT NOT NULL,
+            time            TEXT NOT NULL,
+            machine_name    TEXT NOT NULL,
+            physicist_name  TEXT NOT NULL,
+            walk_circle_r   REAL NOT NULL,
+            pass_fail       INTEGER NOT NULL,
+            baseline_dx     REAL,
+            baseline_dy     REAL,
+            raw_dx_G0       REAL, raw_dy_G0   REAL,
+            raw_dx_G90      REAL, raw_dy_G90  REAL,
+            raw_dx_G180     REAL, raw_dy_G180 REAL,
+            raw_dx_G270     REAL, raw_dy_G270 REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: str):
+    """Insert one QA session record into the database."""
+    now   = datetime.datetime.now()
+    pa    = wl_results["per_angle"]
+    conn  = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO wl_records (
+            date, time, machine_name, physicist_name,
+            walk_circle_r, pass_fail,
+            baseline_dx, baseline_dy,
+            raw_dx_G0,  raw_dy_G0,
+            raw_dx_G90, raw_dy_G90,
+            raw_dx_G180,raw_dy_G180,
+            raw_dx_G270,raw_dy_G270
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%H:%M"),
+            machine, physicist,
+            wl_results["walk_circle_r"],
+            1 if wl_results["pass_fail"] else 0,
+            wl_results["baseline_dx"],
+            wl_results["baseline_dy"],
+            pa[0]["raw_dx"],   pa[0]["raw_dy"],
+            pa[90]["raw_dx"],  pa[90]["raw_dy"],
+            pa[180]["raw_dx"], pa[180]["raw_dy"],
+            pa[270]["raw_dx"], pa[270]["raw_dy"],
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ── PDF report ────────────────────────────────────────────────────────────────
@@ -969,6 +1268,9 @@ def generate_pdf_report(
     image_results: dict,
     output_path: str,
     diag_fig_path: str | None = None,
+    machine_name: str = MACHINE_NAME,
+    physicist_name: str = "",
+    dicom_date: "datetime.date | None" = None,
 ):
     doc = SimpleDocTemplate(
         output_path,
@@ -1022,12 +1324,13 @@ def generate_pdf_report(
 
     # ── Header ────────────────────────────────────────────────────────────────
     story.append(Paragraph("Daily Winston-Lutz QA Report", title_style))
-    story.append(Paragraph(f"{MACHINE_NAME}  —  {PHANTOM_NAME}", sub_style))
+    story.append(Paragraph(f"{machine_name}  —  {PHANTOM_NAME}", sub_style))
     story.append(HRFlowable(width="100%", thickness=1, color=_BORDER, spaceAfter=8))
 
     # ── Metadata table ────────────────────────────────────────────────────────
-    today_str = datetime.date.today().strftime("%B %d, %Y")
-    time_str  = datetime.datetime.now().strftime("%H:%M")
+    report_date = dicom_date if dicom_date else datetime.date.today()
+    today_str   = report_date.strftime("%B %d, %Y")
+    time_str    = datetime.datetime.now().strftime("%H:%M")
     max_walk  = wl_results["max_2d_walk_mm"]
     passed    = wl_results["pass_fail"]
     baseline_dx = wl_results["baseline_dx"]
@@ -1035,18 +1338,21 @@ def generate_pdf_report(
     baseline_dr = np.sqrt(baseline_dx ** 2 + baseline_dy ** 2)
 
     meta_rows = [
-        ["Date:", today_str,        "Time:",        time_str],
-        ["Machine:", MACHINE_NAME,  "Phantom:",     PHANTOM_NAME],
-        ["Field Size:", f"{FIELD_SIZE_MM:.0f}×{FIELD_SIZE_MM:.0f} mm",
-         "Void Diameter:", f"{VOID_DIAMETER_MM:.1f} mm (air)"],
-        ["Tolerance:", f"≤ {TOLERANCE_MM:.1f} mm",
-         "MEC Setup Error:", f"{baseline_dr:.3f} mm  (ΔX={baseline_dx:+.3f}, ΔY={baseline_dy:+.3f})"],
+        ["Date:", today_str,           "Time:",        time_str],
+        ["Machine:", machine_name,     "Phantom:",     PHANTOM_NAME],
+        ["Physicist:", physicist_name, "Field Size:",  f"{FIELD_SIZE_MM:.0f}×{FIELD_SIZE_MM:.0f} mm"],
+        ["Void Diameter:", f"{VOID_DIAMETER_MM:.1f} mm (air)",
+         "Tolerance:", f"≤ {TOLERANCE_MM:.1f} mm"],
+        ["MEC Setup Error:",
+         f"{baseline_dr:.3f} mm  (ΔX={baseline_dx:+.3f}, ΔY={baseline_dy:+.3f})",
+         "", ""],
     ]
-    meta_tbl = Table(meta_rows, colWidths=[1.1*inch, 2.1*inch, 1.3*inch, 2.5*inch])
+    meta_tbl = Table(meta_rows, colWidths=[1.2*inch, 2.2*inch, 1.2*inch, 2.5*inch])
     meta_tbl.setStyle(TableStyle([
         ("FONTSIZE",   (0, 0), (-1, -1), 9),
         ("FONTNAME",   (0, 0), (0, -1),  "Helvetica-Bold"),
         ("FONTNAME",   (2, 0), (2, -1),  "Helvetica-Bold"),
+        ("SPAN",       (1, 4), (3, 4)),   # MEC value spans last 3 cols
         ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, _STRIPE]),
         ("GRID",       (0, 0), (-1, -1), 0.3, _BORDER),
         ("TOPPADDING", (0, 0), (-1, -1), 4),
@@ -1231,13 +1537,54 @@ def generate_pdf_report(
         note_style,
     ))
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    # ── Electronic Signature ──────────────────────────────────────────────────
     story.append(Spacer(1, 0.18 * inch))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=8))
+    story.append(Paragraph("Electronic Signature", h2_style))
+
+    sig_time = datetime.datetime.now()
+    sig_rows = [
+        ["Machine:", machine_name,    "Report Date:", today_str],
+        ["Physicist:", physicist_name, "Signed:",
+         f"{sig_time.strftime('%Y-%m-%d  %H:%M')}"],
+        ["Result:", ("PASS" if passed else "FAIL") +
+         f"   —   Walk Circle Radius = {max_walk:.3f} mm",
+         "Phantom:", PHANTOM_NAME],
+    ]
+    sig_tbl = Table(sig_rows, colWidths=[1.0*inch, 2.7*inch, 1.1*inch, 2.3*inch])
+    sig_bg   = _GREEN_LITE if passed else _RED_LITE
+    sig_tbl.setStyle(TableStyle([
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("FONTNAME",      (0, 0), (0, -1),  "Helvetica-Bold"),
+        ("FONTNAME",      (2, 0), (2, -1),  "Helvetica-Bold"),
+        ("FONTNAME",      (1, 2), (1, 2),   "Helvetica-Bold"),
+        ("TEXTCOLOR",     (1, 2), (1, 2),   _GREEN if passed else _RED),
+        ("BACKGROUND",    (0, 2), (-1, 2),  sig_bg),
+        ("ROWBACKGROUNDS",(0, 0), (-1, 1),  [colors.white, _STRIPE]),
+        ("GRID",          (0, 0), (-1, -1), 0.4, _BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sig_tbl)
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(Paragraph(
+        "This report was generated electronically by the Winston-Lutz QA Tool.  "
+        f"The physicist named above ({physicist_name}) reviewed and approved the results "
+        f"by initiating report generation on {sig_time.strftime('%B %d, %Y at %H:%M')}.  "
+        "This electronic signature is consistent with 21 CFR Part 11 intent for "
+        "medical physics QA documentation.",
+        ParagraphStyle("SigNote", parent=ss["Normal"], fontSize=8,
+                       textColor=colors.HexColor("#555555"), leading=11),
+    ))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.12 * inch))
     story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=4))
     story.append(Paragraph(
-        f"Generated by Winston-Lutz QA Tool v1.0  —  "
-        f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  —  "
-        f"{MACHINE_NAME}  /  {PHANTOM_NAME}",
+        f"Winston-Lutz QA Tool v1.0  —  "
+        f"Generated {sig_time.strftime('%Y-%m-%d %H:%M')}  —  "
+        f"{machine_name}  /  {PHANTOM_NAME}",
         footer_style,
     ))
 
