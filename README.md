@@ -1,0 +1,229 @@
+# Daily WL QA
+
+**Daily Winston-Lutz mechanical isocenter QA for Elekta Versa HD LINACs**
+using the Standard Imaging MIMI Phantom (6.4 mm air void).
+
+![App Icon](icon.png)
+
+---
+
+## What it does
+
+Loads four Elekta iViewGT portal DICOM images (G0 / G90 / G180 / G270),
+automatically detects the MIMI phantom air void in each image, computes the
+**radiation/mechanical walk circle** via the Minimum Enclosing Circle (MEC)
+algorithm, and generates a signed PDF QA report — in seconds.
+
+| Feature | Detail |
+|---------|--------|
+| **Input** | Elekta iViewGT RTIMAGE DICOM files (4 cardinal angles) |
+| **Phantom** | Standard Imaging MIMI — 6.4 mm air void |
+| **Algorithm** | MEC of all 4 raw displacement vectors |
+| **Pass/Fail** | Walk circle radius ≤ 1.0 mm |
+| **Output** | PDF report + SQLite trend database |
+| **Platforms** | Linux · Windows · macOS |
+
+---
+
+## Quick install
+
+> **Requires Python 3.10 or newer.**
+> Download Python at [python.org](https://www.python.org/downloads/) if needed.
+
+### Step 1 — Get the code
+
+```bash
+git clone https://github.com/hwsalmon/daily-wl-qa.git
+cd daily-wl-qa
+```
+
+Or click **Code → Download ZIP**, unzip, and open a terminal in the folder.
+
+### Step 2 — Run the installer
+
+```bash
+python3 install.py        # Linux / macOS
+python  install.py        # Windows (in Command Prompt or PowerShell)
+```
+
+The installer will:
+- Install all Python dependencies automatically (`pip install -r requirements.txt`)
+- Generate the app icon
+- **Linux**: add *Daily WL QA* to your application menu (GNOME, KDE, COSMIC, etc.)
+- **Windows**: create a *Daily WL QA* shortcut on your Desktop
+
+That's it — no administrator rights required.
+
+---
+
+## Manual install (if the installer doesn't work)
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Run the app
+python3 wl_qa_tool.py          # Linux / macOS
+python  wl_qa_tool.py          # Windows
+```
+
+On **Windows** you can also double-click `run_wl_qa.bat`.
+
+---
+
+## System requirements
+
+| Requirement | Minimum |
+|-------------|---------|
+| Python | 3.10 or newer |
+| RAM | 512 MB |
+| Disk | 100 MB (including dependencies) |
+| Display | 1280 × 800 or larger |
+| OS | Linux (X11 or Xwayland), Windows 10/11, macOS 12+ |
+
+### Python packages installed automatically
+
+| Package | Purpose |
+|---------|---------|
+| `customtkinter` | Dark-mode GUI framework |
+| `pydicom` | DICOM file reading |
+| `opencv-python` | Image processing |
+| `scipy` | Gaussian filter, blob analysis |
+| `reportlab` | PDF generation |
+| `matplotlib` | Diagnostic figure rendering |
+| `Pillow` | Image scaling |
+
+---
+
+## Usage
+
+### 1. Select machine and physicist
+Use the dropdowns at the top of the window before loading data.
+
+### 2. Load DICOM directory
+Click **Load DICOM Directory** and select the folder containing the four
+Elekta iViewGT portal DICOM files from that day's WL acquisition.
+The folder should contain one file per cardinal gantry angle
+(G0, G90, G180, G270 — within ±5° of each cardinal).
+
+### 3. Review results
+- **PASS/FAIL banner** — walk circle radius vs. 1.0 mm tolerance, shown immediately.
+- **Results tab** — raw displacements (Field → Void) and corrected displacements
+  (MEC setup error removed) for all four angles, colour-coded green/amber/red.
+- **Portal Images tab** — 5-panel diagnostic figure: one portal image per angle
+  (field boundary overlay, crosshair, void marker, displacement arrow, scale bar)
+  plus a 2-D displacement map showing the MEC walk circle.
+
+### 4. Generate report
+Click **Generate Daily Report (PDF)**.  
+The report includes:
+- Metadata (machine, physicist, date from DICOM header, phantom, tolerance)
+- Colour PASS/FAIL banner
+- Raw and corrected displacement tables
+- Portal diagnostic figure
+- Methodology notes
+- **Electronic signature block** (physicist name, timestamp, 21 CFR Part 11 statement)
+
+Each report generation automatically saves a record to `wl_qa_history.db`.
+
+### 5. View trend analysis
+Click **View Trends** at any time to see a per-machine time-series plot of
+walk circle radius with tolerance and advisory lines, plus a scrollable table
+of all historical records.
+
+---
+
+## Machine and physicist configuration
+
+Machines and physicists are defined as lists near the top of `wl_qa_tool.py`
+(lines ~115–126):
+
+```python
+MACHINES = [
+    "Elekta VersaHD 153991",
+    "Elekta VersaHD 156724",
+    "Elekta VersaHD 154613",
+]
+
+PHYSICISTS = [
+    "Howard W. Salmon, PhD, DABR",
+    "Shawn Hollars, MS, DABR",
+    "Logen Hall, MS, DABR",
+]
+```
+
+To add or change machines or physicists, edit those two lists and save —
+no other changes are needed.
+
+---
+
+## DICOM requirements
+
+- Elekta iViewGT RTIMAGE files (modality `RTIMAGE`)
+- Files **do not** need a DICOM File Meta Information header (the Elekta
+  iViewGT format omits the Transfer Syntax UID — handled automatically)
+- One file per gantry angle; the `GantryAngle` DICOM tag is used to assign
+  each file to its nearest cardinal angle
+- Pixel spacing and SID/SAD are read from the DICOM header for automatic
+  magnification correction
+
+---
+
+## Clinical notes
+
+### Why MEC instead of G0 subtraction?
+
+Naive baseline subtraction (raw − G0) doubles the CBCT setup error at G180
+because the Y-axis displacement appears with opposite sign at opposing angles.
+The **Minimum Enclosing Circle** of all four displacement vectors estimates the
+static setup error geometry-independently; its radius is the smallest circle
+that contains all four walk vectors and is the correct metric for reporting.
+
+### Pass/Fail criterion
+
+Walk circle radius ≤ **1.0 mm** (editable via `TOLERANCE_MM` in `wl_qa_tool.py`).
+
+### Void detection
+
+The MIMI air void receives *more* dose than the surrounding acetal phantom
+(air attenuates less at MV energies). Elekta iViewGT stores pixels inverted
+(LOW value = HIGH dose), so the void is the **local minimum** within the
+irradiated field. Detection pipeline:
+
+1. Gaussian pre-filter (σ ≈ void_radius × 0.30 px) — suppresses MV noise
+2. Global minimum pixel within the central 50% of the field
+3. Inverse-intensity-squared centroid — sub-pixel void localisation
+
+---
+
+## File layout
+
+```
+wl_qa_tool.py       Main application (single file — no build step)
+install.py          One-step installer
+run_wl_qa.bat       Windows double-click launcher
+requirements.txt    Python dependency list
+icon.png            App icon (256 px)
+icon_512.png        App icon (512 px master)
+icon.ico            Windows multi-resolution icon (16–256 px)
+CLAUDE.md           Developer / AI assistant reference
+wl_qa_history.db    SQLite trend database (auto-created, not in git)
+```
+
+---
+
+## Trend database
+
+`wl_qa_history.db` is created automatically in the same folder as
+`wl_qa_tool.py` on first run.  It is a standard SQLite file and can be
+opened with any SQLite browser (e.g. [DB Browser for SQLite](https://sqlitebrowser.org/)).
+
+The database is excluded from git (`.gitignore`) because it contains
+site-specific QA records.
+
+---
+
+## License
+
+For clinical and research use at Franciscan Health Indianapolis.  
+Contact: Howard W. Salmon, PhD, DABR — howard.w.salmon@gmail.com
