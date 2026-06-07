@@ -23,11 +23,17 @@ from pathlib import Path
 # ── Dependency checks ─────────────────────────────────────────────────────────
 _missing = []
 try:
-    import customtkinter as ctk
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+        QComboBox, QTabWidget, QFrame, QDialog, QScrollArea,
+        QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
+        QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
+        QHeaderView,
+    )
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush
 except ImportError:
-    _missing.append("customtkinter")
+    _missing.append("PySide6")
 
 try:
     import pydicom
@@ -702,38 +708,89 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
-class WLApp(ctk.CTk):
+def _apply_dark_theme(app: QApplication) -> None:
+    """Apply a dark Fusion-based palette and stylesheet to the application."""
+    from PySide6.QtGui import QPalette
+    app.setStyle("Fusion")
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window,          QColor(43,  43,  43))
+    pal.setColor(QPalette.ColorRole.WindowText,      QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Base,            QColor(30,  30,  30))
+    pal.setColor(QPalette.ColorRole.AlternateBase,   QColor(43,  43,  43))
+    pal.setColor(QPalette.ColorRole.ToolTipBase,     QColor(43,  43,  43))
+    pal.setColor(QPalette.ColorRole.ToolTipText,     QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Text,            QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Button,          QColor(60,  60,  60))
+    pal.setColor(QPalette.ColorRole.ButtonText,      QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.BrightText,      Qt.GlobalColor.white)
+    pal.setColor(QPalette.ColorRole.Link,            QColor(30,  120, 200))
+    pal.setColor(QPalette.ColorRole.Highlight,       QColor(31,  83,  141))
+    pal.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+    app.setPalette(pal)
+    app.setStyleSheet("""
+        QPushButton {
+            background-color: #1f538d; color: white; border-radius: 6px;
+            padding: 6px 14px; font-size: 14px; min-height: 28px;
+        }
+        QPushButton:hover   { background-color: #2563ae; }
+        QPushButton:pressed { background-color: #174078; }
+        QPushButton:disabled { background-color: #444444; color: #777777; }
+        QComboBox {
+            background-color: #3a3a3a; color: #dcdcdc;
+            border: 1px solid #555555; border-radius: 4px;
+            padding: 4px 8px; font-size: 14px; min-height: 28px;
+        }
+        QComboBox::drop-down { border: none; }
+        QComboBox QAbstractItemView {
+            background-color: #3a3a3a; color: #dcdcdc;
+            selection-background-color: #1f538d;
+        }
+        QTabWidget::pane { border: 1px solid #3a3a3a; border-radius: 4px; }
+        QTabBar::tab {
+            background-color: #3a3a3a; color: #aaaaaa;
+            padding: 8px 20px; font-size: 13px;
+        }
+        QTabBar::tab:selected          { background-color: #1f538d; color: white; }
+        QTabBar::tab:hover:!selected   { background-color: #4a4a4a; }
+        QScrollArea { border: none; }
+        QTableWidget {
+            background-color: #2b2b2b; color: #dcdcdc;
+            gridline-color: #3a3a3a; border: none;
+        }
+        QTableWidget::item { padding: 4px; }
+        QHeaderView::section {
+            background-color: #3a3a3a; color: #aaaaaa;
+            padding: 6px; border: none; font-size: 13px; font-weight: bold;
+        }
+        QScrollBar:vertical   { background: #2b2b2b; width: 12px; }
+        QScrollBar:horizontal { background: #2b2b2b; height: 12px; }
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+            background: #555555; border-radius: 6px; min-length: 20px;
+        }
+        QDialog { background-color: #2b2b2b; }
+    """)
+
+
+class WLApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.title("Winston-Lutz Daily QA  —  Elekta Versa HD / MIMI Phantom")
-        self.geometry("1160x860")
-        self.minsize(960, 720)
+        self.setWindowTitle("Winston-Lutz Daily QA  —  Elekta Versa HD / MIMI Phantom")
+        self.resize(1160, 860)
+        self.setMinimumSize(960, 720)
 
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-
-        # Set window icon if icon.png is in the same directory as this script
-        _icon_path = Path(__file__).parent / "icon.png"
-        if _icon_path.exists():
-            try:
-                _icon_img = tk.PhotoImage(file=str(_icon_path))
-                self.iconphoto(True, _icon_img)
-                self._icon_img_ref = _icon_img  # prevent GC
-            except Exception:
-                pass
+        for icon_name in ("icon.ico", "icon.png"):
+            _icon_path = Path(__file__).parent / icon_name
+            if _icon_path.exists():
+                self.setWindowIcon(QIcon(str(_icon_path)))
+                break
 
         self._wl_results    = None
         self._image_results = None
         self._loaded_dir    = None
         self._diag_fig_path = None
-        self._dicom_date    = None   # datetime.date from DICOM header
+        self._dicom_date    = None
         self._table_labels: dict = {}
-        self._diag_ctk_img  = None   # keep CTkImage reference to prevent GC
-
-        # Selections (defaulting to first option)
-        self._machine_var   = tk.StringVar(value=MACHINES[0])
-        self._physicist_var = tk.StringVar(value=PHYSICISTS[0])
 
         self._config = _load_config()
         _init_db()
@@ -742,219 +799,253 @@ class WLApp(ctk.CTk):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 18, 20, 16)
+        main_layout.setSpacing(6)
+
         # ── Top bar ──────────────────────────────────────────────────────────
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=20, pady=(18, 6))
+        top_bar = QWidget()
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
-        ctk.CTkLabel(
-            top,
-            text="Winston-Lutz Daily QA",
-            font=ctk.CTkFont(size=24, weight="bold"),
-        ).pack(side="left")
+        title_lbl = QLabel("Winston-Lutz Daily QA")
+        title_lbl.setStyleSheet("font-size: 24px; font-weight: bold;")
+        top_layout.addWidget(title_lbl)
+        top_layout.addStretch()
 
-        self._load_btn = ctk.CTkButton(
-            top,
-            text="Load DICOM Directory",
-            command=self._load_directory,
-            width=210,
-            font=ctk.CTkFont(size=14),
-        )
-        self._load_btn.pack(side="right")
+        self._dir_label = QLabel("No directory loaded")
+        self._dir_label.setStyleSheet("font-size: 13px; color: gray;")
+        top_layout.addWidget(self._dir_label)
 
-        self._dir_label = ctk.CTkLabel(
-            top,
-            text="No directory loaded",
-            font=ctk.CTkFont(size=13),
-            text_color="gray",
-        )
-        self._dir_label.pack(side="right", padx=14)
+        self._load_btn = QPushButton("Load DICOM Directory")
+        self._load_btn.setMinimumWidth(210)
+        self._load_btn.clicked.connect(self._load_directory)
+        top_layout.addWidget(self._load_btn)
 
-        # ── Selector bar (machine + physicist) ───────────────────────────────
-        sel = ctk.CTkFrame(self, fg_color="transparent")
-        sel.pack(fill="x", padx=20, pady=(0, 6))
+        main_layout.addWidget(top_bar)
 
-        ctk.CTkLabel(sel, text="Machine:",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-        ctk.CTkOptionMenu(
-            sel,
-            values=MACHINES,
-            variable=self._machine_var,
-            width=240,
-            font=ctk.CTkFont(size=14),
-            dropdown_font=ctk.CTkFont(size=14),
-        ).pack(side="left", padx=(6, 24))
+        # ── Selector bar ──────────────────────────────────────────────────────
+        sel_bar = QWidget()
+        sel_layout = QHBoxLayout(sel_bar)
+        sel_layout.setContentsMargins(0, 0, 0, 0)
 
-        ctk.CTkLabel(sel, text="Physicist:",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-        ctk.CTkOptionMenu(
-            sel,
-            values=PHYSICISTS,
-            variable=self._physicist_var,
-            width=300,
-            font=ctk.CTkFont(size=14),
-            dropdown_font=ctk.CTkFont(size=14),
-        ).pack(side="left", padx=(6, 0))
+        machine_lbl = QLabel("Machine:")
+        machine_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
+        sel_layout.addWidget(machine_lbl)
+
+        self._machine_combo = QComboBox()
+        self._machine_combo.addItems(MACHINES)
+        self._machine_combo.setMinimumWidth(240)
+        sel_layout.addWidget(self._machine_combo)
+        sel_layout.addSpacing(24)
+
+        physicist_lbl = QLabel("Physicist:")
+        physicist_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
+        sel_layout.addWidget(physicist_lbl)
+
+        self._physicist_combo = QComboBox()
+        self._physicist_combo.addItems(PHYSICISTS)
+        self._physicist_combo.setMinimumWidth(300)
+        sel_layout.addWidget(self._physicist_combo)
+        sel_layout.addStretch()
+
+        main_layout.addWidget(sel_bar)
 
         # ── PASS / FAIL banner ────────────────────────────────────────────────
-        self._pf_frame = ctk.CTkFrame(self, corner_radius=10, height=85)
-        self._pf_frame.pack(fill="x", padx=20, pady=4)
-        self._pf_frame.pack_propagate(False)
-
-        self._pf_label = ctk.CTkLabel(
-            self._pf_frame,
-            text="—  AWAITING DATA  —",
-            font=ctk.CTkFont(size=30, weight="bold"),
-            text_color="gray",
+        self._pf_frame = QFrame()
+        self._pf_frame.setFixedHeight(85)
+        self._pf_frame.setStyleSheet(
+            "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
         )
-        self._pf_label.pack(expand=True)
+        pf_inner = QHBoxLayout(self._pf_frame)
+        pf_inner.setContentsMargins(0, 0, 0, 0)
 
-        # ── Tab view: Results | Portal Images ────────────────────────────────
-        self._tabview = ctk.CTkTabview(self, anchor="nw")
-        self._tabview.pack(fill="both", expand=True, padx=20, pady=6)
-
-        tab_res = self._tabview.add("Results")
-        tab_img = self._tabview.add("Portal Images")
-
-        # ── Results tab: two displacement cards side by side ─────────────────
-        tables_row = ctk.CTkFrame(tab_res, fg_color="transparent")
-        tables_row.pack(fill="both", expand=True)
-
-        left_card = ctk.CTkFrame(tables_row, corner_radius=10)
-        left_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
-
-        ctk.CTkLabel(
-            left_card,
-            text="Raw Displacements  (Field → Void)",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        ).pack(pady=(14, 2))
-        ctk.CTkLabel(
-            left_card,
-            text="Includes CBCT setup error",
-            font=ctk.CTkFont(size=12),
-            text_color="gray",
-        ).pack(pady=(0, 6))
-
-        raw_tbl = ctk.CTkFrame(left_card, fg_color="transparent")
-        raw_tbl.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self._build_result_table(raw_tbl, prefix="raw")
-
-        right_card = ctk.CTkFrame(tables_row, corner_radius=10)
-        right_card.pack(side="right", fill="both", expand=True, padx=(8, 0))
-
-        ctk.CTkLabel(
-            right_card,
-            text="Corrected Displacements  (Isocenter Walk)",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        ).pack(pady=(14, 2))
-        ctk.CTkLabel(
-            right_card,
-            text="Isocenter walk  (all 4 angles used to estimate setup error)",
-            font=ctk.CTkFont(size=12),
-            text_color="gray",
-        ).pack(pady=(0, 6))
-
-        corr_tbl = ctk.CTkFrame(right_card, fg_color="transparent")
-        corr_tbl.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self._build_result_table(corr_tbl, prefix="corr")
-
-        # ── Portal Images tab ─────────────────────────────────────────────────
-        img_outer = ctk.CTkFrame(tab_img, fg_color="transparent")
-        img_outer.pack(fill="both", expand=True, padx=6, pady=6)
-        # Plain tk.Label — works with tk.PhotoImage without requiring PIL.ImageTk
-        self._diag_img_label = tk.Label(
-            img_outer,
-            text="Load a DICOM directory to view portal images",
-            font=("Helvetica", 14),
-            fg="#888888",
-            bg="#2b2b2b",
+        self._pf_label = QLabel("—  AWAITING DATA  —")
+        self._pf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pf_label.setStyleSheet(
+            "font-size: 30px; font-weight: bold; color: gray; background: transparent;"
         )
-        self._diag_img_label.pack(expand=True, pady=40)
+        pf_inner.addWidget(self._pf_label)
+
+        main_layout.addWidget(self._pf_frame)
+
+        # ── Tab view ──────────────────────────────────────────────────────────
+        self._tabview = QTabWidget()
+        self._tabview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        main_layout.addWidget(self._tabview, stretch=1)
+
+        # Results tab ─────────────────────────────────────────────────────────
+        tab_res = QWidget()
+        res_layout = QHBoxLayout(tab_res)
+        res_layout.setContentsMargins(6, 6, 6, 6)
+        res_layout.setSpacing(16)
+        self._tabview.addTab(tab_res, "Results")
+
+        left_card = QFrame()
+        left_card.setStyleSheet(
+            "QFrame { background-color: #363636; border-radius: 10px; }"
+        )
+        left_layout = QVBoxLayout(left_card)
+        left_layout.setContentsMargins(14, 14, 14, 12)
+
+        raw_title = QLabel("Raw Displacements  (Field → Void)")
+        raw_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        raw_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; background: transparent;"
+        )
+        left_layout.addWidget(raw_title)
+
+        raw_sub = QLabel("Includes CBCT setup error")
+        raw_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        raw_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
+        left_layout.addWidget(raw_sub)
+
+        raw_tbl_widget = QWidget()
+        raw_tbl_widget.setStyleSheet("background: transparent;")
+        self._build_result_table(raw_tbl_widget, prefix="raw")
+        left_layout.addWidget(raw_tbl_widget, stretch=1)
+        res_layout.addWidget(left_card)
+
+        right_card = QFrame()
+        right_card.setStyleSheet(
+            "QFrame { background-color: #363636; border-radius: 10px; }"
+        )
+        right_layout = QVBoxLayout(right_card)
+        right_layout.setContentsMargins(14, 14, 14, 12)
+
+        corr_title = QLabel("Corrected Displacements  (Isocenter Walk)")
+        corr_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        corr_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; background: transparent;"
+        )
+        right_layout.addWidget(corr_title)
+
+        corr_sub = QLabel(
+            "Isocenter walk  (all 4 angles used to estimate setup error)"
+        )
+        corr_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        corr_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
+        right_layout.addWidget(corr_sub)
+
+        corr_tbl_widget = QWidget()
+        corr_tbl_widget.setStyleSheet("background: transparent;")
+        self._build_result_table(corr_tbl_widget, prefix="corr")
+        right_layout.addWidget(corr_tbl_widget, stretch=1)
+        res_layout.addWidget(right_card)
+
+        # Portal Images tab ───────────────────────────────────────────────────
+        tab_img = QWidget()
+        img_layout = QVBoxLayout(tab_img)
+        img_layout.setContentsMargins(6, 6, 6, 6)
+        self._tabview.addTab(tab_img, "Portal Images")
+
+        self._diag_img_label = QLabel(
+            "Load a DICOM directory to view portal images"
+        )
+        self._diag_img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._diag_img_label.setStyleSheet("font-size: 14px; color: #888888;")
+
+        img_scroll = QScrollArea()
+        img_scroll.setWidgetResizable(True)
+        img_scroll.setWidget(self._diag_img_label)
+        img_layout.addWidget(img_scroll)
 
         # ── Bottom bar ────────────────────────────────────────────────────────
-        bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.pack(fill="x", padx=20, pady=(4, 16))
+        bottom_bar = QWidget()
+        bottom_layout = QHBoxLayout(bottom_bar)
+        bottom_layout.setContentsMargins(0, 4, 0, 0)
 
-        self._walk_label = ctk.CTkLabel(
-            bottom,
-            text=f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)",
-            font=ctk.CTkFont(size=15),
+        self._walk_label = QLabel(
+            f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
         )
-        self._walk_label.pack(side="left")
+        self._walk_label.setStyleSheet("font-size: 15px;")
+        bottom_layout.addWidget(self._walk_label)
+        bottom_layout.addStretch()
 
-        self._report_btn = ctk.CTkButton(
-            bottom,
-            text="Generate Daily Report (PDF)",
-            command=self._generate_report,
-            width=230,
-            state="disabled",
-            font=ctk.CTkFont(size=14),
-        )
-        self._report_btn.pack(side="right")
+        self._trends_btn = QPushButton("View Trends")
+        self._trends_btn.setMinimumWidth(150)
+        self._trends_btn.clicked.connect(self._show_trends)
+        bottom_layout.addWidget(self._trends_btn)
 
-        self._trends_btn = ctk.CTkButton(
-            bottom,
-            text="View Trends",
-            command=self._show_trends,
-            width=150,
-            font=ctk.CTkFont(size=14),
-        )
-        self._trends_btn.pack(side="right", padx=(0, 10))
+        self._report_btn = QPushButton("Generate Daily Report (PDF)")
+        self._report_btn.setMinimumWidth(230)
+        self._report_btn.setEnabled(False)
+        self._report_btn.clicked.connect(self._generate_report)
+        bottom_layout.addWidget(self._report_btn)
 
-    def _build_result_table(self, parent: ctk.CTkFrame, prefix: str):
+        main_layout.addWidget(bottom_bar)
+
+    def _build_result_table(self, parent: QWidget, prefix: str):
+        grid = QGridLayout(parent)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.setSpacing(4)
+
         headers = ["Angle", "ΔX (mm)", "ΔY (mm)", "|ΔR| (mm)"]
         for c, h in enumerate(headers):
-            parent.columnconfigure(c, weight=1)
-            ctk.CTkLabel(
-                parent,
-                text=h,
-                font=ctk.CTkFont(size=15, weight="bold"),
-                text_color="#aaaaaa",
-            ).grid(row=0, column=c, sticky="ew", padx=4, pady=4)
+            grid.setColumnStretch(c, 1)
+            lbl = QLabel(h)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(
+                "color: #aaaaaa; font-size: 15px; font-weight: bold;"
+            )
+            grid.addWidget(lbl, 0, c)
 
-        sep = ctk.CTkFrame(parent, height=1, fg_color="#3a3a3a")
-        sep.grid(row=1, column=0, columnspan=4, sticky="ew", padx=2, pady=3)
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("QFrame { background-color: #3a3a3a; }")
+        grid.addWidget(sep, 1, 0, 1, 4)
 
         for i, angle in enumerate(GANTRY_ANGLES):
             row = i + 2
-            ctk.CTkLabel(
-                parent,
-                text=f"G{angle:03d}°",
-                font=ctk.CTkFont(size=17, weight="bold"),
-            ).grid(row=row, column=0, sticky="ew", padx=4, pady=9)
+            angle_lbl = QLabel(f"G{angle:03d}°")
+            angle_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            angle_lbl.setStyleSheet("font-size: 17px; font-weight: bold;")
+            grid.addWidget(angle_lbl, row, 0)
 
             for c, suffix in enumerate(["dx", "dy", "dr"], start=1):
                 key = f"{prefix}_{angle}_{suffix}"
-                lbl = ctk.CTkLabel(
-                    parent,
-                    text="—",
-                    font=ctk.CTkFont(size=17, family="Courier"),
+                lbl = QLabel("—")
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl.setStyleSheet(
+                    "font-size: 17px; font-family: monospace; color: #dcdcdc;"
                 )
-                lbl.grid(row=row, column=c, sticky="ew", padx=4, pady=9)
+                grid.addWidget(lbl, row, c)
                 self._table_labels[key] = lbl
+
+        grid.setRowStretch(len(GANTRY_ANGLES) + 2, 1)
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _load_directory(self):
-        directory = filedialog.askdirectory(
-            title="Select DICOM Directory",
-            initialdir=self._config.get("last_dicom_dir", str(Path.home())),
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select DICOM Directory",
+            self._config.get("last_dicom_dir", str(Path.home())),
         )
         if not directory:
             return
         self._config["last_dicom_dir"] = directory
         _save_config(self._config)
 
-        self._dir_label.configure(text=Path(directory).name)
-        self._pf_label.configure(text="Processing…", text_color="gray")
-        self._pf_frame.configure(fg_color=["#2b2b2b", "#2b2b2b"])
-        self.update()
+        self._dir_label.setText(Path(directory).name)
+        self._pf_label.setText("Processing…")
+        self._pf_label.setStyleSheet(
+            "font-size: 30px; font-weight: bold; color: gray; background: transparent;"
+        )
+        self._pf_frame.setStyleSheet(
+            "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
+        )
+        QApplication.processEvents()
 
         try:
-            dcm_images      = load_dicom_images(directory)
-            image_results   = {a: analyze_image(ds) for a, ds in dcm_images.items()}
-            wl_results      = compute_wl_results(image_results)
+            dcm_images    = load_dicom_images(directory)
+            image_results = {a: analyze_image(ds) for a, ds in dcm_images.items()}
+            wl_results    = compute_wl_results(image_results)
 
-            # Extract acquisition date from DICOM header (YYYYMMDD → datetime.date)
             self._dicom_date = None
             for ds in dcm_images.values():
                 for tag in ("AcquisitionDate", "StudyDate", "ContentDate"):
@@ -970,17 +1061,20 @@ class WLApp(ctk.CTk):
                 if self._dicom_date:
                     break
 
-            self._image_results   = image_results
-            self._wl_results      = wl_results
-            self._loaded_dir      = directory
-            self._diag_fig_path   = generate_diagnostic_figure(image_results, wl_results)
+            self._image_results = image_results
+            self._wl_results    = wl_results
+            self._loaded_dir    = directory
+            self._diag_fig_path = generate_diagnostic_figure(image_results, wl_results)
 
             self._refresh_display()
-            self._report_btn.configure(state="normal")
+            self._report_btn.setEnabled(True)
 
         except Exception as exc:
-            messagebox.showerror("Processing Error", str(exc))
-            self._pf_label.configure(text="— ERROR —", text_color="#f44336")
+            QMessageBox.critical(self, "Processing Error", str(exc))
+            self._pf_label.setText("— ERROR —")
+            self._pf_label.setStyleSheet(
+                "font-size: 30px; font-weight: bold; color: #f44336; background: transparent;"
+            )
 
     def _refresh_display(self):
         if self._wl_results is None:
@@ -990,104 +1084,96 @@ class WLApp(ctk.CTk):
         walk = wl["max_2d_walk_mm"]
         ok   = wl["pass_fail"]
 
-        # PASS/FAIL banner
         if ok:
-            self._pf_frame.configure(fg_color="#1a3d1e")
-            self._pf_label.configure(
-                text=f"PASS    {walk:.2f} mm",
-                text_color="#66bb6a",
+            self._pf_frame.setStyleSheet(
+                "QFrame { background-color: #1a3d1e; border-radius: 10px; }"
+            )
+            self._pf_label.setText(f"PASS    {walk:.2f} mm")
+            self._pf_label.setStyleSheet(
+                "font-size: 30px; font-weight: bold; color: #66bb6a; background: transparent;"
             )
         else:
-            self._pf_frame.configure(fg_color="#3d1a1a")
-            self._pf_label.configure(
-                text=f"FAIL    {walk:.2f} mm",
-                text_color="#ef5350",
+            self._pf_frame.setStyleSheet(
+                "QFrame { background-color: #3d1a1a; border-radius: 10px; }"
+            )
+            self._pf_label.setText(f"FAIL    {walk:.2f} mm")
+            self._pf_label.setStyleSheet(
+                "font-size: 30px; font-weight: bold; color: #ef5350; background: transparent;"
             )
 
-        self._walk_label.configure(
-            text=(
-                f"Walk Circle Radius: {walk:.3f} mm   "
-                f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
-            )
+        self._walk_label.setText(
+            f"Walk Circle Radius: {walk:.3f} mm   "
+            f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
         )
+
+        def _color(v):
+            if v < 0.5:
+                return "#66bb6a"
+            if v < TOLERANCE_MM:
+                return "#ffa726"
+            return "#ef5350"
+
+        def _set(key, text, color):
+            lbl = self._table_labels[key]
+            lbl.setText(text)
+            lbl.setStyleSheet(
+                f"font-size: 17px; font-family: monospace; color: {color};"
+            )
 
         for angle in GANTRY_ANGLES:
             r = wl["per_angle"][angle]
             raw_dr  = np.sqrt(r["raw_dx"] ** 2 + r["raw_dy"] ** 2)
             corr_dr = np.sqrt(r["rel_dx"] ** 2 + r["rel_dy"] ** 2)
 
-            def _color(v):
-                if v < 0.5:
-                    return "#66bb6a"
-                if v < TOLERANCE_MM:
-                    return "#ffa726"
-                return "#ef5350"
-
-            self._table_labels[f"raw_{angle}_dx"].configure(
-                text=f"{r['raw_dx']:+.3f}", text_color=_color(abs(r["raw_dx"]))
-            )
-            self._table_labels[f"raw_{angle}_dy"].configure(
-                text=f"{r['raw_dy']:+.3f}", text_color=_color(abs(r["raw_dy"]))
-            )
-            self._table_labels[f"raw_{angle}_dr"].configure(
-                text=f"{raw_dr:.3f}", text_color=_color(raw_dr)
-            )
-            self._table_labels[f"corr_{angle}_dx"].configure(
-                text=f"{r['rel_dx']:+.3f}", text_color=_color(abs(r["rel_dx"]))
-            )
-            self._table_labels[f"corr_{angle}_dy"].configure(
-                text=f"{r['rel_dy']:+.3f}", text_color=_color(abs(r["rel_dy"]))
-            )
-            self._table_labels[f"corr_{angle}_dr"].configure(
-                text=f"{corr_dr:.3f}", text_color=_color(corr_dr)
-            )
+            _set(f"raw_{angle}_dx",  f"{r['raw_dx']:+.3f}", _color(abs(r["raw_dx"])))
+            _set(f"raw_{angle}_dy",  f"{r['raw_dy']:+.3f}", _color(abs(r["raw_dy"])))
+            _set(f"raw_{angle}_dr",  f"{raw_dr:.3f}",       _color(raw_dr))
+            _set(f"corr_{angle}_dx", f"{r['rel_dx']:+.3f}", _color(abs(r["rel_dx"])))
+            _set(f"corr_{angle}_dy", f"{r['rel_dy']:+.3f}", _color(abs(r["rel_dy"])))
+            _set(f"corr_{angle}_dr", f"{corr_dr:.3f}",      _color(corr_dr))
 
         self._update_diag_image()
 
     def _update_diag_image(self):
-        """Render the diagnostic figure PNG into the Portal Images tab.
-
-        Uses tk.PhotoImage(data=<base64 PNG>) so PIL.ImageTk is not required —
-        only PIL.Image (which is always present via the reportlab dependency).
-        """
         if not self._diag_fig_path or not os.path.exists(self._diag_fig_path):
             return
         try:
-            import io, base64
+            import io
             from PIL import Image as PILImage
             pil_img = PILImage.open(self._diag_fig_path)
-            self.update_idletasks()
-            avail_w = max(900, self.winfo_width() - 60)
+            avail_w = max(900, self.width() - 60)
             scale_h = int(pil_img.height * avail_w / pil_img.width)
             pil_img = pil_img.resize((avail_w, scale_h), PILImage.LANCZOS)
             buf = io.BytesIO()
             pil_img.save(buf, format="PNG")
-            tk_img = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
-            self._diag_ctk_img = tk_img   # prevent garbage collection
-            self._diag_img_label.configure(image=tk_img, text="", bg="#111111")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.getvalue())
+            self._diag_img_label.setPixmap(pixmap)
+            self._diag_img_label.adjustSize()
         except Exception as exc:
-            self._diag_img_label.configure(
-                text=f"Image display error:\n{exc}", image=""
-            )
+            self._diag_img_label.setText(f"Image display error:\n{exc}")
+            self._diag_img_label.setPixmap(QPixmap())
 
     def _generate_report(self):
         if self._wl_results is None:
-            messagebox.showwarning("No Data", "Load DICOM images first.")
+            QMessageBox.warning(self, "No Data", "Load DICOM images first.")
             return
 
-        machine   = self._machine_var.get()
-        physicist = self._physicist_var.get()
+        machine   = self._machine_combo.currentText()
+        physicist = self._physicist_combo.currentText()
 
         default_name = (
             f"WL_QA_{machine.replace(' ', '_')}_"
             f"{datetime.date.today().strftime('%Y%m%d')}.pdf"
         )
-        save_path = filedialog.asksaveasfilename(
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-            initialfile=default_name,
-            initialdir=self._config.get("last_report_dir", str(Path.home())),
-            title="Save Daily QA Report",
+        initial_path = str(
+            Path(self._config.get("last_report_dir", str(Path.home()))) / default_name
+        )
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Daily QA Report",
+            initial_path,
+            "PDF files (*.pdf)",
         )
         if not save_path:
             return
@@ -1105,18 +1191,17 @@ class WLApp(ctk.CTk):
                 dicom_date=self._dicom_date,
             )
             _save_to_db(self._wl_results, self._image_results, machine, physicist)
-            messagebox.showinfo("Report Saved", f"Report saved to:\n{save_path}")
+            QMessageBox.information(self, "Report Saved", f"Report saved to:\n{save_path}")
         except Exception as exc:
-            messagebox.showerror("Report Error", str(exc))
+            QMessageBox.critical(self, "Report Error", str(exc))
 
     def _show_trends(self):
-        """Open a window showing walk-circle-radius trend per machine."""
-        import tkinter as _tk
-        top = ctk.CTkToplevel(self)
-        top.title("Winston-Lutz Trend Analysis")
-        top.geometry("1000x680")
+        """Open a dialog showing walk-circle-radius trend per machine."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Winston-Lutz Trend Analysis")
+        dlg.resize(1000, 700)
+        dlg_layout = QVBoxLayout(dlg)
 
-        # Fetch data from DB
         try:
             conn = sqlite3.connect(DB_PATH)
             cur  = conn.cursor()
@@ -1127,19 +1212,23 @@ class WLApp(ctk.CTk):
             rows = cur.fetchall()
             conn.close()
         except Exception as exc:
-            ctk.CTkLabel(top, text=f"Database error: {exc}",
-                         font=ctk.CTkFont(size=14)).pack(expand=True)
+            lbl = QLabel(f"Database error: {exc}")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dlg_layout.addWidget(lbl)
+            dlg.exec()
             return
 
         if not rows:
-            ctk.CTkLabel(
-                top,
-                text="No records in database yet.\nGenerate a report to save the first record.",
-                font=ctk.CTkFont(size=15),
-            ).pack(expand=True)
+            lbl = QLabel(
+                "No records in database yet.\n"
+                "Generate a report to save the first record."
+            )
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size: 15px;")
+            dlg_layout.addWidget(lbl)
+            dlg.exec()
             return
 
-        # Build per-machine data
         from collections import defaultdict
         machine_data: dict = defaultdict(list)
         for date_str, mname, walk_r, pf in rows:
@@ -1154,8 +1243,10 @@ class WLApp(ctk.CTk):
             spine.set_edgecolor("#555555")
         ax.set_xlabel("Date", color="white", fontsize=11)
         ax.set_ylabel("Walk Circle Radius (mm)", color="white", fontsize=11)
-        ax.set_title("Winston-Lutz Walk Circle Radius — Trend by Machine",
-                     color="white", fontsize=13, fontweight="bold")
+        ax.set_title(
+            "Winston-Lutz Walk Circle Radius — Trend by Machine",
+            color="white", fontsize=13, fontweight="bold",
+        )
 
         ax.axhline(TOLERANCE_MM, color="#ef5350", linewidth=1.5, linestyle="--",
                    label=f"Tolerance ≤ {TOLERANCE_MM:.1f} mm")
@@ -1163,9 +1254,9 @@ class WLApp(ctk.CTk):
                    label="0.5 mm advisory")
 
         for idx, (mname, pts) in enumerate(sorted(machine_data.items())):
-            col = machine_colors[idx % len(machine_colors)]
-            dates = [p[0] for p in pts]
-            vals  = [p[1] for p in pts]
+            col    = machine_colors[idx % len(machine_colors)]
+            dates  = [p[0] for p in pts]
+            vals   = [p[1] for p in pts]
             passes = [p[2] for p in pts]
             ax.plot(dates, vals, color=col, linewidth=1.5, marker="o",
                     markersize=6, label=mname)
@@ -1179,21 +1270,19 @@ class WLApp(ctk.CTk):
                  color="white")
         fig.tight_layout()
 
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        canvas = FigureCanvasTkAgg(fig, master=top)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        import io
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight",
+                    facecolor="#111111")
+        plt.close(fig)
+        buf.seek(0)
 
-        # Records table below the chart
-        tbl_frame = ctk.CTkScrollableFrame(top, height=160)
-        tbl_frame.pack(fill="x", padx=10, pady=(0, 10))
-        hdrs = ["Date", "Machine", "Physicist", "Walk r (mm)", "Result"]
-        for c, h in enumerate(hdrs):
-            ctk.CTkLabel(tbl_frame, text=h,
-                         font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color="#aaaaaa").grid(
-                row=0, column=c, padx=8, pady=4, sticky="ew")
-            tbl_frame.columnconfigure(c, weight=1)
+        pixmap = QPixmap()
+        pixmap.loadFromData(buf.read())
+        chart_label = QLabel()
+        chart_label.setPixmap(pixmap)
+        chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dlg_layout.addWidget(chart_label, stretch=1)
 
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -1207,16 +1296,30 @@ class WLApp(ctk.CTk):
         except Exception:
             all_rows = []
 
-        for ri, row in enumerate(all_rows, start=1):
+        hdrs = ["Date", "Machine", "Physicist", "Walk r (mm)", "Result"]
+        table = QTableWidget(len(all_rows), len(hdrs))
+        table.setHorizontalHeaderLabels(hdrs)
+        table.setMaximumHeight(200)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.verticalHeader().setVisible(False)
+
+        for ri, row in enumerate(all_rows):
             date_s, mname, phys, walk_r, pf = row
             vals_disp = [date_s, mname, phys, f"{walk_r:.3f}",
                          "PASS" if pf else "FAIL"]
             for c, val in enumerate(vals_disp):
-                col = "#66bb6a" if (c == 4 and pf) else ("#ef5350" if c == 4 else "white")
-                ctk.CTkLabel(tbl_frame, text=val,
-                             font=ctk.CTkFont(size=13),
-                             text_color=col).grid(
-                    row=ri, column=c, padx=8, pady=3, sticky="ew")
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if c == 4:
+                    item.setForeground(
+                        QBrush(QColor("#66bb6a" if pf else "#ef5350"))
+                    )
+                table.setItem(ri, c, item)
+
+        dlg_layout.addWidget(table)
+        dlg.exec()
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -1631,5 +1734,8 @@ def generate_pdf_report(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = WLApp()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    _apply_dark_theme(app)
+    window = WLApp()
+    window.show()
+    sys.exit(app.exec())

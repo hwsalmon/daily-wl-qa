@@ -1,6 +1,6 @@
 @echo off
 REM Daily WL QA — Windows setup
-REM Downloads a self-contained Python 3.12 runtime and installs all
+REM Downloads an embeddable Python 3.12 runtime and installs all
 REM dependencies into the app folder.  No admin rights required.
 setlocal enabledelayedexpansion
 
@@ -67,7 +67,7 @@ REM ── Install / update WL QA dependencies ───────────
 echo.
 echo Installing dependencies ^(first run may take a few minutes^)...
 "%RUNTIME%\python.exe" -m pip install --upgrade --no-warn-script-location --quiet ^
-    customtkinter ^
+    PySide6 ^
     pydicom ^
     opencv-python ^
     scipy ^
