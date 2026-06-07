@@ -2,9 +2,12 @@
 """
 Daily Winston-Lutz QA Tool — Elekta Versa HD / Standard Imaging MIMI Phantom
 
-Inverted void-detection variant: the MIMI phantom uses a 6.4 mm diameter AIR VOID
-as the isocenter target. Air attenuates less than the surrounding acetal copolymer
-(~1.41 g/cm³) at MV energies, so the void appears BRIGHT on the EPID portal image.
+Air void detection: the MIMI phantom uses a 6.4 mm diameter AIR VOID as the
+isocenter target. Air attenuates less than the surrounding acetal copolymer
+(~1.41 g/cm³) so the void receives more dose than the phantom body. Elekta
+iViewGT RTIMAGEs are stored with INVERTED pixel values (LOW value = HIGH dose),
+so the void is the LOCAL MINIMUM within the irradiated field — detected as the
+darkest spot in the field-windowed portal image.
 
 Baseline correction: the G0° displacement (residual CBCT couch setup error) is
 subtracted from all cardinal-angle displacements to isolate true mechanical walk.
@@ -463,8 +466,20 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         r1 = min(arr.shape[0], cy + half)
         crop = arr[r0:r1, c0:c1]
 
-        vmin_c = np.percentile(crop, 0.5)
-        vmax_c = np.percentile(crop, 99.5)
+        # Window to field-interior pixels only so the ~7% void contrast is visible.
+        # Elekta inverted convention: field = LOW value, background = HIGH value.
+        # A 0.15-normalised threshold separates field interior from penumbra/background.
+        g_min = float(arr.min())
+        g_max = float(arr.max())
+        norm_crop = (crop.astype(np.float64) - g_min) / max(g_max - g_min, 1.0)
+        field_mask = norm_crop < 0.15          # field interior; penumbra/bg excluded
+        if field_mask.sum() > 200:
+            fp     = crop[field_mask].astype(np.float64)
+            vmin_c = float(np.percentile(fp, 2))    # just below void level
+            vmax_c = float(np.percentile(fp, 90))   # upper phantom body
+        else:
+            vmin_c = float(np.percentile(crop, 0.5))
+            vmax_c = float(np.percentile(crop, 60))
 
         ax.imshow(
             crop, cmap="gray", vmin=vmin_c, vmax=vmax_c,
