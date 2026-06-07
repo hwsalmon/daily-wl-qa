@@ -14,7 +14,7 @@ No server, no build step. Requires a display (Xwayland works on COSMIC/Wayland).
 ## Dependencies
 
 ```bash
-pip install customtkinter pydicom opencv-python scipy reportlab matplotlib pillow
+pip install PySide6 pydicom opencv-python scipy reportlab matplotlib pillow
 ```
 
 All imports are checked at startup; missing packages are reported with the exact
