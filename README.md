@@ -42,7 +42,7 @@ Double-click **`setup_windows.bat`**
 
 This will:
 - Download Python 3.12 embeddable (~8 MB) into a `python_runtime` folder inside the app
-- Install all dependencies (customtkinter, pydicom, scipy, reportlab, matplotlib, Pillow, OpenCV)
+- Install all dependencies (PySide6, pydicom, scipy, reportlab, matplotlib, Pillow, OpenCV)
 - Generate the app icon
 
 **Step 3** — Launch the app
@@ -86,7 +86,7 @@ python  wl_qa_tool.py          # Windows (if Python is on your PATH)
 |-------------|---------|
 | Python | 3.10 or newer |
 | RAM | 512 MB |
-| Disk | 100 MB (including dependencies) |
+| Disk | 400 MB (including dependencies) |
 | Display | 1280 × 800 or larger |
 | OS | Linux (X11 or Xwayland), Windows 10/11, macOS 12+ |
 
@@ -94,7 +94,7 @@ python  wl_qa_tool.py          # Windows (if Python is on your PATH)
 
 | Package | Purpose |
 |---------|---------|
-| `customtkinter` | Dark-mode GUI framework |
+| `PySide6` | Qt-based GUI framework |
 | `pydicom` | DICOM file reading |
 | `opencv-python` | Image processing |
 | `scipy` | Gaussian filter, blob analysis |
