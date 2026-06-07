@@ -696,6 +696,16 @@ class WLApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
+        # Set window icon if icon.png is in the same directory as this script
+        _icon_path = Path(__file__).parent / "icon.png"
+        if _icon_path.exists():
+            try:
+                _icon_img = tk.PhotoImage(file=str(_icon_path))
+                self.iconphoto(True, _icon_img)
+                self._icon_img_ref = _icon_img  # prevent GC
+            except Exception:
+                pass
+
         self._wl_results    = None
         self._image_results = None
         self._loaded_dir    = None
