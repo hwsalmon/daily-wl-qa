@@ -1,6 +1,6 @@
 # Daily WL QA
 
-**Daily Winston-Lutz mechanical isocenter QA for Elekta Versa HD LINACs**
+**Daily Winston-Lutz isocenter walk QA for Elekta Versa HD LINACs**
 using the Standard Imaging MIMI Phantom (6.4 mm air void).
 
 ![App Icon](icon.png)
@@ -25,49 +25,58 @@ algorithm, and generates a signed PDF QA report — in seconds.
 
 ---
 
-## Quick install
+## Installation
 
-> **Requires Python 3.10 or newer.**
-> Download Python at [python.org](https://www.python.org/downloads/) if needed.
+### Windows (hospital / restricted PC) — no admin rights needed
 
-### Step 1 — Get the code
+> No system Python required. The setup script downloads its own
+> self-contained Python runtime into the app folder.
+
+**Step 1** — Download the app
+
+Click **Code → Download ZIP** on GitHub, unzip anywhere (e.g. your Desktop or `Documents`).
+
+**Step 2** — Run setup (one time only)
+
+Double-click **`setup_windows.bat`**
+
+This will:
+- Download Python 3.12 embeddable (~8 MB) into a `python_runtime` folder inside the app
+- Install all dependencies (customtkinter, pydicom, scipy, reportlab, matplotlib, Pillow, OpenCV)
+- Generate the app icon
+
+**Step 3** — Launch the app
+
+Double-click **`run_wl_qa.bat`**
+
+That's it. No Python installation, no admin rights, no IT involvement.
+
+> **Already have rad-inventory installed?**  The setup is identical — it uses the same
+> self-contained embedded Python approach.  You can run `setup_windows.bat` from the
+> WL QA folder independently; it will not affect rad-inventory.
+
+---
+
+### Linux / macOS
 
 ```bash
 git clone https://github.com/hwsalmon/daily-wl-qa.git
 cd daily-wl-qa
+python3 install.py
 ```
 
-Or click **Code → Download ZIP**, unzip, and open a terminal in the folder.
-
-### Step 2 — Run the installer
-
-```bash
-python3 install.py        # Linux / macOS
-python  install.py        # Windows (in Command Prompt or PowerShell)
-```
-
-The installer will:
-- Install all Python dependencies automatically (`pip install -r requirements.txt`)
-- Generate the app icon
-- **Linux**: add *Daily WL QA* to your application menu (GNOME, KDE, COSMIC, etc.)
-- **Windows**: create a *Daily WL QA* shortcut on your Desktop
-
-That's it — no administrator rights required.
+The installer handles dependencies, icon generation, and adds *Daily WL QA* to
+your application menu automatically.
 
 ---
 
-## Manual install (if the installer doesn't work)
+## Manual install (fallback)
 
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
-
-# 2. Run the app
 python3 wl_qa_tool.py          # Linux / macOS
-python  wl_qa_tool.py          # Windows
+python  wl_qa_tool.py          # Windows (if Python is on your PATH)
 ```
-
-On **Windows** you can also double-click `run_wl_qa.bat`.
 
 ---
 

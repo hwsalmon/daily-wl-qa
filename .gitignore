@@ -3,4 +3,5 @@ __pycache__/
 *.pdf
 *.db
 wl_qa_config.json
+python_runtime/
 Test Data/
