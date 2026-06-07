@@ -377,19 +377,74 @@ def analyze_image(ds) -> dict:
 
 # ── Winston-Lutz metrics ──────────────────────────────────────────────────────
 
+def _minimum_enclosing_circle(points):
+    """
+    Brute-force minimum enclosing circle (MEC) for ≤6 2D points.
+
+    Returns (cx, cy, radius).  For the 4-cardinal-angle WL test the MEC centre
+    is used as the best-fit estimate of the CBCT residual setup error, and the
+    MEC radius is the 'walk circle' metric — the smallest circle that contains
+    all four void-to-field-centre displacement vectors.
+    """
+    from itertools import combinations
+
+    def _c2(p, q):
+        cx, cy = (p[0]+q[0])/2, (p[1]+q[1])/2
+        return cx, cy, float(np.hypot(q[0]-p[0], q[1]-p[1]) / 2)
+
+    def _c3(p, q, s):
+        ax, ay = q[0]-p[0], q[1]-p[1]
+        bx, by = s[0]-p[0], s[1]-p[1]
+        D = 2 * (ax*by - ay*bx)
+        if abs(D) < 1e-12:
+            return None
+        ux = (by*(ax**2+ay**2) - ay*(bx**2+by**2)) / D
+        uy = (ax*(bx**2+by**2) - bx*(ax**2+ay**2)) / D
+        return p[0]+ux, p[1]+uy, float(np.hypot(ux, uy))
+
+    def _ok(cx, cy, r, pts):
+        return all(np.hypot(p[0]-cx, p[1]-cy) <= r + 1e-9 for p in pts)
+
+    pts = list(points)
+    best_r, best = float("inf"), (0.0, 0.0, 0.0)
+
+    for i, j in combinations(range(len(pts)), 2):
+        cx, cy, r = _c2(pts[i], pts[j])
+        if r < best_r and _ok(cx, cy, r, pts):
+            best_r, best = r, (cx, cy, r)
+
+    for i, j, k in combinations(range(len(pts)), 3):
+        res = _c3(pts[i], pts[j], pts[k])
+        if res:
+            cx, cy, r = res
+            if r < best_r and _ok(cx, cy, r, pts):
+                best_r, best = r, (cx, cy, r)
+
+    if np.isinf(best_r):   # degenerate / single point
+        cx = float(np.mean([p[0] for p in pts]))
+        cy = float(np.mean([p[1] for p in pts]))
+        r  = float(max(np.hypot(p[0]-cx, p[1]-cy) for p in pts))
+        best = (cx, cy, r)
+
+    return best
+
+
 def compute_wl_results(image_results: dict) -> dict:
     """
-    Compute baseline-corrected displacements and PASS/FAIL.
+    Compute setup-error-corrected displacements and walk circle PASS/FAIL.
 
-    The G0° displacement vector is the residual setup error after CBCT-guided
-    couch shift. Subtracting it from every other angle removes this static offset
-    and isolates the pure mechanical isocenter walk as the gantry rotates.
+    The residual CBCT setup error is estimated from ALL four images as the centre
+    of the Minimum Enclosing Circle (MEC) of the four raw void-to-field-centre
+    displacement vectors.  Subtracting the MEC centre from each raw vector gives
+    the per-angle mechanical walk.  The MEC radius is the walk circle metric
+    (smallest circle containing all four walk vectors) used for PASS/FAIL.
 
-    Returns a result dict with per-angle raw and corrected displacements plus
-    the maximum 2D corrected magnitude (the clinical metric).
+    Using all four angles to estimate setup error is more robust than the single
+    G0° reference, and avoids the coordinate-flip ambiguity that affects the
+    naive G0 subtraction at G180°.
     """
-    baseline_dx = image_results[0]["dx_mm"]
-    baseline_dy = image_results[0]["dy_mm"]
+    raw = [(image_results[a]["dx_mm"], image_results[a]["dy_mm"]) for a in GANTRY_ANGLES]
+    cx, cy, walk_r = _minimum_enclosing_circle(raw)
 
     per_angle = {}
     for angle in GANTRY_ANGLES:
@@ -397,22 +452,17 @@ def compute_wl_results(image_results: dict) -> dict:
         per_angle[angle] = {
             "raw_dx": r["dx_mm"],
             "raw_dy": r["dy_mm"],
-            "rel_dx": r["dx_mm"] - baseline_dx,
-            "rel_dy": r["dy_mm"] - baseline_dy,
+            "rel_dx": r["dx_mm"] - cx,
+            "rel_dy": r["dy_mm"] - cy,
         }
 
-    magnitudes = [
-        np.sqrt(per_angle[a]["rel_dx"] ** 2 + per_angle[a]["rel_dy"] ** 2)
-        for a in GANTRY_ANGLES
-    ]
-    max_2d_walk = max(magnitudes)
-
     return {
-        "per_angle":     per_angle,
-        "baseline_dx":   baseline_dx,
-        "baseline_dy":   baseline_dy,
-        "max_2d_walk_mm": max_2d_walk,
-        "pass_fail":     max_2d_walk <= TOLERANCE_MM,
+        "per_angle":      per_angle,
+        "baseline_dx":    cx,       # MEC centre X (setup error estimate)
+        "baseline_dy":    cy,       # MEC centre Y
+        "walk_circle_r":  walk_r,
+        "max_2d_walk_mm": walk_r,   # used by GUI / PDF for PASS/FAIL banner
+        "pass_fail":      walk_r <= TOLERANCE_MM,
     }
 
 
@@ -438,15 +488,25 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
 
     import tempfile
 
-    fig, axes = plt.subplots(1, 4, figsize=(22, 6), facecolor="#111111")
+    walk_r = wl_results["walk_circle_r"]
+    passed = wl_results["pass_fail"]
+
+    # 5 panels: 4 portal images + 1 displacement / walk-circle map
+    fig = plt.figure(figsize=(28, 6.4), facecolor="#111111", layout="constrained")
+    gs  = fig.add_gridspec(1, 5, width_ratios=[1, 1, 1, 1, 1.1], wspace=0.07)
+    portal_axes = [fig.add_subplot(gs[i]) for i in range(4)]
+    disp_ax     = fig.add_subplot(gs[4])
+
     fig.suptitle(
         f"Portal Images — Field & Void Centre Detection     "
-        f"Max 2D Walk = {wl_results['max_2d_walk_mm']:.3f} mm   "
-        f"{'PASS ✓' if wl_results['pass_fail'] else 'FAIL ✗'}",
+        f"Walk Circle Radius = {walk_r:.3f} mm   "
+        f"{'PASS ✓' if passed else 'FAIL ✗'}",
         color="white", fontsize=11, fontweight="bold",
     )
 
-    for ax, angle in zip(axes, GANTRY_ANGLES):
+    angle_colors = {0: "#64b5f6", 90: "#81c784", 180: "#ffb74d", 270: "#f06292"}
+
+    for ax, angle in zip(portal_axes, GANTRY_ANGLES):
         r   = img_results[angle]
         arr = r["pixel_array"]
         fc  = r["field_center_px"]   # (col, row)
@@ -455,15 +515,15 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         wla = wl_results["per_angle"][angle]
         corr_dr = np.sqrt(wla["rel_dx"] ** 2 + wla["rel_dy"] ** 2)
 
-        # Tight crop: field half-width (in detector pixels) + 20 % margin
+        # Tight crop: field half-width + 20 % margin
         field_half_px = (FIELD_SIZE_MM / 2.0) / spc
         margin = max(15, int(field_half_px * 0.20))
         half   = int(field_half_px) + margin
-        cx, cy = int(round(fc[0])), int(round(fc[1]))
-        c0 = max(0,            cx - half)
-        c1 = min(arr.shape[1], cx + half)
-        r0 = max(0,            cy - half)
-        r1 = min(arr.shape[0], cy + half)
+        fcx, fcy = int(round(fc[0])), int(round(fc[1]))
+        c0 = max(0,            fcx - half)
+        c1 = min(arr.shape[1], fcx + half)
+        r0 = max(0,            fcy - half)
+        r1 = min(arr.shape[0], fcy + half)
         crop = arr[r0:r1, c0:c1]
 
         # Window to field-interior pixels only so the ~7% void contrast is visible.
@@ -472,11 +532,11 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         g_min = float(arr.min())
         g_max = float(arr.max())
         norm_crop = (crop.astype(np.float64) - g_min) / max(g_max - g_min, 1.0)
-        field_mask = norm_crop < 0.15          # field interior; penumbra/bg excluded
+        field_mask = norm_crop < 0.15
         if field_mask.sum() > 200:
             fp     = crop[field_mask].astype(np.float64)
-            vmin_c = float(np.percentile(fp, 2))    # just below void level
-            vmax_c = float(np.percentile(fp, 90))   # upper phantom body
+            vmin_c = float(np.percentile(fp, 2))
+            vmax_c = float(np.percentile(fp, 90))
         else:
             vmin_c = float(np.percentile(crop, 0.5))
             vmax_c = float(np.percentile(crop, 60))
@@ -487,7 +547,7 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             interpolation="bilinear",
         )
 
-        # Field boundary
+        # 40 × 40 mm field boundary box
         fh = field_half_px
         ax.add_patch(mpatches.Rectangle(
             (fc[0] - fh, fc[1] - fh), 2 * fh, 2 * fh,
@@ -498,15 +558,16 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         ax.axhline(fc[1], color="cyan", lw=0.8, ls=":", alpha=0.7)
         ax.axvline(fc[0], color="cyan", lw=0.8, ls=":", alpha=0.7)
 
-        # Void centre + circle
+        # Air void circle (6.4 mm diameter) centred on detected void
         void_r_px = (VOID_DIAMETER_MM / 2.0) / spc
-        ax.plot(vc[0], vc[1], "r+", ms=16, mew=2.0, zorder=5)
+        col = angle_colors[angle]
+        ax.plot(vc[0], vc[1], "+", color=col, ms=16, mew=2.2, zorder=5)
         ax.add_patch(mpatches.Circle(
             (vc[0], vc[1]), void_r_px,
-            edgecolor="#ff4444", facecolor="none", lw=1.8, zorder=4,
+            edgecolor=col, facecolor="none", lw=2.0, zorder=4,
         ))
 
-        # Displacement arrow (field → void)
+        # Displacement arrow (field centre → void centre)
         ax.annotate(
             "", xy=(vc[0], vc[1]), xytext=(fc[0], fc[1]),
             arrowprops=dict(arrowstyle="->", color="#ffff00", lw=1.8),
@@ -520,26 +581,86 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         ax.text(bx0 + bar_px / 2, by - 4, "5 mm",
                 color="white", ha="center", va="bottom", fontsize=6.5)
 
-        # Title (colour-coded by corrected result)
-        if angle == 0:
-            tc, status = "white", "baseline ref"
-        elif corr_dr <= TOLERANCE_MM:
-            tc, status = "#66bb6a", f"PASS  {corr_dr:.3f} mm"
-        else:
-            tc, status = "#ef5350", f"FAIL  {corr_dr:.3f} mm"
-
+        # Panel title (colour = angle colour, status = corrected walk magnitude)
+        corr_label = f"{corr_dr:.3f} mm"
         ax.set_title(
-            f"G{angle:03d}°\n"
+            f"G{angle:03d}°  |  Raw |ΔR|={np.hypot(wla['raw_dx'],wla['raw_dy']):.3f} mm\n"
             f"Raw  ΔX={wla['raw_dx']:+.3f}  ΔY={wla['raw_dy']:+.3f} mm\n"
-            f"Corr ΔX={wla['rel_dx']:+.3f}  ΔY={wla['rel_dy']:+.3f}  [{status}]",
-            color=tc, fontsize=7.5, fontweight="bold",
+            f"Corr ΔX={wla['rel_dx']:+.3f}  ΔY={wla['rel_dy']:+.3f}  [{corr_label}]",
+            color=col, fontsize=7.5, fontweight="bold",
         )
         ax.tick_params(colors="#777777", labelsize=6)
         for sp in ax.spines.values():
             sp.set_color("#333333")
         ax.set_facecolor("#111111")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    # ── Walk-circle displacement map ──────────────────────────────────────────
+    disp_ax.set_facecolor("#111111")
+    for sp in disp_ax.spines.values():
+        sp.set_color("#444444")
+    disp_ax.tick_params(colors="#aaaaaa", labelsize=8)
+    disp_ax.set_xlabel("ΔX (mm)", color="#aaaaaa", fontsize=9)
+    disp_ax.set_ylabel("ΔY (mm)", color="#aaaaaa", fontsize=9)
+    disp_ax.set_title(
+        f"Void Displacement Map\n"
+        f"Walk circle r = {walk_r:.3f} mm  "
+        f"({'PASS' if passed else 'FAIL'})",
+        color="#66bb6a" if passed else "#ef5350",
+        fontsize=8.5, fontweight="bold",
+    )
+
+    # Grid
+    disp_ax.axhline(0, color="#555555", lw=0.8)
+    disp_ax.axvline(0, color="#555555", lw=0.8)
+    disp_ax.grid(color="#333333", lw=0.5, ls="--")
+
+    # Origin = ideal radiation isocenter
+    disp_ax.plot(0, 0, "w+", ms=14, mew=2.0, zorder=6, label="Field ctr (ideal)")
+
+    # MEC centre = setup error estimate
+    ecx = wl_results["baseline_dx"]
+    ecy = wl_results["baseline_dy"]
+    disp_ax.plot(ecx, ecy, "w*", ms=10, zorder=6, label=f"MEC ctr ({ecx:+.2f},{ecy:+.2f})")
+
+    # Walk circle
+    theta = np.linspace(0, 2 * np.pi, 300)
+    disp_ax.plot(
+        ecx + walk_r * np.cos(theta),
+        ecy + walk_r * np.sin(theta),
+        color="white", lw=1.4, ls="-", alpha=0.6, label=f"Walk circle r={walk_r:.3f}mm",
+    )
+
+    # Tolerance circle centred on MEC centre
+    disp_ax.plot(
+        ecx + TOLERANCE_MM * np.cos(theta),
+        ecy + TOLERANCE_MM * np.sin(theta),
+        color="#888888", lw=1.0, ls=":", alpha=0.5, label=f"Tolerance {TOLERANCE_MM:.1f} mm",
+    )
+
+    # Raw displacement points per angle
+    for angle in GANTRY_ANGLES:
+        wla = wl_results["per_angle"][angle]
+        col = angle_colors[angle]
+        disp_ax.scatter(
+            wla["raw_dx"], wla["raw_dy"],
+            color=col, s=60, zorder=7,
+        )
+        disp_ax.annotate(
+            f"G{angle}°",
+            xy=(wla["raw_dx"], wla["raw_dy"]),
+            xytext=(wla["raw_dx"] + 0.04, wla["raw_dy"] + 0.04),
+            color=col, fontsize=7.5, fontweight="bold",
+        )
+
+    # Axis limits: at least ±(walk_r + 0.3) mm from MEC centre
+    pad  = max(walk_r + 0.35, TOLERANCE_MM + 0.2)
+    disp_ax.set_xlim(ecx - pad, ecx + pad)
+    disp_ax.set_ylim(ecy - pad, ecy + pad)
+    disp_ax.set_aspect("equal")
+    disp_ax.legend(
+        fontsize=6.5, loc="upper right",
+        facecolor="#222222", edgecolor="#555555", labelcolor="white",
+    )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     plt.savefig(tmp.name, dpi=150, bbox_inches="tight", facecolor="#111111")
@@ -639,12 +760,12 @@ class WLApp(ctk.CTk):
 
         ctk.CTkLabel(
             right_card,
-            text="Corrected Displacements  (G0 baseline removed)",
+            text="Corrected Displacements  (MEC setup error removed)",
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(pady=(12, 2))
         ctk.CTkLabel(
             right_card,
-            text="True mechanical isocenter walk",
+            text="Mechanical walk  (all 4 angles used to estimate setup error)",
             font=ctk.CTkFont(size=10),
             text_color="gray",
         ).pack(pady=(0, 6))
@@ -659,7 +780,7 @@ class WLApp(ctk.CTk):
 
         self._walk_label = ctk.CTkLabel(
             bottom,
-            text=f"Max 2D Mechanical Walk: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)",
+            text=f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)",
             font=ctk.CTkFont(size=13),
         )
         self._walk_label.pack(side="left")
@@ -759,7 +880,7 @@ class WLApp(ctk.CTk):
 
         self._walk_label.configure(
             text=(
-                f"Max 2D Mechanical Walk: {walk:.3f} mm   "
+                f"Walk Circle Radius: {walk:.3f} mm   "
                 f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
             )
         )
@@ -919,7 +1040,7 @@ def generate_pdf_report(
         ["Field Size:", f"{FIELD_SIZE_MM:.0f}×{FIELD_SIZE_MM:.0f} mm",
          "Void Diameter:", f"{VOID_DIAMETER_MM:.1f} mm (air)"],
         ["Tolerance:", f"≤ {TOLERANCE_MM:.1f} mm",
-         "G0 Setup Error:", f"{baseline_dr:.3f} mm  (ΔX={baseline_dx:+.3f}, ΔY={baseline_dy:+.3f})"],
+         "MEC Setup Error:", f"{baseline_dr:.3f} mm  (ΔX={baseline_dx:+.3f}, ΔY={baseline_dy:+.3f})"],
     ]
     meta_tbl = Table(meta_rows, colWidths=[1.1*inch, 2.1*inch, 1.3*inch, 2.5*inch])
     meta_tbl.setStyle(TableStyle([
@@ -939,7 +1060,7 @@ def generate_pdf_report(
     status_text = "PASS" if passed else "FAIL"
     banner_bg   = _GREEN if passed else _RED
     pf_tbl = Table(
-        [[f"OVERALL RESULT:  {status_text}       Max Walk = {max_walk:.3f} mm"]],
+        [[f"OVERALL RESULT:  {status_text}       Walk Circle Radius = {max_walk:.3f} mm"]],
         colWidths=[7.1 * inch],
     )
     pf_tbl.setStyle(TableStyle([
@@ -956,6 +1077,13 @@ def generate_pdf_report(
 
     # ── Raw displacements ─────────────────────────────────────────────────────
     story.append(Paragraph("Raw Displacements  (Field Centre → Void Centre)", h2_style))
+    story.append(Paragraph(
+        f"MEC centre (setup error estimate): "
+        f"ΔX={baseline_dx:+.3f} mm, ΔY={baseline_dy:+.3f} mm  |  "
+        f"Walk circle radius: {max_walk:.3f} mm",
+        ParagraphStyle("mecnote", parent=ss["Normal"], fontSize=9,
+                       textColor=colors.HexColor("#444444"), spaceAfter=4),
+    ))
 
     raw_header = [
         "Gantry", "ΔX raw (mm)", "ΔY raw (mm)", "|ΔR| raw (mm)", "Note"
@@ -964,7 +1092,7 @@ def generate_pdf_report(
     for angle in GANTRY_ANGLES:
         r  = wl_results["per_angle"][angle]
         dr = np.sqrt(r["raw_dx"] ** 2 + r["raw_dy"] ** 2)
-        note = "← Baseline (subtracted from all)" if angle == 0 else ""
+        note = ""
         raw_data.append([
             f"G{angle:03d}°",
             f"{r['raw_dx']:+.3f}",
@@ -992,7 +1120,7 @@ def generate_pdf_report(
 
     # ── Corrected displacements ───────────────────────────────────────────────
     story.append(Paragraph(
-        "Corrected Displacements  (G0° Baseline Removed — True Mechanical Isocenter Walk)",
+        "Corrected Displacements  (MEC Setup Error Removed — Mechanical Isocenter Walk)",
         h2_style,
     ))
 
@@ -1017,7 +1145,7 @@ def generate_pdf_report(
 
     # Summary row
     corr_data.append([
-        "MAX WALK", "", "", f"{max_walk:.3f}",
+        "WALK CIRCLE r", "", "", f"{max_walk:.3f}",
         "PASS" if passed else "FAIL",
     ])
 
@@ -1052,11 +1180,12 @@ def generate_pdf_report(
             spaceAfter=4,
         )
         story.append(Paragraph(
-            "Cyan dashed box = radiation field boundary.  "
-            "Cyan dotted crosshair = field centre.  "
-            "Red + and circle = detected void centre (circle = 6.4 mm diameter at isocenter).  "
-            "Yellow arrow = raw displacement vector (field → void).  "
-            "White bar = 5 mm scale at isocenter.",
+            "Cyan dashed box = 40×40 mm radiation field boundary (field of view).  "
+            "Cyan dotted crosshair = field centre (radiation isocenter).  "
+            "Coloured + and circle = detected void centre; circle = 6.4 mm air void diameter at isocenter.  "
+            "Yellow arrow = raw displacement vector (field centre → void centre).  "
+            "White bar = 5 mm scale at isocenter.  "
+            "5th panel: displacement map — coloured dots = raw void positions, white circle = MEC walk circle.",
             caption_style,
         ))
         # Scale image to full usable page width, preserving aspect ratio
@@ -1074,28 +1203,31 @@ def generate_pdf_report(
     story.append(Paragraph(
         "<b>Void Detection (Inverted Logic):</b>  The MIMI phantom isocenter target is a "
         f"{VOID_DIAMETER_MM} mm diameter air void embedded in acetal copolymer (ρ ≈ 1.41 g/cm³). "
-        "At MV energies, air attenuates significantly less than acetal, so the void appears "
-        "<i>bright</i> on the EPID portal image — the opposite of a steel BB. "
-        "Detection: Gaussian pre-filter (σ ≈ void_radius × 0.30 px) to suppress MV portal noise; "
-        f"threshold at the {VOID_PERCENTILE_THRESHOLD}th percentile within a "
-        f"{FIELD_SIZE_MM * VOID_SEARCH_HALF_FIELD_FRACTION:.0f} mm search window centred on "
-        "the radiation field; blob selection by area proximity to π·(3.2 mm)² and distance to "
-        "field centre; intensity-weighted centroid for sub-pixel localisation.",
+        "At MV energies air attenuates less than acetal, so the void receives more dose and appears "
+        "as the LOCAL MINIMUM pixel value in the field on Elekta iViewGT RTIMAGEs "
+        "(inverted storage convention: LOW value = HIGH dose). "
+        "Detection: Gaussian pre-filter (σ ≈ void_radius × 0.30 px); global minimum in the "
+        f"{FIELD_SIZE_MM * VOID_SEARCH_HALF_FIELD_FRACTION:.0f} mm search window; "
+        "inverse-intensity-squared centroid for sub-pixel localisation. "
+        "Portal images are windowed to field-interior pixels only to make the ~7% void contrast visible.",
         note_style,
     ))
     story.append(Spacer(1, 0.05 * inch))
     story.append(Paragraph(
-        "<b>Baseline Correction:</b>  The G0° raw displacement vector (ΔX, ΔY) encodes "
-        "the residual couch positioning error remaining after the CBCT-guided setup shift "
-        "(≤ 1.0 mm clinically expected). This static offset is subtracted from G90°, G180°, "
-        "and G270° displacements to yield the purely mechanical component of isocenter walk. "
-        "G0° itself is defined as the zero-reference and therefore shows 0.00 mm corrected.",
+        "<b>Walk Circle (Minimum Enclosing Circle):</b>  The residual CBCT setup error is estimated "
+        "from ALL four gantry angles as the centre of the Minimum Enclosing Circle (MEC) of the four "
+        "raw void-to-field-centre displacement vectors (ΔX, ΔY). "
+        "Using all four images avoids the coordinate-system ambiguity of single-angle baseline "
+        "subtraction and gives a geometry-independent estimate of the static setup error. "
+        "Subtracting the MEC centre from each raw vector yields the per-angle mechanical walk. "
+        "The MEC radius is the smallest circle containing all four walk vectors — the walk circle metric.",
         note_style,
     ))
     story.append(Spacer(1, 0.05 * inch))
     story.append(Paragraph(
-        f"<b>Tolerance:</b>  Maximum corrected 2D displacement ≤ {TOLERANCE_MM:.1f} mm = PASS.  "
-        "Evaluated independently at G90°, G180°, G270° relative to the G0° baseline.",
+        f"<b>Tolerance:</b>  Walk circle radius ≤ {TOLERANCE_MM:.1f} mm = PASS.  "
+        "Pixel spacing corrected from detector plane to isocenter using "
+        "SAD/SID magnification (spacing_iso = spacing_det × SAD/SID).",
         note_style,
     ))
 
