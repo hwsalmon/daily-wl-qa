@@ -10,7 +10,7 @@ so the void is the LOCAL MINIMUM within the irradiated field — detected as the
 darkest spot in the field-windowed portal image.
 
 Baseline correction: the G0° displacement (residual CBCT couch setup error) is
-subtracted from all cardinal-angle displacements to isolate true mechanical walk.
+subtracted from all cardinal-angle displacements to isolate true radiation/mechanical walk.
 """
 
 import os
@@ -75,7 +75,7 @@ if _missing:
     sys.exit(1)
 
 # ── Clinical constants ────────────────────────────────────────────────────────
-TOLERANCE_MM        = 1.0    # Maximum 2D mechanical walk (PASS/FAIL threshold)
+TOLERANCE_MM        = 1.0    # Maximum 2D radiation/mechanical walk (PASS/FAIL threshold)
 VOID_DIAMETER_MM    = 6.4    # MIMI phantom air void diameter
 FIELD_SIZE_MM       = 40.0   # Nominal field size (40×40 mm)
 GANTRY_ANGLES       = [0, 90, 180, 270]
@@ -451,7 +451,7 @@ def compute_wl_results(image_results: dict) -> dict:
     The residual CBCT setup error is estimated from ALL four images as the centre
     of the Minimum Enclosing Circle (MEC) of the four raw void-to-field-centre
     displacement vectors.  Subtracting the MEC centre from each raw vector gives
-    the per-angle mechanical walk.  The MEC radius is the walk circle metric
+    the per-angle radiation/mechanical walk.  The MEC radius is the walk circle metric
     (smallest circle containing all four walk vectors) used for PASS/FAIL.
 
     Using all four angles to estimate setup error is more robust than the single
@@ -825,12 +825,12 @@ class WLApp(ctk.CTk):
 
         ctk.CTkLabel(
             right_card,
-            text="Corrected Displacements  (MEC setup error removed)",
+            text="Corrected Displacements  (Radiation/Mechanical Walk)",
             font=ctk.CTkFont(size=15, weight="bold"),
         ).pack(pady=(14, 2))
         ctk.CTkLabel(
             right_card,
-            text="Mechanical walk  (all 4 angles used to estimate setup error)",
+            text="Radiation/mechanical walk  (all 4 angles used to estimate setup error)",
             font=ctk.CTkFont(size=12),
             text_color="gray",
         ).pack(pady=(0, 6))
@@ -1436,7 +1436,7 @@ def generate_pdf_report(
 
     # ── Corrected displacements ───────────────────────────────────────────────
     story.append(Paragraph(
-        "Corrected Displacements  (MEC Setup Error Removed — Mechanical Isocenter Walk)",
+        "Corrected Displacements  (MEC Setup Error Removed — Radiation/Mechanical Isocenter Walk)",
         h2_style,
     ))
 
@@ -1535,7 +1535,7 @@ def generate_pdf_report(
         "raw void-to-field-centre displacement vectors (ΔX, ΔY). "
         "Using all four images avoids the coordinate-system ambiguity of single-angle baseline "
         "subtraction and gives a geometry-independent estimate of the static setup error. "
-        "Subtracting the MEC centre from each raw vector yields the per-angle mechanical walk. "
+        "Subtracting the MEC centre from each raw vector yields the per-angle radiation/mechanical walk. "
         "The MEC radius is the smallest circle containing all four walk vectors — the walk circle metric.",
         note_style,
     ))
