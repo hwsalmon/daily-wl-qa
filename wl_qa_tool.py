@@ -112,7 +112,24 @@ PHYSICISTS = [
     "Logen Hall, MS, DABR",
 ]
 
-DB_PATH = Path(__file__).parent / "wl_qa_history.db"
+DB_PATH     = Path(__file__).parent / "wl_qa_history.db"
+CONFIG_PATH = Path(__file__).parent / "wl_qa_config.json"
+
+
+def _load_config() -> dict:
+    import json
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    import json
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
 
 
 # ── DICOM loading ─────────────────────────────────────────────────────────────
@@ -718,6 +735,7 @@ class WLApp(ctk.CTk):
         self._machine_var   = tk.StringVar(value=MACHINES[0])
         self._physicist_var = tk.StringVar(value=PHYSICISTS[0])
 
+        self._config = _load_config()
         _init_db()
         self._build_ui()
 
@@ -917,9 +935,14 @@ class WLApp(ctk.CTk):
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _load_directory(self):
-        directory = filedialog.askdirectory(title="Select DICOM Directory")
+        directory = filedialog.askdirectory(
+            title="Select DICOM Directory",
+            initialdir=self._config.get("last_dicom_dir", str(Path.home())),
+        )
         if not directory:
             return
+        self._config["last_dicom_dir"] = directory
+        _save_config(self._config)
 
         self._dir_label.configure(text=Path(directory).name)
         self._pf_label.configure(text="Processing…", text_color="gray")
@@ -1063,10 +1086,13 @@ class WLApp(ctk.CTk):
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
             initialfile=default_name,
+            initialdir=self._config.get("last_report_dir", str(Path.home())),
             title="Save Daily QA Report",
         )
         if not save_path:
             return
+        self._config["last_report_dir"] = str(Path(save_path).parent)
+        _save_config(self._config)
 
         try:
             generate_pdf_report(
