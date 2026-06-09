@@ -1003,10 +1003,7 @@ class WLApp(QMainWindow):
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setSpacing(4)
 
-        if prefix == "raw":
-            headers = ["Angle", "ΔX (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
-        else:
-            headers = ["Angle", "ΔLat/AP (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
+        headers = ["Angle", "ΔLat / ΔAP (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
         for c, h in enumerate(headers):
             grid.setColumnStretch(c, 1)
             lbl = QLabel(h)
@@ -1023,7 +1020,8 @@ class WLApp(QMainWindow):
 
         for i, angle in enumerate(GANTRY_ANGLES):
             row = i + 2
-            angle_lbl = QLabel(f"G{angle:03d}°")
+            x_dir = "AP" if angle in (90, 270) else "Lat"
+            angle_lbl = QLabel(f"G{angle:03d}°  {x_dir}")
             angle_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             angle_lbl.setStyleSheet("font-size: 17px; font-weight: bold;")
             grid.addWidget(angle_lbl, row, 0)
@@ -1521,7 +1519,7 @@ def generate_pdf_report(
          f"{setup_3d:.3f} mm  (Lat={setup_lat:+.3f},  SI={setup_si:+.3f},  AP={setup_ap:+.3f})",
          "", ""],
     ]
-    meta_tbl = Table(meta_rows, colWidths=[1.2*inch, 2.2*inch, 1.2*inch, 2.5*inch])
+    meta_tbl = Table(meta_rows, colWidths=[1.55*inch, 1.85*inch, 1.2*inch, 2.5*inch])
     meta_tbl.setStyle(TableStyle([
         ("FONTSIZE",   (0, 0), (-1, -1), 9),
         ("FONTNAME",   (0, 0), (0, -1),  "Helvetica-Bold"),
