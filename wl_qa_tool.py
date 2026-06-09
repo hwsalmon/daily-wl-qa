@@ -469,37 +469,54 @@ def _minimum_enclosing_circle(points):
 
 def compute_wl_results(image_results: dict) -> dict:
     """
-    Compute setup-error-corrected displacements and walk circle PASS/FAIL.
+    Compute 3D CBCT setup error, corrected walk residuals, and walk circle PASS/FAIL.
 
-    The residual CBCT setup error is estimated from ALL four images as the centre
-    of the Minimum Enclosing Circle (MEC) of the four raw void-to-field-centre
-    displacement vectors.  Subtracting the MEC centre from each raw vector gives
-    the per-angle isocenter walk.  The MEC radius is the walk circle metric
-    (smallest circle containing all four walk vectors) used for PASS/FAIL.
+    Elekta iViewGT portal images are stored with a CONSISTENT patient coordinate
+    orientation at all gantry angles (no coordinate flip at opposing angles).
+    The portal-plane axes map to patient space as follows:
+        G0°  / G180°  portal-X = patient lateral (L/R)
+        G90° / G270°  portal-X = patient AP (A/P)
+        All angles    portal-Y = patient SI (S/I)
 
-    Using all four angles to estimate setup error is more robust than the single
-    G0° reference, and avoids the coordinate-flip ambiguity that affects the
-    naive G0 subtraction at G180°.
+    3D CBCT residual setup error is therefore:
+        Lateral = mean(ΔX_G0, ΔX_G180)
+        SI      = mean(ΔY_G0, ΔY_G90, ΔY_G180, ΔY_G270)
+        AP      = mean(ΔX_G90, ΔX_G270)
+
+    Subtracting the angle-appropriate component from each raw displacement yields
+    pure mechanical walk residuals.  The Minimum Enclosing Circle of the four
+    corrected walk vectors gives the walk circle metric.
     """
-    raw = [(image_results[a]["dx_mm"], image_results[a]["dy_mm"]) for a in GANTRY_ANGLES]
-    cx, cy, walk_r = _minimum_enclosing_circle(raw)
+    dx = {a: image_results[a]["dx_mm"] for a in GANTRY_ANGLES}
+    dy = {a: image_results[a]["dy_mm"] for a in GANTRY_ANGLES}
+
+    setup_x = (dx[0]  + dx[180]) / 2                               # patient lateral (mm)
+    setup_y = (dy[0]  + dy[90] + dy[180] + dy[270]) / 4            # patient SI (mm)
+    setup_z = (dx[90] + dx[270]) / 2                               # patient AP (mm)
 
     per_angle = {}
     for angle in GANTRY_ANGLES:
-        r = image_results[angle]
+        x_corr = setup_z if angle in (90, 270) else setup_x        # lateral vs AP
         per_angle[angle] = {
-            "raw_dx": r["dx_mm"],
-            "raw_dy": r["dy_mm"],
-            "rel_dx": r["dx_mm"] - cx,
-            "rel_dy": r["dy_mm"] - cy,
+            "raw_dx": dx[angle],
+            "raw_dy": dy[angle],
+            "rel_dx": dx[angle] - x_corr,
+            "rel_dy": dy[angle] - setup_y,
         }
+
+    corrected_pts = [(per_angle[a]["rel_dx"], per_angle[a]["rel_dy"]) for a in GANTRY_ANGLES]
+    _, _, walk_r = _minimum_enclosing_circle(corrected_pts)
 
     return {
         "per_angle":      per_angle,
-        "baseline_dx":    cx,       # MEC centre X (setup error estimate)
-        "baseline_dy":    cy,       # MEC centre Y
+        "setup_x":        setup_x,    # patient lateral (mm)
+        "setup_y":        setup_y,    # patient SI (mm)
+        "setup_z":        setup_z,    # patient AP (mm)
+        "baseline_dx":    setup_x,    # backward-compat alias
+        "baseline_dy":    setup_y,
+        "baseline_dz":    setup_z,
         "walk_circle_r":  walk_r,
-        "max_2d_walk_mm": walk_r,   # used by GUI / PDF for PASS/FAIL banner
+        "max_2d_walk_mm": walk_r,
         "pass_fail":      walk_r <= TOLERANCE_MM,
     }
 
@@ -621,10 +638,11 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
 
         # Panel title (colour = angle colour, status = corrected walk magnitude)
         corr_label = f"{corr_dr:.3f} mm"
+        x_dir = "AP" if angle in (90, 270) else "Lat"
         ax.set_title(
             f"G{angle:03d}°  |  Raw |ΔR|={np.hypot(wla['raw_dx'],wla['raw_dy']):.3f} mm\n"
-            f"Raw  ΔX={wla['raw_dx']:+.3f}  ΔY={wla['raw_dy']:+.3f} mm\n"
-            f"Corr ΔX={wla['rel_dx']:+.3f}  ΔY={wla['rel_dy']:+.3f}  [{corr_label}]",
+            f"Raw  Δ{x_dir}={wla['raw_dx']:+.3f}  ΔSI={wla['raw_dy']:+.3f} mm\n"
+            f"Corr Δ{x_dir}={wla['rel_dx']:+.3f}  ΔSI={wla['rel_dy']:+.3f}  [{corr_label}]",
             color=col, fontsize=7.5, fontweight="bold",
         )
         ax.tick_params(colors="#777777", labelsize=6)
@@ -637,8 +655,9 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
     for sp in disp_ax.spines.values():
         sp.set_color("#444444")
     disp_ax.tick_params(colors="#aaaaaa", labelsize=8)
-    disp_ax.set_xlabel("ΔX (mm)", color="#aaaaaa", fontsize=9)
-    disp_ax.set_ylabel("ΔY (mm)", color="#aaaaaa", fontsize=9)
+    disp_ax.set_xlabel("ΔX (mm)  [Lat at G0°/G180°,  AP at G90°/G270°]",
+                       color="#aaaaaa", fontsize=8)
+    disp_ax.set_ylabel("ΔSI (mm)", color="#aaaaaa", fontsize=9)
     disp_ax.set_title(
         f"Void Displacement Map\n"
         f"Walk circle r = {walk_r:.3f} mm  "
@@ -655,10 +674,12 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
     # Origin = ideal radiation isocenter
     disp_ax.plot(0, 0, "w+", ms=14, mew=2.0, zorder=6, label="Field ctr (ideal)")
 
-    # MEC centre = setup error estimate
-    ecx = wl_results["baseline_dx"]
-    ecy = wl_results["baseline_dy"]
-    disp_ax.plot(ecx, ecy, "w*", ms=10, zorder=6, label=f"MEC ctr ({ecx:+.2f},{ecy:+.2f})")
+    # Setup error (lateral shown on X axis; AP shown separately in title)
+    ecx = wl_results["setup_x"]    # lateral
+    ecy = wl_results["setup_y"]    # SI
+    ecz = wl_results["setup_z"]    # AP
+    disp_ax.plot(ecx, ecy, "w*", ms=10, zorder=6,
+                 label=f"Setup Lat={ecx:+.2f} SI={ecy:+.2f} AP={ecz:+.2f}")
 
     # Walk circle
     theta = np.linspace(0, 2 * np.pi, 300)
@@ -924,12 +945,10 @@ class WLApp(QMainWindow):
         )
         right_layout.addWidget(corr_title)
 
-        corr_sub = QLabel(
-            "Isocenter walk  (all 4 angles used to estimate setup error)"
-        )
-        corr_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        corr_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
-        right_layout.addWidget(corr_sub)
+        self._corr_sub = QLabel("Isocenter walk  (3D setup error removed)")
+        self._corr_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._corr_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
+        right_layout.addWidget(self._corr_sub)
 
         corr_tbl_widget = QWidget()
         corr_tbl_widget.setStyleSheet("background: transparent;")
@@ -984,7 +1003,10 @@ class WLApp(QMainWindow):
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setSpacing(4)
 
-        headers = ["Angle", "ΔX (mm)", "ΔY (mm)", "|ΔR| (mm)"]
+        if prefix == "raw":
+            headers = ["Angle", "ΔX (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
+        else:
+            headers = ["Angle", "ΔLat/AP (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
         for c, h in enumerate(headers):
             grid.setColumnStretch(c, 1)
             lbl = QLabel(h)
@@ -1105,6 +1127,11 @@ class WLApp(QMainWindow):
             f"Walk Circle Radius: {walk:.3f} mm   "
             f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
         )
+        sx = wl["setup_x"]; sy = wl["setup_y"]; sz = wl["setup_z"]
+        self._corr_sub.setText(
+            f"CBCT setup: Lat={sx:+.3f} mm   SI={sy:+.3f} mm   AP={sz:+.3f} mm"
+        )
+        self._corr_sub.setStyleSheet("font-size: 12px; color: #90caf9; background: transparent;")
 
         def _color(v):
             if v < 0.5:
@@ -1325,7 +1352,7 @@ class WLApp(QMainWindow):
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def _init_db():
-    """Create the wl_records table if it does not already exist."""
+    """Create the wl_records table if it does not already exist, and migrate schema."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS wl_records (
@@ -1338,12 +1365,18 @@ def _init_db():
             pass_fail       INTEGER NOT NULL,
             baseline_dx     REAL,
             baseline_dy     REAL,
+            baseline_dz     REAL,
             raw_dx_G0       REAL, raw_dy_G0   REAL,
             raw_dx_G90      REAL, raw_dy_G90  REAL,
             raw_dx_G180     REAL, raw_dy_G180 REAL,
             raw_dx_G270     REAL, raw_dy_G270 REAL
         )
     """)
+    # Migrate older databases that lack baseline_dz
+    try:
+        conn.execute("ALTER TABLE wl_records ADD COLUMN baseline_dz REAL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -1357,12 +1390,12 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
         """INSERT INTO wl_records (
             date, time, machine_name, physicist_name,
             walk_circle_r, pass_fail,
-            baseline_dx, baseline_dy,
+            baseline_dx, baseline_dy, baseline_dz,
             raw_dx_G0,  raw_dy_G0,
             raw_dx_G90, raw_dy_G90,
             raw_dx_G180,raw_dy_G180,
             raw_dx_G270,raw_dy_G270
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             now.strftime("%Y-%m-%d"),
             now.strftime("%H:%M"),
@@ -1371,6 +1404,7 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
             1 if wl_results["pass_fail"] else 0,
             wl_results["baseline_dx"],
             wl_results["baseline_dy"],
+            wl_results["baseline_dz"],
             pa[0]["raw_dx"],   pa[0]["raw_dy"],
             pa[90]["raw_dx"],  pa[90]["raw_dy"],
             pa[180]["raw_dx"], pa[180]["raw_dy"],
@@ -1472,9 +1506,10 @@ def generate_pdf_report(
     time_str    = datetime.datetime.now().strftime("%H:%M")
     max_walk  = wl_results["max_2d_walk_mm"]
     passed    = wl_results["pass_fail"]
-    baseline_dx = wl_results["baseline_dx"]
-    baseline_dy = wl_results["baseline_dy"]
-    baseline_dr = np.sqrt(baseline_dx ** 2 + baseline_dy ** 2)
+    setup_lat = wl_results["setup_x"]    # patient lateral
+    setup_si  = wl_results["setup_y"]    # patient SI
+    setup_ap  = wl_results["setup_z"]    # patient AP
+    setup_3d  = float(np.sqrt(setup_lat**2 + setup_si**2 + setup_ap**2))
 
     meta_rows = [
         ["Date:", today_str,           "Time:",        time_str],
@@ -1482,8 +1517,8 @@ def generate_pdf_report(
         ["Physicist:", physicist_name, "Field Size:",  f"{FIELD_SIZE_MM:.0f}×{FIELD_SIZE_MM:.0f} mm"],
         ["Void Diameter:", f"{VOID_DIAMETER_MM:.1f} mm (air)",
          "Tolerance:", f"≤ {TOLERANCE_MM:.1f} mm"],
-        ["MEC Setup Error:",
-         f"{baseline_dr:.3f} mm  (ΔX={baseline_dx:+.3f}, ΔY={baseline_dy:+.3f})",
+        ["CBCT Setup Error (3D):",
+         f"{setup_3d:.3f} mm  (Lat={setup_lat:+.3f},  SI={setup_si:+.3f},  AP={setup_ap:+.3f})",
          "", ""],
     ]
     meta_tbl = Table(meta_rows, colWidths=[1.2*inch, 2.2*inch, 1.2*inch, 2.5*inch])
@@ -1523,27 +1558,26 @@ def generate_pdf_report(
     # ── Raw displacements ─────────────────────────────────────────────────────
     story.append(Paragraph("Raw Displacements  (Field Centre → Void Centre)", h2_style))
     story.append(Paragraph(
-        f"MEC centre (setup error estimate): "
-        f"ΔX={baseline_dx:+.3f} mm, ΔY={baseline_dy:+.3f} mm  |  "
+        f"3D CBCT setup error: Lateral={setup_lat:+.3f} mm,  SI={setup_si:+.3f} mm,  AP={setup_ap:+.3f} mm  |  "
         f"Walk circle radius: {max_walk:.3f} mm",
         ParagraphStyle("mecnote", parent=ss["Normal"], fontSize=9,
                        textColor=colors.HexColor("#444444"), spaceAfter=4),
     ))
 
     raw_header = [
-        "Gantry", "ΔX raw (mm)", "ΔY raw (mm)", "|ΔR| raw (mm)", "Note"
+        "Gantry", "ΔX raw (mm)", "ΔSI raw (mm)", "|ΔR| raw (mm)", "ΔX represents"
     ]
     raw_data = [raw_header]
     for angle in GANTRY_ANGLES:
         r  = wl_results["per_angle"][angle]
         dr = np.sqrt(r["raw_dx"] ** 2 + r["raw_dy"] ** 2)
-        note = ""
+        x_dir = "AP (patient A/P)" if angle in (90, 270) else "Lateral (patient L/R)"
         raw_data.append([
             f"G{angle:03d}°",
             f"{r['raw_dx']:+.3f}",
             f"{r['raw_dy']:+.3f}",
             f"{dr:.3f}",
-            note,
+            x_dir,
         ])
 
     raw_tbl = Table(raw_data, colWidths=[0.9*inch, 1.2*inch, 1.2*inch, 1.3*inch, 2.5*inch])
@@ -1565,23 +1599,21 @@ def generate_pdf_report(
 
     # ── Corrected displacements ───────────────────────────────────────────────
     story.append(Paragraph(
-        "Corrected Displacements  (MEC Setup Error Removed — Isocenter Walk)",
+        "Corrected Displacements  (3D Setup Error Removed — Isocenter Walk)",
         h2_style,
     ))
 
     corr_header = [
-        "Gantry", "ΔX corr (mm)", "ΔY corr (mm)", "|ΔR| corr (mm)", "Status"
+        "Gantry", "ΔLat/AP corr (mm)", "ΔSI corr (mm)", "|ΔR| corr (mm)", "Status"
     ]
     corr_data = [corr_header]
     for angle in GANTRY_ANGLES:
         r  = wl_results["per_angle"][angle]
         dr = np.sqrt(r["rel_dx"] ** 2 + r["rel_dy"] ** 2)
-        if angle == 0:
-            status_cell = "—  (reference)"
-        else:
-            status_cell = "✓  PASS" if dr <= TOLERANCE_MM else "✗  FAIL"
+        x_dir = "AP walk" if angle in (90, 270) else "Lat walk"
+        status_cell = "✓  PASS" if dr <= TOLERANCE_MM else "✗  FAIL"
         corr_data.append([
-            f"G{angle:03d}°",
+            f"G{angle:03d}°  ({x_dir})",
             f"{r['rel_dx']:+.3f}",
             f"{r['rel_dy']:+.3f}",
             f"{dr:.3f}",
@@ -1595,7 +1627,7 @@ def generate_pdf_report(
     ])
 
     last_row_bg = _GREEN_LITE if passed else _RED_LITE
-    corr_tbl = Table(corr_data, colWidths=[0.9*inch, 1.2*inch, 1.2*inch, 1.3*inch, 2.5*inch])
+    corr_tbl = Table(corr_data, colWidths=[1.3*inch, 1.2*inch, 1.2*inch, 1.2*inch, 2.2*inch])
     corr_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0),  (-1, 0),  _BLUE_DARK),
         ("TEXTCOLOR",     (0, 0),  (-1, 0),  colors.white),
@@ -1659,13 +1691,20 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 0.05 * inch))
     story.append(Paragraph(
-        "<b>Walk Circle (Minimum Enclosing Circle):</b>  The residual CBCT setup error is estimated "
-        "from ALL four gantry angles as the centre of the Minimum Enclosing Circle (MEC) of the four "
-        "raw void-to-field-centre displacement vectors (ΔX, ΔY). "
-        "Using all four images avoids the coordinate-system ambiguity of single-angle baseline "
-        "subtraction and gives a geometry-independent estimate of the static setup error. "
-        "Subtracting the MEC centre from each raw vector yields the per-angle isocenter walk. "
-        "The MEC radius is the smallest circle containing all four walk vectors — the walk circle metric.",
+        "<b>Walk Circle (Minimum Enclosing Circle):</b>  "
+        "Elekta iViewGT portal images are stored with a consistent patient coordinate orientation "
+        "at all gantry angles (no image flip at opposing angles). "
+        "The portal-plane axes map to patient space as: "
+        "G0°/G180° portal-X = patient Lateral (L/R);  "
+        "G90°/G270° portal-X = patient AP (A/P);  "
+        "all angles portal-Y = patient SI (S/I).  "
+        "The residual CBCT setup error in 3D patient coordinates is therefore: "
+        "Lateral = (ΔX_G0 + ΔX_G180)/2,  "
+        "SI = mean(ΔY_G0, ΔY_G90, ΔY_G180, ΔY_G270),  "
+        "AP = (ΔX_G90 + ΔX_G270)/2.  "
+        "Subtracting the angle-appropriate component from each raw displacement yields "
+        "the per-angle isocenter walk residuals.  "
+        "The Minimum Enclosing Circle radius of the four corrected walk vectors is the walk circle metric.",
         note_style,
     ))
     story.append(Spacer(1, 0.05 * inch))
