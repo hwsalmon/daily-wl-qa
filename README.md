@@ -118,17 +118,21 @@ The folder should contain one file per cardinal gantry angle
 ### 3. Review results
 - **PASS/FAIL banner** — walk circle radius vs. 1.0 mm tolerance, shown immediately.
 - **Results tab** — raw displacements (Field → Void) and corrected displacements
-  (MEC setup error removed) for all four angles, colour-coded green/amber/red.
+  (3D setup error removed) for all four angles, colour-coded green/amber/red.
+  The corrected-table subtitle shows the live **3D CBCT setup error**
+  (Lateral / SI / AP mm) derived from all four images.
 - **Portal Images tab** — 5-panel diagnostic figure: one portal image per angle
   (field boundary overlay, crosshair, void marker, displacement arrow, scale bar)
-  plus a 2-D displacement map showing the MEC walk circle.
+  plus a 2-D displacement map showing the walk circle.
 
 ### 4. Generate report
 Click **Generate Daily Report (PDF)**.  
 The report includes:
-- Metadata (machine, physicist, date from DICOM header, phantom, tolerance)
+- Metadata (machine, physicist, date from DICOM header, phantom, tolerance,
+  **3D CBCT setup error** — Lateral / SI / AP mm)
 - Colour PASS/FAIL banner
-- Raw and corrected displacement tables
+- Raw displacement table (ΔX axis labelled Lateral or AP per gantry angle)
+- Corrected displacement table (3D setup error removed; Lat walk / AP walk labelled)
 - Portal diagnostic figure
 - Methodology notes
 - **Electronic signature block** (physicist name, timestamp, 21 CFR Part 11 statement)
@@ -180,13 +184,27 @@ no other changes are needed.
 
 ## Clinical notes
 
-### Why MEC instead of G0 subtraction?
+### Portal coordinate system
 
-Naive baseline subtraction (raw − G0) doubles the CBCT setup error at G180
-because the Y-axis displacement appears with opposite sign at opposing angles.
-The **Minimum Enclosing Circle** of all four displacement vectors estimates the
-static setup error geometry-independently; its radius is the smallest circle
-that contains all four walk vectors and is the correct metric for reporting.
+Elekta iViewGT stores portal images with a **consistent patient orientation** at
+all gantry angles (no image flip at opposing gantry positions).
+
+| Gantry | Portal X | Portal Y |
+|--------|----------|----------|
+| G0° / G180° | Patient **Lateral** (L/R) | Patient **SI** (S/I) |
+| G90° / G270° | Patient **AP** (A/P) | Patient **SI** (S/I) |
+
+The 3D CBCT residual setup error is therefore:
+
+```
+Lateral = (ΔX_G0  + ΔX_G180) / 2
+SI      = mean(ΔY_G0, ΔY_G90, ΔY_G180, ΔY_G270)
+AP      = (ΔX_G90 + ΔX_G270) / 2
+```
+
+Subtracting the angle-appropriate component from each raw displacement yields
+pure mechanical walk residuals. The **Minimum Enclosing Circle** radius of those
+four residual vectors is the walk circle metric.
 
 ### Pass/Fail criterion
 
