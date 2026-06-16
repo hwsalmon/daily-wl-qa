@@ -278,10 +278,13 @@ def find_field_center(arr: np.ndarray, spacing_mm: float) -> tuple:
     Storage convention: LOW pixel value = high dose (inverted relative to dose).
     The irradiated field is therefore the DARK region of the image against a
     near-saturated (bright) background.  We threshold at the 50th percentile of
-    the normalised range, isolate the largest dark blob, and return its
-    bounding-box geometric midpoint (more stable than centroid for flat-top fields).
+    the normalised range, isolate the largest dark blob, and return two estimates:
+      - BBox midpoint: (min+max)/2 per axis — 0.5-px quantisation, robust to
+        interior inhomogeneity
+      - Geometric centroid: mean of all field pixel coordinates — sub-pixel
+        precision, sensitive to edge asymmetry
 
-    Returns (col_px, row_px) — i.e. (x, y) in image coordinates.
+    Returns ((bbox_col, bbox_row), (centroid_col, centroid_row)).
     """
     norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-9)
     # Field = DARK (low norm); background = BRIGHT (high norm)
@@ -293,15 +296,19 @@ def find_field_center(arr: np.ndarray, spacing_mm: float) -> tuple:
 
     labeled, n = scipy_label(field_mask > 0)
     if n == 0:
-        return arr.shape[1] / 2.0, arr.shape[0] / 2.0
+        cx = arr.shape[1] / 2.0
+        cy = arr.shape[0] / 2.0
+        return (cx, cy), (cx, cy)
 
     sizes = ndimage_sum(field_mask > 0, labeled, range(1, n + 1))
     largest = int(np.argmax(sizes)) + 1
     rows, cols = np.where(labeled == largest)
 
-    col_center = (cols.min() + cols.max()) / 2.0
-    row_center = (rows.min() + rows.max()) / 2.0
-    return col_center, row_center
+    bbox_col = (cols.min() + cols.max()) / 2.0
+    bbox_row = (rows.min() + rows.max()) / 2.0
+    cent_col = float(cols.mean())
+    cent_row = float(rows.mean())
+    return (bbox_col, bbox_row), (cent_col, cent_row)
 
 
 def find_void_center(
@@ -396,20 +403,25 @@ def analyze_image(ds) -> dict:
     arr, spacing = get_pixel_array(ds)
     gantry = float(getattr(ds, "GantryAngle", 0.0))
 
-    field_center_px = find_field_center(arr, spacing)
-    void_center_px  = find_void_center(arr, spacing, field_center_px)
+    field_center_bbox_px, field_center_cent_px = find_field_center(arr, spacing)
+    void_center_px = find_void_center(arr, spacing, field_center_bbox_px)
 
-    dx_px = void_center_px[0] - field_center_px[0]
-    dy_px = void_center_px[1] - field_center_px[1]
+    dx_px_bbox = void_center_px[0] - field_center_bbox_px[0]
+    dy_px_bbox = void_center_px[1] - field_center_bbox_px[1]
+    dx_px_cent = void_center_px[0] - field_center_cent_px[0]
+    dy_px_cent = void_center_px[1] - field_center_cent_px[1]
 
     return {
-        "gantry":          gantry,
-        "spacing_mm":      spacing,
-        "field_center_px": field_center_px,
-        "void_center_px":  void_center_px,
-        "dx_mm":           dx_px * spacing,
-        "dy_mm":           dy_px * spacing,
-        "pixel_array":     arr,
+        "gantry":               gantry,
+        "spacing_mm":           spacing,
+        "field_center_px":      field_center_bbox_px,
+        "field_center_cent_px": field_center_cent_px,
+        "void_center_px":       void_center_px,
+        "dx_mm":                dx_px_bbox * spacing,
+        "dy_mm":                dy_px_bbox * spacing,
+        "dx_mm_cent":           dx_px_cent * spacing,
+        "dy_mm_cent":           dy_px_cent * spacing,
+        "pixel_array":          arr,
     }
 
 
@@ -467,7 +479,11 @@ def _minimum_enclosing_circle(points):
     return best
 
 
-def compute_wl_results(image_results: dict) -> dict:
+def compute_wl_results(
+    image_results: dict,
+    dx_key: str = "dx_mm",
+    dy_key: str = "dy_mm",
+) -> dict:
     """
     Compute 3D CBCT setup error, corrected walk residuals, and walk circle PASS/FAIL.
 
@@ -486,9 +502,12 @@ def compute_wl_results(image_results: dict) -> dict:
     Subtracting the angle-appropriate component from each raw displacement yields
     pure mechanical walk residuals.  The Minimum Enclosing Circle of the four
     corrected walk vectors gives the walk circle metric.
+
+    dx_key / dy_key select which displacement keys to read from each angle's dict,
+    allowing comparison between field-center detection methods.
     """
-    dx = {a: image_results[a]["dx_mm"] for a in GANTRY_ANGLES}
-    dy = {a: image_results[a]["dy_mm"] for a in GANTRY_ANGLES}
+    dx = {a: image_results[a][dx_key] for a in GANTRY_ANGLES}
+    dy = {a: image_results[a][dy_key] for a in GANTRY_ANGLES}
 
     setup_x = (dx[0]  + dx[180]) / 2                               # patient lateral (mm)
     setup_y = (dy[0]  + dy[90] + dy[180] + dy[270]) / 4            # patient SI (mm)
@@ -609,9 +628,22 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             edgecolor="cyan", facecolor="none", lw=1.2, ls="--", alpha=0.8,
         ))
 
-        # Field centre crosshairs
-        ax.axhline(fc[1], color="cyan", lw=0.8, ls=":", alpha=0.7)
-        ax.axvline(fc[0], color="cyan", lw=0.8, ls=":", alpha=0.7)
+        # Field centre crosshairs — BBox midpoint (cyan) and geometric centroid (orange)
+        ax.axhline(fc[1], color="cyan",   lw=0.8, ls=":",  alpha=0.7)
+        ax.axvline(fc[0], color="cyan",   lw=0.8, ls=":",  alpha=0.7)
+        fcc = r.get("field_center_cent_px")
+        if fcc is not None:
+            ax.axhline(fcc[1], color="orange", lw=0.8, ls="-.", alpha=0.6)
+            ax.axvline(fcc[0], color="orange", lw=0.8, ls="-.", alpha=0.6)
+            dcx = (fcc[0] - fc[0]) * spc
+            dcy = (fcc[1] - fc[1]) * spc
+            ax.text(
+                0.02, 0.02,
+                f"ΔFc  x={dcx:+.3f}  y={dcy:+.3f} mm",
+                transform=ax.transAxes,
+                color="white", fontsize=6.0, va="bottom", ha="left",
+                bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
+            )
 
         # Air void circle (6.4 mm diameter) centred on detected void
         void_r_px = (VOID_DIAMETER_MM / 2.0) / spc
@@ -1065,6 +1097,11 @@ class WLApp(QMainWindow):
             dcm_images    = load_dicom_images(directory)
             image_results = {a: analyze_image(ds) for a, ds in dcm_images.items()}
             wl_results    = compute_wl_results(image_results)
+            wl_cent = compute_wl_results(
+                image_results, dx_key="dx_mm_cent", dy_key="dy_mm_cent"
+            )
+            wl_results["walk_circle_r_cent"] = wl_cent["walk_circle_r"]
+            wl_results["pass_fail_cent"]     = wl_cent["pass_fail"]
 
             self._dicom_date = None
             for ds in dcm_images.values():
@@ -1121,10 +1158,17 @@ class WLApp(QMainWindow):
                 "font-size: 30px; font-weight: bold; color: #ef5350; background: transparent;"
             )
 
-        self._walk_label.setText(
-            f"Walk Circle Radius: {walk:.3f} mm   "
-            f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
-        )
+        walk_cent = wl.get("walk_circle_r_cent")
+        if walk_cent is not None:
+            self._walk_label.setText(
+                f"Walk Circle:  BBox = {walk:.3f} mm  │  Centroid = {walk_cent:.3f} mm"
+                f"   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
+            )
+        else:
+            self._walk_label.setText(
+                f"Walk Circle Radius: {walk:.3f} mm   "
+                f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
+            )
         sx = wl["setup_x"]; sy = wl["setup_y"]; sz = wl["setup_z"]
         self._corr_sub.setText(
             f"CBCT setup: Lat={sx:+.3f} mm   SI={sy:+.3f} mm   AP={sz:+.3f} mm"
