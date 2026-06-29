@@ -46,7 +46,7 @@ except ImportError:
     _missing.append("opencv-python")
 
 try:
-    from scipy.ndimage import gaussian_filter, label as scipy_label, sum as ndimage_sum
+    from scipy.ndimage import gaussian_filter, gaussian_filter1d, label as scipy_label, sum as ndimage_sum
 except ImportError:
     _missing.append("scipy")
 
@@ -102,6 +102,25 @@ VOID_PERCENTILE_THRESHOLD = 85
 # Acceptable void blob area range relative to ideal circle area
 VOID_AREA_MIN_RATIO = 0.15
 VOID_AREA_MAX_RATIO = 4.0
+
+# ── Field size constants ───────────────────────────────────────────────────────
+FIELD_SIZE_REF_MM   = 40.0                              # Nominal total field size (both axes)
+MLC_LEAVES_PER_BANK = 8                                 # Leaves per MLC bank
+MLC_LEAF_WIDTH_MM   = FIELD_SIZE_MM / MLC_LEAVES_PER_BANK  # 5.0 mm per leaf (SI)
+FIELD_SIZE_WARN_MM  = 0.4   # |deviation| > this → orange (warning)
+FIELD_SIZE_FAIL_MM  = 0.6   # |deviation| > this → red   (call service)
+
+# ── Phantom ring constants ─────────────────────────────────────────────────────
+# The MIMI phantom has an internal cylindrical feature whose shadow appears as a
+# ring at ~22 mm radius in portal images. Ellipticity (horizontal vs vertical
+# apparent radius) indicates phantom tilt: θ = arccos(r_short / r_long).
+# ±45° sectors are used so that both cardinal and diagonal ring positions (where
+# the ring is clearly inside the 40 mm square field) contribute to each axis.
+RING_SEARCH_MIN_MM   = 10.0   # inner search boundary for phantom ring (mm)
+RING_SEARCH_MAX_MM   = 32.0   # outer search boundary for phantom ring (mm)
+RING_GAUSSIAN_SIGMA  = 6.0    # smoothing σ (pixels) — suppresses MV portal noise
+RING_TILT_WARN_DEG   = 3.0    # tilt advisory threshold (°)
+RING_TILT_FAIL_DEG   = 8.0    # tilt action threshold (°)
 
 MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
@@ -391,6 +410,238 @@ def find_void_center(
     return c0 + void_col_crop, r0 + void_row_crop
 
 
+# ── Field size measurement ────────────────────────────────────────────────────
+
+def _find_field_edge_pair(profile: np.ndarray) -> tuple:
+    """
+    Find left and right 50%-penumbra field edges in an inverted 1D portal profile.
+    Field = dark (low value), background = bright (high value).
+    Returns (left_edge_px, right_edge_px) as sub-pixel floats, or (None, None).
+    """
+    n = len(profile)
+    border = max(5, int(n * 0.08))
+    bg_val    = float(np.mean(np.concatenate([profile[:border], profile[-border:]])))
+    mid       = n // 2
+    mid_hw    = max(5, int(n * 0.10))
+    field_val = float(np.mean(profile[max(0, mid - mid_hw) : mid + mid_hw]))
+    threshold = (bg_val + field_val) / 2.0
+
+    left_edge = right_edge = None
+    for i in range(n - 1):
+        if profile[i] >= threshold > profile[i + 1]:
+            frac      = (threshold - profile[i]) / (profile[i + 1] - profile[i])
+            left_edge = i + frac
+            break
+    for i in range(n - 1, 0, -1):
+        if profile[i] >= threshold > profile[i - 1]:
+            frac       = (threshold - profile[i]) / (profile[i - 1] - profile[i])
+            right_edge = i - frac
+            break
+    return left_edge, right_edge
+
+
+def measure_field_edges(arr: np.ndarray, spacing_mm: float) -> dict:
+    """
+    Measure total radiation field size from an Elekta iViewGT portal image using
+    50%-penumbra profiles.
+
+    Naming convention (Elekta):
+        MLC (Y)  →  horizontal / column direction
+                    at G0°/G180°: patient Left/Right (lateral)
+                    at G90°/G270°: patient Ant/Post (AP)
+        Jaw (X)  →  vertical / row direction = always Superior/Inferior
+
+    Returns the total distance between opposing edges in mm (independent of image
+    centre position), plus raw pixel positions for overlay drawing.
+    """
+    nrows, ncols = arr.shape
+    cx_px = (ncols - 1) / 2.0
+    cy_px = (nrows - 1) / 2.0
+
+    sigma_px  = max(1.0, 2.0 / spacing_mm)
+    h_profile = gaussian_filter1d(arr.mean(axis=0).astype(np.float64), sigma=sigma_px)
+    v_profile = gaussian_filter1d(arr.mean(axis=1).astype(np.float64), sigma=sigma_px)
+
+    y_left_px, y_right_px = _find_field_edge_pair(h_profile)   # MLC
+    x_top_px,  x_bot_px   = _find_field_edge_pair(v_profile)   # Jaw
+
+    mlc_total_mm = (y_right_px - y_left_px) * spacing_mm \
+        if (y_left_px is not None and y_right_px is not None) else None
+    jaw_total_mm = (x_bot_px - x_top_px) * spacing_mm \
+        if (x_top_px is not None and x_bot_px is not None) else None
+
+    return {
+        "mlc_total_mm": mlc_total_mm,
+        "jaw_total_mm": jaw_total_mm,
+        "y_left_px":    y_left_px,   "y_right_px": y_right_px,
+        "x_top_px":     x_top_px,    "x_bot_px":   x_bot_px,
+        "center_px":    (cx_px,      cy_px),
+    }
+
+
+def measure_mlc_leaves(
+    arr:           np.ndarray,
+    spacing_mm:    float,
+    n_leaves:      int   = MLC_LEAVES_PER_BANK,
+    leaf_width_mm: float = MLC_LEAF_WIDTH_MM,
+) -> list:
+    """
+    Measure individual MLC leaf tip positions for both banks.
+
+    The MLC leaves are stacked in the X (SI / vertical) direction. The field is
+    divided into n_leaves horizontal strips of leaf_width_mm each. For each strip
+    the 50%-penumbra left (Y1) and right (Y2) edge positions are found.
+    Reference point: geometric image centre.
+
+    Returns list of n_leaves dicts ordered top → bottom (superior → inferior):
+        {"leaf_idx": int, "y1_mm": float|None, "y2_mm": float|None}
+    """
+    nrows, ncols = arr.shape
+    cx_px = (ncols - 1) / 2.0
+    cy_px = (nrows - 1) / 2.0
+
+    half_field_px = (n_leaves * leaf_width_mm / 2.0) / spacing_mm
+    leaf_px       = leaf_width_mm / spacing_mm
+    # Keep smoothing to ≤0.5 mm to preserve penumbra sharpness for sub-0.2 mm accuracy.
+    # Averaging ~20 rows per strip already suppresses noise; additional Gaussian is minimal.
+    sigma_px      = max(0.5, 0.5 / spacing_mm)
+
+    leaves = []
+    for i in range(n_leaves):
+        r0  = cy_px - half_field_px + i * leaf_px
+        r1  = r0 + leaf_px
+        r0i = max(0, int(round(r0)))
+        r1i = min(nrows, int(round(r1)))
+        if r1i <= r0i:
+            leaves.append({"leaf_idx": i, "y1_mm": None, "y2_mm": None})
+            continue
+        strip   = arr[r0i:r1i, :]
+        profile = gaussian_filter1d(strip.mean(axis=0).astype(np.float64), sigma=sigma_px)
+        y_lp, y_rp = _find_field_edge_pair(profile)
+        leaves.append({
+            "leaf_idx":  i,
+            "total_mm":  (y_rp - y_lp) * spacing_mm
+                         if (y_lp is not None and y_rp is not None) else None,
+        })
+    return leaves
+
+
+def measure_phantom_ring(
+    arr: np.ndarray,
+    spacing_mm: float,
+    field_center_px: tuple,
+) -> dict:
+    """
+    Measure the MIMI phantom outer ring radius and detect phantom tilt via
+    ellipticity (horizontal vs vertical apparent ring radius difference).
+
+    The ring (internal cylindrical feature visible at ~22 mm radius) projects as
+    a circle when the phantom is upright.  When tilted by θ, the cross-section
+    projects as an ellipse: short axis = R, long axis = R/cos(θ), so
+    θ = arccos(r_short / r_long).
+
+    Sector strategy: sectors centred at 30° and 60° from horizontal (and their
+    equivalents in all 4 quadrants) are used to measure directional ring radii.
+    These angles guarantee the ~22 mm ring lies inside the 40–44 mm square field:
+      At 30°: ring coord = (22cos30°, 22sin30°) = (19.1, 11.0) mm — inside ✓
+      At 60°: ring coord = (22cos60°, 22sin60°) = (11.0, 19.1) mm — inside ✓
+    Cardinal-axis sectors (0°, 90°) are intentionally avoided because the field
+    edge at ~20–22 mm falls within the search range and would be mistaken for
+    the ring.
+
+    R1 (30°-type sectors) weights horizontal; R2 (60°-type sectors) weights
+    vertical.  For an ellipse with semi-axes a (horiz) and b (vert):
+        R1 = ab / sqrt(0.75 b² + 0.25 a²)   (≈ a for small ellipticity)
+        R2 = ab / sqrt(0.25 b² + 0.75 a²)   (≈ b for small ellipticity)
+    Ellipticity = |R1 − R2|; tilt = arccos(min/max) gives a lower-bound estimate.
+
+    Returns dict: r_horiz_mm (R1), r_vert_mm (R2), r_mean_mm (all-angle mean),
+    ellipticity_mm, tilt_deg (approximate lower bound).
+    """
+    fcx, fcy = field_center_px
+    nr, nc = arr.shape
+
+    # Crop to bounding box around field center
+    r_max_px_crop = int(RING_SEARCH_MAX_MM / spacing_mm) + 5
+    c0 = max(0, int(fcx) - r_max_px_crop)
+    c1 = min(nc, int(fcx) + r_max_px_crop + 1)
+    r0 = max(0, int(fcy) - r_max_px_crop)
+    r1 = min(nr, int(fcy) + r_max_px_crop + 1)
+
+    smooth  = gaussian_filter(arr[r0:r1, c0:c1].astype(np.float64),
+                              sigma=RING_GAUSSIAN_SIGMA)
+    fcx_loc = fcx - c0
+    fcy_loc = fcy - r0
+    nr_loc, nc_loc = smooth.shape
+
+    C, Rm  = np.meshgrid(np.arange(nc_loc, dtype=float),
+                         np.arange(nr_loc, dtype=float))
+    dx_map = C - fcx_loc
+    dy_map = Rm - fcy_loc
+    dist   = np.sqrt(dx_map**2 + dy_map**2) + 1e-12
+
+    r_min_px = int(RING_SEARCH_MIN_MM / spacing_mm)
+    r_max_px = int(RING_SEARCH_MAX_MM / spacing_mm)
+    r_range  = range(r_min_px, r_max_px + 1)
+
+    def _ring_in_sector(dir_angle_deg: float, half_deg: float = 20.0) -> float | None:
+        """Radial-gradient ring radius within sector centred at dir_angle_deg."""
+        rad     = np.radians(dir_angle_deg)
+        dir_x   = np.cos(rad);  dir_y = np.sin(rad)
+        half_cos = np.cos(np.radians(half_deg))
+        dot      = dx_map * dir_x + dy_map * dir_y
+        sector   = (dot / dist) >= half_cos
+
+        profile = np.full(len(r_range), np.nan)
+        for i, r in enumerate(r_range):
+            mask = (dist >= r - 0.5) & (dist < r + 0.5) & sector
+            if mask.sum() >= 3:
+                profile[i] = float(smooth[mask].mean())
+
+        valid = ~np.isnan(profile)
+        if valid.sum() < 5:
+            return None
+        x        = np.arange(len(profile))
+        interp_p = np.interp(x, x[valid], profile[valid])
+        grad     = np.abs(np.gradient(interp_p))
+        peak     = int(np.argmax(grad))
+        return (r_min_px + peak) * spacing_mm
+
+    def _avg_sectors(angles_deg: list, half_deg: float = 20.0) -> float | None:
+        vals = [v for a in angles_deg
+                if (v := _ring_in_sector(a, half_deg)) is not None]
+        return float(np.mean(vals)) if vals else None
+
+    # Mean ring radius from full radial profile (all angles, half_deg=90° ≡ all)
+    r_mean = _avg_sectors([0, 45, 90, 135, 180, 225, 270, 315], half_deg=45.0)
+
+    # Directional ring radii using field-edge-safe off-cardinal sectors
+    R1 = _avg_sectors([30, 150, 210, 330])   # H-weighted sectors
+    R2 = _avg_sectors([60, 120, 240, 300])   # V-weighted sectors
+
+    if R1 is None or R2 is None:
+        return {
+            "r_horiz_mm":     r_mean,
+            "r_vert_mm":      r_mean,
+            "r_mean_mm":      r_mean,
+            "ellipticity_mm": None,
+            "tilt_deg":       None,
+        }
+
+    ellipticity = abs(R1 - R2)
+    r_short     = min(R1, R2)
+    r_long      = max(R1, R2)
+    tilt_deg    = float(np.degrees(np.arccos(np.clip(r_short / r_long, 0.0, 1.0))))
+
+    return {
+        "r_horiz_mm":     R1,       # ring radius in H-weighted direction
+        "r_vert_mm":      R2,       # ring radius in V-weighted direction
+        "r_mean_mm":      r_mean,   # mean across all angles
+        "ellipticity_mm": ellipticity,
+        "tilt_deg":       tilt_deg,
+    }
+
+
 def analyze_image(ds) -> dict:
     """
     Full analysis of one EPID DICOM image.
@@ -405,6 +656,9 @@ def analyze_image(ds) -> dict:
 
     field_center_bbox_px, field_center_cent_px = find_field_center(arr, spacing)
     void_center_px = find_void_center(arr, spacing, field_center_bbox_px)
+    field_edges    = measure_field_edges(arr, spacing)
+    mlc_leaves     = measure_mlc_leaves(arr, spacing)
+    ring_info      = measure_phantom_ring(arr, spacing, field_center_bbox_px)
 
     dx_px_bbox = void_center_px[0] - field_center_bbox_px[0]
     dy_px_bbox = void_center_px[1] - field_center_bbox_px[1]
@@ -421,6 +675,9 @@ def analyze_image(ds) -> dict:
         "dy_mm":                dy_px_bbox * spacing,
         "dx_mm_cent":           dx_px_cent * spacing,
         "dy_mm_cent":           dy_px_cent * spacing,
+        "field_edges":          field_edges,
+        "mlc_leaves":           mlc_leaves,
+        "ring_info":            ring_info,
         "pixel_array":          arr,
     }
 
@@ -660,6 +917,62 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             arrowprops=dict(arrowstyle="->", color="#ffff00", lw=1.8),
         )
 
+        # ── Detected field edges overlay (lime green) ─────────────────────────
+        fe = r.get("field_edges", {})
+        if fe:
+            cx_f, cy_f = fe.get("center_px", (0, 0))
+            y_lp = fe.get("y_left_px");  y_rp = fe.get("y_right_px")
+            x_tp = fe.get("x_top_px");   x_bp = fe.get("x_bot_px")
+            # Image-centre marker (white ×)
+            if c0 <= cx_f <= c1 and r0 <= cy_f <= r1:
+                ax.plot(cx_f, cy_f, "wx", ms=9, mew=1.5, zorder=6, alpha=0.9)
+            # MLC edges (Y1 left / Y2 right) — lime vertical lines
+            for xpx in [y_lp, y_rp]:
+                if xpx is not None and c0 <= xpx <= c1:
+                    ax.axvline(xpx, color="#00e676", lw=1.3, ls="-", alpha=0.80)
+            # Jaw edges (X1 sup / X2 inf) — lime horizontal lines
+            for ypx in [x_tp, x_bp]:
+                if ypx is not None and r0 <= ypx <= r1:
+                    ax.axhline(ypx, color="#00e676", lw=1.3, ls="-", alpha=0.80)
+            # Field-size annotation (bottom-right corner)
+            mlc_t = fe.get("mlc_total_mm")
+            jaw_t = fe.get("jaw_total_mm")
+            if mlc_t is not None or jaw_t is not None:
+                mlc_dir = "AP" if angle in (90, 270) else "Lat"
+                lines = []
+                if mlc_t is not None:
+                    lines.append(f"MLC ({mlc_dir}): {mlc_t:.2f} mm")
+                if jaw_t is not None:
+                    lines.append(f"Jaw (SI):    {jaw_t:.2f} mm")
+                ax.text(
+                    0.98, 0.02, "\n".join(lines),
+                    transform=ax.transAxes,
+                    color="#00e676", fontsize=6.0, va="bottom", ha="right",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
+                )
+
+        # ── Ring ellipticity overlay (magenta ellipse) ───────────────────────
+        ring = r.get("ring_info", {})
+        r_h  = ring.get("r_horiz_mm")
+        r_v  = ring.get("r_vert_mm")
+        if r_h is not None and r_v is not None:
+            r_h_px = r_h / spc
+            r_v_px = r_v / spc
+            ax.add_patch(mpatches.Ellipse(
+                (fc[0], fc[1]), 2 * r_h_px, 2 * r_v_px,
+                edgecolor="magenta", facecolor="none",
+                lw=1.5, ls="--", alpha=0.75, zorder=3,
+            ))
+            tilt_str = (f"{ring['tilt_deg']:.1f}°"
+                        if ring.get("tilt_deg") is not None else "?")
+            ax.text(
+                0.98, 0.20,
+                f"Ring  h={r_h:.1f}  v={r_v:.1f} mm\nTilt  ≈{tilt_str}",
+                transform=ax.transAxes,
+                color="magenta", fontsize=6.0, va="bottom", ha="right",
+                bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
+            )
+
         # 5 mm scale bar
         bar_px = 5.0 / spc
         bx0    = c0 + 8
@@ -848,6 +1161,8 @@ class WLApp(QMainWindow):
         self._config = _load_config()
         _init_db()
         self._build_ui()
+        # Show saved calibration values (or first-use notice) immediately on startup
+        self._update_field_ref_labels()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -891,6 +1206,7 @@ class WLApp(QMainWindow):
         self._machine_combo = QComboBox()
         self._machine_combo.addItems(MACHINES)
         self._machine_combo.setMinimumWidth(240)
+        self._machine_combo.currentIndexChanged.connect(self._update_field_ref_labels)
         sel_layout.addWidget(self._machine_combo)
         sel_layout.addSpacing(24)
 
@@ -988,6 +1304,9 @@ class WLApp(QMainWindow):
         right_layout.addWidget(corr_tbl_widget, stretch=1)
         res_layout.addWidget(right_card)
 
+        # Field Size QA tab ───────────────────────────────────────────────────
+        self._build_field_size_tab()
+
         # Portal Images tab ───────────────────────────────────────────────────
         tab_img = QWidget()
         img_layout = QVBoxLayout(tab_img)
@@ -1010,11 +1329,28 @@ class WLApp(QMainWindow):
         bottom_layout = QHBoxLayout(bottom_bar)
         bottom_layout.setContentsMargins(0, 4, 0, 0)
 
+        # Stack WL walk label + DLG status label on the left
+        left_status = QWidget()
+        left_status.setStyleSheet("background: transparent;")
+        left_vbox = QVBoxLayout(left_status)
+        left_vbox.setContentsMargins(0, 0, 0, 0)
+        left_vbox.setSpacing(2)
+
         self._walk_label = QLabel(
             f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
         )
         self._walk_label.setStyleSheet("font-size: 15px;")
-        bottom_layout.addWidget(self._walk_label)
+        left_vbox.addWidget(self._walk_label)
+
+        self._dlg_status_label = QLabel("DLG Field Size:  —")
+        self._dlg_status_label.setStyleSheet("font-size: 13px; color: #888888;")
+        left_vbox.addWidget(self._dlg_status_label)
+
+        self._ring_status_label = QLabel("Phantom Ring:  —")
+        self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
+        left_vbox.addWidget(self._ring_status_label)
+
+        bottom_layout.addWidget(left_status)
         bottom_layout.addStretch()
 
         self._trends_btn = QPushButton("View Trends")
@@ -1069,6 +1405,371 @@ class WLApp(QMainWindow):
                 self._table_labels[key] = lbl
 
         grid.setRowStretch(len(GANTRY_ANGLES) + 2, 1)
+
+    def _build_field_size_tab(self):
+        """Build the Field Size QA tab — total MLC and Jaw field sizes only."""
+        tab_fs = QWidget()
+        fs_layout = QVBoxLayout(tab_fs)
+        fs_layout.setContentsMargins(10, 10, 10, 10)
+        fs_layout.setSpacing(10)
+        self._tabview.addTab(tab_fs, "Field Size QA")
+
+        # ── Reference row ─────────────────────────────────────────────────────
+        ref_frame = QFrame()
+        ref_frame.setStyleSheet(
+            "QFrame { background-color: #363636; border-radius: 8px; }"
+        )
+        ref_inner = QHBoxLayout(ref_frame)
+        ref_inner.setContentsMargins(12, 8, 12, 8)
+
+        ref_title = QLabel("Reference:")
+        ref_title.setStyleSheet(
+            "font-size: 14px; font-weight: bold; background: transparent;"
+        )
+        ref_inner.addWidget(ref_title)
+        ref_inner.addSpacing(16)
+
+        self._fs_ref_labels: dict = {}
+        for key, display in [("mlc", "MLC (Leaves)"), ("jaw", "Jaw (SI)")]:
+            lbl_name = QLabel(f"{display}:")
+            lbl_name.setStyleSheet(
+                "font-size: 13px; color: #aaaaaa; background: transparent;"
+            )
+            ref_inner.addWidget(lbl_name)
+            lbl_val = QLabel(f"{FIELD_SIZE_REF_MM:.3f} mm")
+            lbl_val.setStyleSheet(
+                "font-size: 14px; font-family: monospace; font-weight: bold; "
+                "color: #90caf9; background: transparent; margin-right: 20px;"
+            )
+            ref_inner.addWidget(lbl_val)
+            self._fs_ref_labels[key] = lbl_val
+
+        ref_inner.addStretch()
+        set_ref_btn = QPushButton("Set Current as Reference")
+        set_ref_btn.setMinimumWidth(230)
+        set_ref_btn.clicked.connect(self._set_field_size_reference)
+        ref_inner.addWidget(set_ref_btn)
+        fs_layout.addWidget(ref_frame)
+
+        # ── First-use notice (hidden once a reference is saved) ───────────────
+        self._fs_notice_label = QLabel(
+            "⚠  First-time setup: load images, then click  'Set Current as Reference'  "
+            "to record this machine's baseline field size.  "
+            "PASS / FAIL comparisons are not shown until a reference is saved."
+        )
+        self._fs_notice_label.setStyleSheet(
+            "font-size: 12px; color: #ffa726; padding: 6px 12px; "
+            "background: #3e2c00; border-radius: 6px;"
+        )
+        self._fs_notice_label.setWordWrap(True)
+        fs_layout.addWidget(self._fs_notice_label)
+
+        # ── Per-angle table ───────────────────────────────────────────────────
+        ang_hdr_lbl = QLabel(
+            "Field Size per Gantry Angle  "
+            "— MLC leaves (Lat at G0°/G180°, AP at G90°/G270°)  "
+            "— Jaw (always SI)  "
+            f"— Warning >{FIELD_SIZE_WARN_MM:.1f} mm  "
+            f"— Call Service >{FIELD_SIZE_FAIL_MM:.1f} mm"
+        )
+        ang_hdr_lbl.setStyleSheet("font-size: 12px; color: #888888;")
+        fs_layout.addWidget(ang_hdr_lbl)
+
+        # 3-column table: just deviations from reference (no raw totals cluttering display)
+        angle_hdrs = ["Angle", "Δ MLC (mm)", "Δ Jaw (mm)"]
+        self._fs_angle_table = QTableWidget(5, len(angle_hdrs))
+        self._fs_angle_table.setHorizontalHeaderLabels(angle_hdrs)
+        self._fs_angle_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._fs_angle_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._fs_angle_table.verticalHeader().setVisible(False)
+        self._fs_angle_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._fs_angle_table.setMaximumHeight(210)
+        angle_row_labels = [f"G{a:03d}°" for a in GANTRY_ANGLES] + ["Mean"]
+        for ri, lbl in enumerate(angle_row_labels):
+            item = QTableWidgetItem(lbl)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setForeground(QBrush(QColor("#90caf9")))
+            self._fs_angle_table.setItem(ri, 0, item)
+        fs_layout.addWidget(self._fs_angle_table)
+
+        # ── MLC leaf table ────────────────────────────────────────────────────
+        leaf_hdr_lbl = QLabel(
+            f"Individual MLC Leaf Spans  "
+            f"— {MLC_LEAVES_PER_BANK} leaves × {MLC_LEAF_WIDTH_MM:.0f} mm each (SI)  "
+            f"— from G000° image  — deviation from leaf baseline"
+        )
+        leaf_hdr_lbl.setStyleSheet("font-size: 12px; color: #888888;")
+        fs_layout.addWidget(leaf_hdr_lbl)
+
+        leaf_hdrs = ["Leaf #", "SI Centre (mm)", "Δ Span (mm)"]
+        self._fs_leaf_table = QTableWidget(MLC_LEAVES_PER_BANK, len(leaf_hdrs))
+        self._fs_leaf_table.setHorizontalHeaderLabels(leaf_hdrs)
+        self._fs_leaf_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._fs_leaf_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._fs_leaf_table.verticalHeader().setVisible(False)
+        self._fs_leaf_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        for ri in range(MLC_LEAVES_PER_BANK):
+            # Leaf 0 = top (most superior), so SI centre goes from +ve to -ve
+            si_pos = (MLC_LEAVES_PER_BANK / 2 - ri - 0.5) * MLC_LEAF_WIDTH_MM
+            for ci, (txt, col) in enumerate([
+                (str(ri + 1),      "#90caf9"),
+                (f"{si_pos:+.1f}", "#aaaaaa"),
+            ]):
+                item = QTableWidgetItem(txt)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QBrush(QColor(col)))
+                self._fs_leaf_table.setItem(ri, ci, item)
+        fs_layout.addWidget(self._fs_leaf_table, stretch=1)
+
+    def _get_field_refs(self, machine_name: str) -> dict:
+        """Return per-machine field size reference values.
+
+        Returns is_calibrated=False when no machine-specific reference has been
+        saved yet — callers should suppress PASS/WARN/FAIL in that state.
+        'leaf' is stored separately from 'mlc' because individual leaf spans
+        measured in 5 mm strips are systematically smaller than the full-field
+        total due to narrower profile averaging.
+        """
+        stored = self._config.get("field_refs", {}).get(machine_name, {})
+        calibrated = bool(stored)
+        ref_mlc = stored.get("mlc", FIELD_SIZE_REF_MM)
+        return {
+            "mlc":           ref_mlc,
+            "jaw":           stored.get("jaw", FIELD_SIZE_REF_MM),
+            "leaf":          stored.get("leaf", ref_mlc),  # falls back to mlc if old config
+            "is_calibrated": calibrated,
+        }
+
+    def _set_field_size_reference(self):
+        """Save mean of current measurements as the reference for the selected machine."""
+        if self._image_results is None:
+            QMessageBox.warning(self, "No Data", "Load DICOM images first.")
+            return
+        machine = self._machine_combo.currentText()
+        mlc_vals, jaw_vals, leaf_vals = [], [], []
+        for ir in self._image_results.values():
+            fe = ir.get("field_edges", {})
+            m = fe.get("mlc_total_mm")
+            j = fe.get("jaw_total_mm")
+            if m is not None:
+                mlc_vals.append(m)
+            if j is not None:
+                jaw_vals.append(j)
+        # Leaf reference from G000° only (same image used in leaf table)
+        for leaf in self._image_results.get(0, {}).get("mlc_leaves", []):
+            t = leaf.get("total_mm")
+            if t is not None:
+                leaf_vals.append(t)
+        new_ref = {}
+        if mlc_vals:
+            new_ref["mlc"]  = float(np.mean(mlc_vals))
+        if jaw_vals:
+            new_ref["jaw"]  = float(np.mean(jaw_vals))
+        if leaf_vals:
+            new_ref["leaf"] = float(np.mean(leaf_vals))
+        if not new_ref:
+            QMessageBox.warning(self, "No Data", "No field size measurements available.")
+            return
+        if "field_refs" not in self._config:
+            self._config["field_refs"] = {}
+        self._config["field_refs"][machine] = new_ref
+        _save_config(self._config)
+        self._refresh_field_size_display()
+        detail = (f"MLC={new_ref.get('mlc', 0):.3f} mm,  "
+                  f"Jaw={new_ref.get('jaw', 0):.3f} mm,  "
+                  f"Leaf span={new_ref.get('leaf', 0):.3f} mm")
+        QMessageBox.information(
+            self, "Reference Saved",
+            f"Field size reference for {machine} updated:\n{detail}"
+        )
+
+    def _update_field_ref_labels(self):
+        """Refresh the reference labels and first-use notice from the saved config.
+
+        Safe to call at startup before any images are loaded.
+        """
+        machine = self._machine_combo.currentText()
+        refs = self._get_field_refs(machine)
+        is_calibrated = refs["is_calibrated"]
+        ref_mlc, ref_jaw = refs["mlc"], refs["jaw"]
+
+        if is_calibrated:
+            ref_style = ("font-size: 14px; font-family: monospace; font-weight: bold; "
+                         "color: #90caf9; background: transparent; margin-right: 20px;")
+            self._fs_ref_labels["mlc"].setText(f"{ref_mlc:.3f} mm")
+            self._fs_ref_labels["jaw"].setText(f"{ref_jaw:.3f} mm")
+        else:
+            ref_style = ("font-size: 14px; font-family: monospace; font-weight: bold; "
+                         "color: #ffa726; background: transparent; margin-right: 20px;")
+            self._fs_ref_labels["mlc"].setText(f"{ref_mlc:.3f} mm  (nominal — not set)")
+            self._fs_ref_labels["jaw"].setText(f"{ref_jaw:.3f} mm  (nominal — not set)")
+        for lbl in self._fs_ref_labels.values():
+            lbl.setStyleSheet(ref_style)
+        self._fs_notice_label.setVisible(not is_calibrated)
+
+    def _refresh_field_size_display(self):
+        """Populate the Field Size QA tab from the latest image results."""
+        machine = self._machine_combo.currentText()
+        refs = self._get_field_refs(machine)
+        ref_mlc       = refs["mlc"]
+        ref_jaw       = refs["jaw"]
+        ref_leaf      = refs["leaf"]
+        is_calibrated = refs["is_calibrated"]
+
+        # Always update reference labels / notice banner (safe before images are loaded)
+        self._update_field_ref_labels()
+
+        if self._image_results is None:
+            return
+
+        from PySide6.QtGui import QFont as _QFont
+
+        def _fs_level(dev: float) -> int:
+            """0=pass, 1=warn, 2=fail"""
+            a = abs(dev)
+            if a <= FIELD_SIZE_WARN_MM:  return 0
+            if a <= FIELD_SIZE_FAIL_MM:  return 1
+            return 2
+
+        _FS_COLORS = ["#66bb6a", "#ffd600", "#ef5350"]   # pass / warn(yellow) / fail(red)
+
+        def _cell(text: str, color: str = "#dcdcdc", bold: bool = False) -> QTableWidgetItem:
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setForeground(QBrush(QColor(color)))
+            if bold:
+                f = _QFont(); f.setBold(True)
+                item.setFont(f)
+            return item
+
+        def _dfmt(v, ref):  return f"{v - ref:+.3f}" if v is not None else "—"
+
+        def _vcell_dev(v, ref):
+            """Δ from reference cell — grey dash when reference not yet calibrated."""
+            if not is_calibrated:
+                return _cell("—", "#555555")
+            dev   = (v - ref) if v is not None else None
+            lvl   = _fs_level(dev) if dev is not None else -1
+            color = _FS_COLORS[lvl] if lvl >= 0 else "#888888"
+            bold  = (lvl == 2)
+            return _cell(_dfmt(v, ref), color, bold)
+
+        mlc_acc, jaw_acc = [], []
+        mlc_devs, jaw_devs = [], []
+        worst_lvl = 0   # track overall DLG status — only meaningful when calibrated
+
+        for ri, angle in enumerate(GANTRY_ANGLES):
+            fe  = self._image_results[angle].get("field_edges", {})
+            mlc = fe.get("mlc_total_mm")
+            jaw = fe.get("jaw_total_mm")
+            self._fs_angle_table.setItem(ri, 1, _vcell_dev(mlc, ref_mlc))
+            self._fs_angle_table.setItem(ri, 2, _vcell_dev(jaw, ref_jaw))
+            if is_calibrated:
+                for v, ref in [(mlc, ref_mlc), (jaw, ref_jaw)]:
+                    if v is not None:
+                        worst_lvl = max(worst_lvl, _fs_level(v - ref))
+            if mlc is not None:
+                mlc_acc.append(mlc)
+                mlc_devs.append(mlc - ref_mlc)
+            if jaw is not None:
+                jaw_acc.append(jaw)
+                jaw_devs.append(jaw - ref_jaw)
+
+        mean_mlc = float(np.mean(mlc_acc)) if mlc_acc else None
+        mean_jaw = float(np.mean(jaw_acc)) if jaw_acc else None
+        self._fs_angle_table.setItem(4, 1, _vcell_dev(mean_mlc, ref_mlc))
+        self._fs_angle_table.setItem(4, 2, _vcell_dev(mean_jaw, ref_jaw))
+
+        # Maximum deviation across angles (signed, worst absolute value)
+        max_mlc_dev = max(mlc_devs, key=abs) if mlc_devs else None
+        max_jaw_dev = max(jaw_devs, key=abs) if jaw_devs else None
+
+        # MLC leaf table (from G000° image) — compared to leaf baseline, not total MLC ref
+        leaves = self._image_results.get(0, {}).get("mlc_leaves", [])
+        leaf_devs = []
+        for ri, leaf in enumerate(leaves):
+            total = leaf.get("total_mm")
+            self._fs_leaf_table.setItem(ri, 2, _vcell_dev(total, ref_leaf))
+            if total is not None:
+                leaf_devs.append(total - ref_leaf)
+                if is_calibrated:
+                    worst_lvl = max(worst_lvl, _fs_level(total - ref_leaf))
+
+        # ── Update DLG status label on the Results page ───────────────────────
+        def _dstr(v): return f"{v:+.3f}" if v is not None else "—"
+
+        if not is_calibrated:
+            dlg_text  = (f"Field Size:  Reference not set — "
+                         f"go to 'Field Size QA' tab and click 'Set Current as Reference'")
+            dlg_style = "font-size: 13px; color: #ffa726; font-weight: bold;"
+        elif worst_lvl == 0:
+            dlg_text  = (f"Field Size:  PASS   "
+                         f"Max ΔMLC = {_dstr(max_mlc_dev)} mm   "
+                         f"Max ΔJaw = {_dstr(max_jaw_dev)} mm")
+            dlg_style = "font-size: 13px; color: #66bb6a;"
+        elif worst_lvl == 1:
+            dlg_text  = (f"Field Size:  WARNING   "
+                         f"Max ΔMLC = {_dstr(max_mlc_dev)} mm   "
+                         f"Max ΔJaw = {_dstr(max_jaw_dev)} mm")
+            dlg_style = "font-size: 13px; color: #ffd600; font-weight: bold;"
+        else:
+            dlg_text  = (f"Field Size:  FAIL — Calibration Needed   "
+                         f"Max ΔMLC = {_dstr(max_mlc_dev)} mm   "
+                         f"Max ΔJaw = {_dstr(max_jaw_dev)} mm")
+            dlg_style = "font-size: 13px; color: #ef5350; font-weight: bold;"
+        self._dlg_status_label.setText(dlg_text)
+        self._dlg_status_label.setStyleSheet(dlg_style)
+
+    def _refresh_ring_display(self):
+        """Update the phantom ring / tilt status label from the current image results."""
+        if self._image_results is None:
+            self._ring_status_label.setText("Phantom Ring:  —")
+            self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
+            return
+
+        r_h_vals, r_v_vals, tilt_vals = [], [], []
+        for ir in self._image_results.values():
+            ring = ir.get("ring_info", {})
+            if ring.get("r_horiz_mm") is not None:
+                r_h_vals.append(ring["r_horiz_mm"])
+            if ring.get("r_vert_mm") is not None:
+                r_v_vals.append(ring["r_vert_mm"])
+            if ring.get("tilt_deg") is not None:
+                tilt_vals.append(ring["tilt_deg"])
+
+        if not tilt_vals:
+            self._ring_status_label.setText("Phantom Ring:  detection failed")
+            self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
+            return
+
+        mean_rh   = float(np.mean(r_h_vals))
+        mean_rv   = float(np.mean(r_v_vals))
+        mean_ell  = abs(mean_rh - mean_rv)
+        max_tilt  = float(np.max(tilt_vals))
+
+        if max_tilt < RING_TILT_WARN_DEG:
+            style = "font-size: 13px; color: #888888;"
+            level = "OK"
+        elif max_tilt < RING_TILT_FAIL_DEG:
+            style = "font-size: 13px; color: #ffa726; font-weight: bold;"
+            level = "ADVISORY — reposition phantom"
+        else:
+            style = "font-size: 13px; color: #ef5350; font-weight: bold;"
+            level = "ACTION — phantom significantly tilted"
+
+        self._ring_status_label.setText(
+            f"Phantom Ring:  r(h)={mean_rh:.1f}  r(v)={mean_rv:.1f} mm  "
+            f"│  ellip={mean_ell:.2f} mm  tilt ≈{max_tilt:.1f}°  [{level}]"
+        )
+        self._ring_status_label.setStyleSheet(style)
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -1201,6 +1902,8 @@ class WLApp(QMainWindow):
             _set(f"corr_{angle}_dy", f"{r['rel_dy']:+.3f}", _color(abs(r["rel_dy"])))
             _set(f"corr_{angle}_dr", f"{corr_dr:.3f}",      _color(corr_dr))
 
+        self._refresh_field_size_display()
+        self._refresh_ring_display()
         self._update_diag_image()
 
     def _update_diag_image(self):
@@ -1414,20 +2117,39 @@ def _init_db():
             raw_dx_G270     REAL, raw_dy_G270 REAL
         )
     """)
-    # Migrate older databases that lack baseline_dz
-    try:
-        conn.execute("ALTER TABLE wl_records ADD COLUMN baseline_dz REAL")
-    except sqlite3.OperationalError:
-        pass
+    # Migrate older databases incrementally
+    for col_def in [
+        "ALTER TABLE wl_records ADD COLUMN baseline_dz REAL",
+        "ALTER TABLE wl_records ADD COLUMN avg_mlc_mm REAL",
+        "ALTER TABLE wl_records ADD COLUMN avg_jaw_mm REAL",
+    ]:
+        try:
+            conn.execute(col_def)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
 
 def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: str):
     """Insert one QA session record into the database."""
-    now   = datetime.datetime.now()
-    pa    = wl_results["per_angle"]
-    conn  = sqlite3.connect(DB_PATH)
+    now = datetime.datetime.now()
+    pa  = wl_results["per_angle"]
+
+    # Compute mean field sizes across all 4 angles
+    mlc_vals, jaw_vals = [], []
+    for ir in image_results.values():
+        fe = ir.get("field_edges", {})
+        m  = fe.get("mlc_total_mm")
+        j  = fe.get("jaw_total_mm")
+        if m is not None:
+            mlc_vals.append(m)
+        if j is not None:
+            jaw_vals.append(j)
+    avg_mlc = float(np.mean(mlc_vals)) if mlc_vals else None
+    avg_jaw = float(np.mean(jaw_vals)) if jaw_vals else None
+
+    conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO wl_records (
             date, time, machine_name, physicist_name,
@@ -1436,8 +2158,9 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
             raw_dx_G0,  raw_dy_G0,
             raw_dx_G90, raw_dy_G90,
             raw_dx_G180,raw_dy_G180,
-            raw_dx_G270,raw_dy_G270
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            raw_dx_G270,raw_dy_G270,
+            avg_mlc_mm, avg_jaw_mm
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             now.strftime("%Y-%m-%d"),
             now.strftime("%H:%M"),
@@ -1451,6 +2174,7 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
             pa[90]["raw_dx"],  pa[90]["raw_dy"],
             pa[180]["raw_dx"], pa[180]["raw_dy"],
             pa[270]["raw_dx"], pa[270]["raw_dy"],
+            avg_mlc, avg_jaw,
         ),
     )
     conn.commit()
@@ -1687,6 +2411,140 @@ def generate_pdf_report(
     story.append(corr_tbl)
     story.append(Spacer(1, 0.14 * inch))
 
+    # ── Field size analysis ───────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
+    story.append(Paragraph(
+        "Field Size Analysis  (Y1/Y2 = MLC leaves,  X1/X2 = Physical jaws)",
+        h2_style,
+    ))
+
+    cfg   = _load_config()
+    frefs = cfg.get("field_refs", {}).get(machine_name, {})
+    ref_mlc  = frefs.get("mlc",  FIELD_SIZE_REF_MM)
+    ref_jaw  = frefs.get("jaw",  FIELD_SIZE_REF_MM)
+    ref_leaf = frefs.get("leaf", ref_mlc)
+
+    story.append(Paragraph(
+        f"Reference:  MLC total = {ref_mlc:.3f} mm,  Jaw (SI) = {ref_jaw:.3f} mm,  "
+        f"Leaf span baseline = {ref_leaf:.3f} mm.  "
+        f"Warning >{FIELD_SIZE_WARN_MM:.1f} mm deviation;  "
+        f"Call Service >{FIELD_SIZE_FAIL_MM:.1f} mm deviation.  "
+        "Field size = total distance between opposing 50%-penumbra edges.",
+        ParagraphStyle("FSNote", parent=ss["Normal"], fontSize=9,
+                       textColor=colors.HexColor("#444444"), spaceAfter=4),
+    ))
+
+    _YEL2 = colors.HexColor("#f57f17")   # dark amber — readable on white for warning
+    _RED2 = colors.HexColor("#b71c1c")
+    _GRN2 = colors.HexColor("#2e7d32")
+
+    def _fcc(v, ref):
+        if v is None:
+            return colors.HexColor("#888888")
+        d = abs(v - ref)
+        return _GRN2 if d <= FIELD_SIZE_WARN_MM else (_YEL2 if d <= FIELD_SIZE_FAIL_MM else _RED2)
+
+    def _ffmt(v):        return f"{v:.3f}" if v is not None else "—"
+    def _fdfmt(v, ref):  return f"{v - ref:+.3f}" if v is not None else "—"
+
+    # Per-angle table
+    fs_hdr  = ["Gantry", "MLC Total (mm)", "Δ MLC", "Jaw Total (mm)", "Δ Jaw"]
+    fs_data = [fs_hdr]
+    mlc_acc, jaw_acc = [], []
+    for angle in GANTRY_ANGLES:
+        fe   = image_results[angle].get("field_edges", {})
+        mlcv = fe.get("mlc_total_mm")
+        jawv = fe.get("jaw_total_mm")
+        dir_lbl = "AP" if angle in (90, 270) else "Lat"
+        fs_data.append([
+            f"G{angle:03d}° ({dir_lbl})",
+            _ffmt(mlcv), _fdfmt(mlcv, ref_mlc),
+            _ffmt(jawv), _fdfmt(jawv, ref_jaw),
+        ])
+        if mlcv is not None: mlc_acc.append(mlcv)
+        if jawv is not None: jaw_acc.append(jawv)
+
+    mean_mlc = float(np.mean(mlc_acc)) if mlc_acc else None
+    mean_jaw = float(np.mean(jaw_acc)) if jaw_acc else None
+    fs_data.append([
+        "Mean",
+        _ffmt(mean_mlc), _fdfmt(mean_mlc, ref_mlc),
+        _ffmt(mean_jaw), _fdfmt(mean_jaw, ref_jaw),
+    ])
+
+    fs_col_w = [1.35 * inch, 1.30 * inch, 1.00 * inch, 1.30 * inch, 1.00 * inch]
+    fs_tbl   = Table(fs_data, colWidths=fs_col_w)
+    fs_cmds  = [
+        ("BACKGROUND",    (0, 0),  (-1, 0),  _BLUE_DARK),
+        ("TEXTCOLOR",     (0, 0),  (-1, 0),  colors.white),
+        ("FONTNAME",      (0, 0),  (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0),  (-1, -1), 9),
+        ("ALIGN",         (1, 0),  (-1, -1), "CENTER"),
+        ("BACKGROUND",    (0, -1), (-1, -1), _STRIPE),
+        ("FONTNAME",      (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("GRID",          (0, 0),  (-1, -1), 0.3, _BORDER),
+        ("TOPPADDING",    (0, 0),  (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0),  (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0),  (-1, -1), 5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, _BLUE_LIGHT]),
+    ]
+    angle_rows = list(GANTRY_ANGLES) + [None]
+    for ri, ang in enumerate(angle_rows):
+        row_idx = ri + 1
+        fe_row  = image_results.get(ang, {}).get("field_edges", {}) if ang is not None else {}
+        mlcv    = fe_row.get("mlc_total_mm") if fe_row else mean_mlc
+        jawv    = fe_row.get("jaw_total_mm") if fe_row else mean_jaw
+        for ci, v, ref in [(1, mlcv, ref_mlc), (2, mlcv, ref_mlc),
+                           (3, jawv, ref_jaw),  (4, jawv, ref_jaw)]:
+            fs_cmds.append(("TEXTCOLOR", (ci, row_idx), (ci, row_idx), _fcc(v, ref)))
+    fs_tbl.setStyle(TableStyle(fs_cmds))
+    story.append(fs_tbl)
+    story.append(Spacer(1, 0.10 * inch))
+
+    # MLC leaf span table (G000°)
+    story.append(Paragraph(
+        f"Individual MLC Leaf Spans  (G000° image  —  "
+        f"{MLC_LEAVES_PER_BANK} leaves × {MLC_LEAF_WIDTH_MM:.0f} mm SI pitch  —  "
+        "total span between opposing banks)",
+        ParagraphStyle("LeafHdr", parent=ss["Normal"], fontSize=9,
+                       textColor=_BLUE_DARK, spaceBefore=6, spaceAfter=3,
+                       fontName="Helvetica-Bold"),
+    ))
+    leaf_hdr_row = ["Leaf #", "SI Centre (mm)", "Span (mm)", f"Δ Span (ref {ref_leaf:.2f} mm)"]
+    leaf_rows    = [leaf_hdr_row]
+    leaves_g0    = image_results.get(0, {}).get("mlc_leaves", [])
+    for leaf in leaves_g0:
+        li   = leaf["leaf_idx"]
+        si_c = (MLC_LEAVES_PER_BANK / 2 - li - 0.5) * MLC_LEAF_WIDTH_MM
+        tot  = leaf.get("total_mm")
+        leaf_rows.append([
+            str(li + 1),
+            f"{si_c:+.1f}",
+            _ffmt(tot),
+            _fdfmt(tot, ref_leaf),
+        ])
+    leaf_col_w = [0.70 * inch, 1.15 * inch, 1.10 * inch, 1.10 * inch]
+    leaf_tbl   = Table(leaf_rows, colWidths=leaf_col_w)
+    leaf_cmds  = [
+        ("BACKGROUND",    (0, 0), (-1, 0),  _BLUE_DARK),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("GRID",          (0, 0), (-1, -1), 0.3, _BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _BLUE_LIGHT]),
+    ]
+    for li, leaf in enumerate(leaves_g0):
+        tot = leaf.get("total_mm")
+        col = _fcc(tot, ref_leaf)
+        for ci in (2, 3):
+            leaf_cmds.append(("TEXTCOLOR", (ci, li + 1), (ci, li + 1), col))
+    leaf_tbl.setStyle(TableStyle(leaf_cmds))
+    story.append(leaf_tbl)
+    story.append(Spacer(1, 0.12 * inch))
+
     # ── Diagnostic portal images ───────────────────────────────────────────────
     if diag_fig_path and os.path.exists(diag_fig_path):
         story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
@@ -1699,8 +2557,10 @@ def generate_pdf_report(
             spaceAfter=4,
         )
         story.append(Paragraph(
-            "Cyan dashed box = 40×40 mm radiation field boundary (field of view).  "
-            "Cyan dotted crosshair = field centre (radiation isocenter).  "
+            "Cyan dashed box = nominal 40×40 mm field boundary from detected field centre.  "
+            "Cyan dotted crosshair = field centre (BBox midpoint).  "
+            "Green lines = measured 50%-penumbra field edges (Y1/Y2 MLC vertical, X1/X2 jaw horizontal) "
+            "from geometric image centre (white ×).  "
             "Coloured + and circle = detected void centre; circle = 6.4 mm air void diameter at isocenter.  "
             "Yellow arrow = raw displacement vector (field centre → void centre).  "
             "White bar = 5 mm scale at isocenter.  "
