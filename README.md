@@ -169,13 +169,25 @@ The **Picket Fence** tab shows:
 - A horizontal bar chart of per-leaf centre deviations (green / orange / red)
 - Summary stats: N leaves, Max |Δ|, RMS, average measured width
 
-A third PASS/FAIL banner (green/red) appears alongside the WL and Field Size
-banners only on days when PF data is loaded.
+A third PASS/FAIL banner (green/red/amber) appears alongside the WL and Field
+Size banners only on days when PF data is loaded.
 
-**Pass criterion:** all leaf centre deviations ≤ ±1.5 mm (`PF_TOLERANCE_MM`).
+**Thresholds** (editable via constants at the top of `wl_qa_tool.py`):
+
+| Level | Threshold | Colour |
+|-------|-----------|--------|
+| Pass | < ±0.4 mm | Green |
+| Warning | 0.4 – 0.5 mm | Amber |
+| Fail | ≥ ±0.5 mm | Red |
+
+When the Picket Fence DICOM is placed in the **same directory** as the four WL
+images it is automatically excluded from the WL and field-size analysis (the
+`GantryAngle = 0°` of the PF image would otherwise displace the real G0 WL
+image).
 
 When the PDF report is generated on a PF day, it includes an extra page with
-the PF results between the Field Size and Portal Images pages (4 pages total).
+the PF results between the Field Size and Portal Images pages (4 pages total),
+plus a **PF Result row** in the electronic signature block.
 On non-PF days the report remains 3 pages.
 
 ### 6. View trend analysis

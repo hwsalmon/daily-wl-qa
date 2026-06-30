@@ -8,6 +8,42 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## 2026-06-30 — Picket Fence display polish and bug fixes
+
+### Changed
+- **PF portal image windowing**: the figure now displays the normalised-inverted
+  array (high dose = bright pixel) windowed from the central 90% of field rows
+  (5th–95th percentile of that core region).  End-of-picket penumbra and the
+  Elekta hot-spot artefact at the beam ends are excluded from the window
+  calculation, eliminating the saturated white blowout seen previously.
+- **PF thresholds tightened**: `PF_TOLERANCE_MM` 1.5 → **0.5 mm** (fail);
+  new `PF_WARN_MM` = **0.4 mm** (warning).
+- **PF deviation chart**: orange ±0.4 mm warning lines added alongside the red
+  ±0.5 mm fail lines; bars and portal-image dots now follow a three-tier colour
+  scheme (green < 0.4 mm / orange 0.4–0.5 mm / red ≥ 0.5 mm).  X-axis scale
+  zoomed in — range = max(2 × fail tol, 1.5 × max dev, 0.3 mm).
+- **PF leaf count capped at 40**: the 12%-threshold field-boundary detection sits
+  in the penumbra, making the measured field height slightly taller than 200 mm;
+  `round()` produced 41 leaves.  Count is now capped at `PF_LEAVES_TOTAL // 2`
+  (40 leaf pairs).
+- **Stats card Max |Δ| colour**: follows the same green / orange / red rule as
+  the chart.
+
+### Fixed
+- **PF file excluded from WL/field-size analysis**: when the Picket Fence DICOM
+  is placed in the same directory as the four WL images, `load_dicom_images()`
+  now calls `identify_pf_dicom()` and skips it before gantry-angle matching.
+  Previously the PF image (acquired at G0) was displacing the real G0 WL image
+  and causing the field-size analysis to fail.
+
+### Added
+- **PF result row in PDF signature**: the electronic signature table on the final
+  page gains a "PF Result" row (PASS/FAIL, Max |Δ|, leaf count, tolerances)
+  whenever PF data is included in the report; background follows the green /
+  amber / red threshold scheme.
+
+---
+
 ## 2026-06-30 — Picket Fence MLC leaf position QA
 
 ### Added
