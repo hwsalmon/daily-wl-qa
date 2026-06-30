@@ -2,6 +2,7 @@
 
 Standalone Python GUI for daily Winston-Lutz (WL) mechanical isocenter QA on
 Elekta Versa HD LINACs using the Standard Imaging MIMI Phantom (6.4 mm air void).
+Optionally includes Picket Fence MLC leaf position QA on days it is performed.
 
 ## Running the app
 
@@ -56,8 +57,14 @@ To add machines or physicists, edit those three structures — no other code cha
 Elekta iViewGT RTIMAGEs **lack a File Meta Information header** (Transfer Syntax
 UID is absent). All DICOM loads use `pydicom.dcmread(..., force=True)`.
 
-Files are matched to cardinal gantry angles by reading the `GantryAngle` tag and
+WL files are matched to cardinal gantry angles by reading the `GantryAngle` tag and
 rounding to the nearest of G0/G90/G180/G270, within ±5°.
+
+**PF DICOM identification (critical):** `identify_pf_dicom(ds)` checks whether
+`RTImageLabel` or `SeriesDescription` contains "PF" or "PICKET" (case-insensitive).
+`load_dicom_images()` calls this on every file and skips PF images before gantry-angle
+matching — so the PF DICOM can safely sit in the same folder as the four WL images
+without corrupting the G0 slot or the field-size analysis.
 
 ## Pixel convention (critical)
 
@@ -67,9 +74,11 @@ Elekta iViewGT stores pixels **inverted**: LOW value = HIGH dose.
 - Irradiated field: ~24 000–28 000
 - Air void (highest dose): local MINIMUM within the field (~24 200)
 
-Detection therefore looks for the **darkest spot** inside the field, not the brightest.
+WL detection therefore looks for the **darkest spot** inside the field, not the brightest.
+PF figure display uses the normalised-inverted array (high dose = bright pixel) so that
+the picket appears as a bright stripe on a dark background.
 
-## Void detection algorithm
+## Void detection algorithm (WL)
 
 1. Gaussian pre-filter (σ = void\_radius\_px × 0.30) — suppresses MV portal noise.
 2. Locate the global minimum pixel within the central 50% of the field (10 mm radius).
@@ -108,6 +117,50 @@ the four corrected walk vectors gives the walk circle metric.
 
 **PASS: walk circle radius ≤ 1.0 mm** (`TOLERANCE_MM` constant).
 
+## Picket Fence QA
+
+Performed on days the test is acquired (typically weekly or as scheduled).
+Phantom: 1 cm MLC gap at G0°, EPID at SID = 1600 mm, central 80 Agility leaves
+(40 per bank, 5 mm wide each at isocenter), 200 mm total picket length.
+
+### PF detection & loading
+
+- **Auto-detected**: on `Load DICOM Directory`, every file in the folder is tested
+  with `identify_pf_dicom()`. The first PF file found is analysed automatically.
+- **Manual load**: `Load Picket Fence` button opens a separate directory picker
+  (for clinics that store PF images in a different folder).
+
+### PF analysis algorithm
+
+1. Gaussian pre-filter (σ = 1.5 px) on the normalised-inverted image.
+2. Column-profile detection (mean along rows) to find the picket column band.
+3. Row-profile detection using **max within the column band** (not global mean —
+   avoids dilution by the narrow picket across 1024 background columns).
+4. Leaf count capped at `PF_LEAVES_TOTAL // 2` (40): the 12% detection threshold
+   sits in the penumbra, making the measured field slightly taller than 200 mm and
+   causing `round()` to produce 41 without the cap.
+5. Per-leaf 50%-penumbra edge finding on both sides of the picket → leaf centre.
+6. Deviation = leaf centre − mean of all leaf centres (removes phantom offset).
+
+### PF thresholds
+
+| Level | Constant | Value | Colour |
+|-------|----------|-------|--------|
+| Pass | — | < `PF_WARN_MM` | Green |
+| Warning | `PF_WARN_MM` | 0.4 mm | Amber |
+| Fail | `PF_TOLERANCE_MM` | 0.5 mm | Red |
+
+### PF figure display
+
+Two-panel matplotlib figure (13 × 9 in):
+- **Left** — portal image using the normalised-inverted array windowed from the
+  central 90% of field rows (5th–95th percentile of that core). Background clips
+  to black; end-of-picket penumbra and hot-spot artefacts are excluded from the
+  window so the main picket body displays uniformly.
+- **Right** — horizontal bar chart of per-leaf deviations; orange ±0.4 mm warning
+  lines and red ±0.5 mm fail lines; X-axis zoomed to
+  `max(2 × PF_TOLERANCE_MM, 1.5 × max_dev, 0.3 mm)`.
+
 ## Trend database
 
 Results are saved to `wl_qa_history.db` (SQLite, same directory as the script)
@@ -122,7 +175,7 @@ Older databases are migrated automatically by `_init_db()` (ALTER TABLE ADD COLU
 
 ## PDF report
 
-Generated via reportlab.  Always 3 pages.
+3 pages on WL-only days; 4 pages on days when PF data is present.
 
 **Page 1 — WL results**
 - Title, metadata table: date/time from DICOM `StudyDate`/`StudyTime` (never today),
@@ -136,10 +189,17 @@ Generated via reportlab.  Always 3 pages.
 - 2-column row: angle field-size table | leaf span table
 - Field size methodology notes
 
-**Page 3 — Portal images & signature**
+**Page 3 (PF days only) — Picket Fence results**
+- PF PASS/FAIL colour banner with Max |Δ| and tolerance
+- 4-column stats table (leaves, max deviation, RMS, avg width)
+- PF figure (7.10 × 4.80 in)
+- PF methodology note (algorithm, thresholds)
+
+**Page 3 or 4 — Portal images & signature**
 - 5-panel diagnostic figure (4 portal images + displacement map)
 - Caption
-- Electronic signature block: machine, physicist, study date/time, result, 21 CFR Part 11 statement
+- Electronic signature block: machine, physicist, study date/time, WL result,
+  field result, **PF result row** (when PF data is present), 21 CFR Part 11 statement
 
 **Study date handling (critical):**
 - `generate_pdf_report()` receives `dicom_date` and `dicom_time` parameters.
@@ -149,7 +209,7 @@ Generated via reportlab.  Always 3 pages.
   replaces `document._timeStamp` (reportlab 4.4.x internal).
 - Filesystem `mtime`/`atime` are back-dated to study date via `os.utime()`.
 
-## Diagnostic figure
+## Diagnostic figure (WL)
 
 Five panels generated by matplotlib Agg backend (no display required):
 - Panels 1–4: portal image crop for each cardinal angle, windowed to field-interior
@@ -166,11 +226,15 @@ The GUI renders it via `QPixmap.loadFromData()` (PySide6).
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `TOLERANCE_MM` | 1.0 | PASS/FAIL threshold (mm) |
+| `TOLERANCE_MM` | 1.0 | WL PASS/FAIL threshold (mm) |
 | `VOID_DIAMETER_MM` | 6.4 | MIMI air void diameter (mm) |
-| `FIELD_SIZE_MM` | 40.0 | Nominal field size (mm) |
+| `FIELD_SIZE_MM` | 40.0 | Nominal WL field size (mm) |
 | `VOID_SEARCH_HALF_FIELD_FRACTION` | 0.50 | Search radius = 50% of field half-width |
-| `GAUSSIAN_SIGMA_FRACTION` | 0.30 | Pre-filter σ as fraction of void radius |
+| `GAUSSIAN_SIGMA_FRACTION` | 0.30 | WL pre-filter σ as fraction of void radius |
+| `PF_TOLERANCE_MM` | 0.5 | PF FAIL threshold per leaf (mm) |
+| `PF_WARN_MM` | 0.4 | PF WARNING threshold per leaf (mm) |
+| `PF_LEAF_WIDTH_MM` | 5.0 | Agility inner leaf width at isocenter (mm) |
+| `PF_LEAVES_TOTAL` | 80 | Total leaves tested (40 per bank) |
 
 ## File layout
 
@@ -184,7 +248,40 @@ requirements.txt           — pip dependency list
 wl_qa_history.db           — SQLite trend database (auto-created, not in git)
 wl_qa_config.json          — last-used paths (auto-created, not in git)
 CLAUDE.md                  — this file
-.gitignore                 — excludes __pycache__, *.pyc, *.pdf, *.db, WL Test Data/
+.gitignore                 — excludes __pycache__, *.pyc, *.pdf, *.db,
+                             WL Test Data/, PicketFence/
 Test Data/                 — sample DICOM directories (not committed)
 WL Test Data/              — clinical DICOM sessions (not committed)
+PicketFence/               — PF sample DICOM (not committed — clinical data)
 ```
+
+## Current application state (as of 2026-06-30)
+
+### Features complete and tested
+- WL void detection, walk circle, 3D CBCT setup error decomposition
+- Field size QA (MLC/jaw deviation, leaf span)
+- Machine auto-detection from DICOM `PatientID`
+- Study-date PDF (DICOM StudyDate → filename, PDF metadata, filesystem mtime)
+- 3-page PDF (WL / Field Size / Portal images + signature)
+- SQLite trend database with per-machine time-series chart
+- Batch report generator (`batch_generate_reports.py`)
+- Picket Fence QA tab: auto-detect or manual load, per-leaf deviation analysis,
+  portal image + deviation chart figure, PASS/FAIL/warning banner
+- PF page in PDF (inserted between Field Size and Portal Images pages)
+- PF result row in electronic signature block
+- PF DICOM excluded from WL/field-size analysis when co-located in same folder
+
+### Known behaviour / edge cases
+- 156724 Jun 22 session in `WL Test Data/` has a missing G180 image — batch
+  processor skips it with an error; this is a data gap, not a code bug.
+- Bending magnet thermal drift on 153991 produced elevated Lat walk on Jun 22/23/29;
+  these are real physics failures (beam steering), not phantom setup errors.
+  The phantom is CBCT-corrected before acquisition and cannot move between shots.
+- `avg_width` reported in the PF stats card is the measured 50%-penumbra radiation
+  width (~12 mm), which is wider than the 10 mm nominal geometric gap due to MV
+  beam penumbra; this is expected and does not affect the deviation metric.
+
+### Pending / future ideas
+- PF trend database (store per-day max deviation and RMS per machine)
+- PF trend chart in the View Trends window
+- Multi-picket fence support (if the department acquires multi-picket images)
