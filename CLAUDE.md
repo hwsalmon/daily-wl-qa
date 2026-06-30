@@ -35,7 +35,21 @@ Three physicists are configured in `PHYSICISTS` (line ~121):
 - Shawn Hollars, MS, DABR
 - Logen Hall, MS, DABR
 
-To add machines or physicists, edit those two lists — no other code changes needed.
+`PATIENT_ID_MACHINE_MAP` (line ~132) maps the Elekta iViewGT `PatientID` DICOM
+tag to a machine name for automatic dropdown selection on directory load:
+
+```python
+PATIENT_ID_MACHINE_MAP = {
+    "QA_Daily_V1_26": "Elekta VersaHD 153991",
+    "QA_Daily_V2_26": "Elekta VersaHD 156724",
+    "QA_Daily_MV_26": "Elekta VersaHD 154613",
+}
+```
+
+`PatientID` is the only reliable machine identifier in iViewGT DICOM headers —
+there is no serial number or station name tag.
+
+To add machines or physicists, edit those three structures — no other code changes needed.
 
 ## DICOM input format
 
@@ -108,17 +122,32 @@ Older databases are migrated automatically by `_init_db()` (ALTER TABLE ADD COLU
 
 ## PDF report
 
-Generated via reportlab. Content:
-- Title with machine name and MIMI phantom
-- Metadata table: date (from DICOM `AcquisitionDate` header, fallback = today),
-  machine, physicist, field size, void diameter, tolerance,
-  3D CBCT setup error (Lateral / SI / AP mm)
+Generated via reportlab.  Always 3 pages.
+
+**Page 1 — WL results**
+- Title, metadata table: date/time from DICOM `StudyDate`/`StudyTime` (never today),
+  machine, physicist, field size, void diameter, tolerance, 3D CBCT setup error
 - PASS/FAIL colour banner with walk circle radius
-- Raw displacement table (all 4 angles; ΔX labelled Lateral or AP per angle)
-- Corrected displacement table (3D setup error removed; labelled Lat walk / AP walk)
+- 2-column row: corrected displacement table | walk circle figure
+- WL methodology notes
+
+**Page 2 — Field size results**
+- Field size heading, FS PASS/FAIL banner
+- 2-column row: angle field-size table | leaf span table
+- Field size methodology notes
+
+**Page 3 — Portal images & signature**
 - 5-panel diagnostic figure (4 portal images + displacement map)
-- Methodology notes
-- Electronic signature block (machine, physicist, timestamp, result)
+- Caption
+- Electronic signature block: machine, physicist, study date/time, result, 21 CFR Part 11 statement
+
+**Study date handling (critical):**
+- `generate_pdf_report()` receives `dicom_date` and `dicom_time` parameters.
+- Date comes from DICOM `StudyDate` → `ContentDate` → folder name parse (MMDDYYYY / MMDDYY).
+  `datetime.today()` is **never** used as a date source.
+- PDF internal `CreationDate`/`ModDate` are set via a custom `_StudyTS` class that
+  replaces `document._timeStamp` (reportlab 4.4.x internal).
+- Filesystem `mtime`/`atime` are back-dated to study date via `os.utime()`.
 
 ## Diagnostic figure
 
@@ -146,9 +175,16 @@ The GUI renders it via `QPixmap.loadFromData()` (PySide6).
 ## File layout
 
 ```
-wl_qa_tool.py       — entire application (single file)
-wl_qa_history.db    — SQLite trend database (auto-created)
-CLAUDE.md           — this file
-.gitignore          — excludes __pycache__, *.pyc, *.pdf
-Test Data/          — sample DICOM directories (not committed)
+wl_qa_tool.py              — entire application (single file)
+batch_generate_reports.py  — batch PDF generator: all sessions, all machines
+install.py                 — one-step Linux/macOS installer
+run_wl_qa.bat              — Windows double-click launcher
+setup_windows.bat          — Windows first-time setup (embeddable Python)
+requirements.txt           — pip dependency list
+wl_qa_history.db           — SQLite trend database (auto-created, not in git)
+wl_qa_config.json          — last-used paths (auto-created, not in git)
+CLAUDE.md                  — this file
+.gitignore                 — excludes __pycache__, *.pyc, *.pdf, *.db, WL Test Data/
+Test Data/                 — sample DICOM directories (not committed)
+WL Test Data/              — clinical DICOM sessions (not committed)
 ```

@@ -18,9 +18,12 @@ algorithm, and generates a signed PDF QA report — in seconds.
 |---------|--------|
 | **Input** | Elekta iViewGT RTIMAGE DICOM files (4 cardinal angles) |
 | **Phantom** | Standard Imaging MIMI — 6.4 mm air void |
-| **Algorithm** | MEC of all 4 raw displacement vectors |
+| **Algorithm** | MEC of all 4 corrected walk residuals |
 | **Pass/Fail** | Walk circle radius ≤ 1.0 mm |
-| **Output** | PDF report + SQLite trend database |
+| **Machine detection** | Auto-selects machine from DICOM `PatientID` tag |
+| **Report date** | Always uses DICOM `StudyDate`/`StudyTime` — never today's date |
+| **Output** | 3-page PDF report + SQLite trend database |
+| **Batch processing** | `batch_generate_reports.py` — all sessions, all machines |
 | **Platforms** | Linux · Windows · macOS |
 
 ---
@@ -115,6 +118,9 @@ Elekta iViewGT portal DICOM files from that day's WL acquisition.
 The folder should contain one file per cardinal gantry angle
 (G0, G90, G180, G270 — within ±5° of each cardinal).
 
+The machine dropdown **auto-selects** the correct unit based on the `PatientID`
+DICOM tag — no manual selection needed for the three configured Versa HD units.
+
 ### 3. Review results
 - **PASS/FAIL banner** — walk circle radius vs. 1.0 mm tolerance, shown immediately.
 - **Results tab** — raw displacements (Field → Void) and corrected displacements
@@ -126,16 +132,28 @@ The folder should contain one file per cardinal gantry angle
   plus a 2-D displacement map showing the walk circle.
 
 ### 4. Generate report
-Click **Generate Daily Report (PDF)**.  
-The report includes:
-- Metadata (machine, physicist, date from DICOM header, phantom, tolerance,
-  **3D CBCT setup error** — Lateral / SI / AP mm)
-- Colour PASS/FAIL banner
-- Raw displacement table (ΔX axis labelled Lateral or AP per gantry angle)
-- Corrected displacement table (3D setup error removed; Lat walk / AP walk labelled)
-- Portal diagnostic figure
-- Methodology notes
-- **Electronic signature block** (physicist name, timestamp, 21 CFR Part 11 statement)
+Click **Generate Daily Report (PDF)**.
+
+The report is a consistent **3-page layout**:
+
+**Page 1 — WL results**
+- Metadata table: date/time from DICOM header, machine, physicist, phantom,
+  tolerance, **3D CBCT setup error** (Lateral / SI / AP mm)
+- Colour PASS/FAIL banner with walk circle radius
+- Corrected displacements table + walk circle figure (side-by-side)
+- Winston-Lutz methodology notes
+
+**Page 2 — Field size results**
+- Field size PASS/FAIL banner
+- Angle displacement table + leaf span table (side-by-side)
+- Field size methodology notes
+
+**Page 3 — Portal images & signature**
+- 5-panel diagnostic figure (4 portal images + 2-D displacement map)
+- **Electronic signature block** (physicist, study date/time, 21 CFR Part 11 statement)
+
+The report date, filename, and PDF internal metadata (`CreationDate`, `ModDate`)
+all use the DICOM `StudyDate`/`StudyTime` — never the generation date.
 
 Each report generation automatically saves a record to `wl_qa_history.db`.
 
@@ -148,8 +166,8 @@ of all historical records.
 
 ## Machine and physicist configuration
 
-Machines and physicists are defined as lists near the top of `wl_qa_tool.py`
-(lines ~115–126):
+Machines, physicists, and the PatientID → machine mapping are defined near the
+top of `wl_qa_tool.py` (lines ~115–135):
 
 ```python
 MACHINES = [
@@ -163,10 +181,33 @@ PHYSICISTS = [
     "Shawn Hollars, MS, DABR",
     "Logen Hall, MS, DABR",
 ]
+
+# Maps Elekta iViewGT PatientID → machine name for auto-detection
+PATIENT_ID_MACHINE_MAP = {
+    "QA_Daily_V1_26": "Elekta VersaHD 153991",
+    "QA_Daily_V2_26": "Elekta VersaHD 156724",
+    "QA_Daily_MV_26": "Elekta VersaHD 154613",
+}
 ```
 
-To add or change machines or physicists, edit those two lists and save —
-no other changes are needed.
+To add or change machines or physicists, edit those three structures and save —
+no other changes are needed.  When a loaded DICOM directory contains a recognised
+`PatientID`, the machine dropdown selects automatically.
+
+---
+
+## Batch processing
+
+`batch_generate_reports.py` processes all sessions in `WL Test Data/` in one run:
+
+```bash
+python3 batch_generate_reports.py
+```
+
+It scans for session directories, identifies each machine via `PatientID`, loads
+and analyses the DICOM images, generates PDF reports (with study-date filenames
+and metadata), and saves all records to `wl_qa_history.db`.  Physicist assignment
+is controlled by the date range defined at the top of the script.
 
 ---
 
@@ -226,15 +267,18 @@ irradiated field. Detection pipeline:
 ## File layout
 
 ```
-wl_qa_tool.py       Main application (single file — no build step)
-install.py          One-step installer
-run_wl_qa.bat       Windows double-click launcher
-requirements.txt    Python dependency list
-icon.png            App icon (256 px)
-icon_512.png        App icon (512 px master)
-icon.ico            Windows multi-resolution icon (16–256 px)
-CLAUDE.md           Developer / AI assistant reference
-wl_qa_history.db    SQLite trend database (auto-created, not in git)
+wl_qa_tool.py              Main application (single file — no build step)
+batch_generate_reports.py  Batch PDF generator for multiple sessions/machines
+install.py                 One-step Linux/macOS installer
+run_wl_qa.bat              Windows double-click launcher
+setup_windows.bat          Windows first-time setup (embeddable Python)
+requirements.txt           Python dependency list
+icon.png                   App icon (256 px)
+icon_512.png               App icon (512 px master)
+icon.ico                   Windows multi-resolution icon (16–256 px)
+CLAUDE.md                  Developer / AI assistant reference
+wl_qa_history.db           SQLite trend database (auto-created, not in git)
+wl_qa_config.json          Last-used paths (auto-created, not in git)
 ```
 
 ---

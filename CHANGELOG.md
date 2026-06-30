@@ -8,6 +8,46 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## 2026-06-30 — Study-date PDF, machine auto-detection, 3-page report, batch processor
+
+### Changed
+- **Study date/time**: Reports always use `StudyDate`/`StudyTime` from the DICOM
+  header.  `datetime.today()` is never used.  Fallback order:
+  DICOM `StudyDate` → DICOM `ContentDate` → folder name (MMDDYYYY or MMDDYY pattern).
+  If no date is recoverable, the date field is left blank rather than defaulting to
+  today's date.
+- **PDF filename**: Report filename now uses the DICOM study date
+  (e.g. `WL_QA_Elekta_VersaHD_153991_20260619.pdf`) instead of the
+  generation date.
+- **PDF internal metadata**: `CreationDate` and `ModDate` fields inside the PDF
+  are set to the study date/time (not the generation timestamp) via a custom
+  `_StudyTS` object replacing `document._timeStamp` in reportlab 4.4.x.
+  Filesystem `mtime`/`atime` are also back-dated via `os.utime()`.
+- **Machine auto-detection**: The machine dropdown auto-selects the correct unit
+  by reading the `PatientID` DICOM tag.  A new `PATIENT_ID_MACHINE_MAP` constant
+  maps iViewGT PatientID strings to machine names:
+  - `QA_Daily_V1_26` → Elekta VersaHD 153991
+  - `QA_Daily_V2_26` → Elekta VersaHD 156724
+  - `QA_Daily_MV_26` → Elekta VersaHD 154613
+- **PDF report — 3-page layout**: Restructured from a variable-length document to
+  a consistent 3-page format:
+  - *Page 1*: metadata table, PASS/FAIL banner, corrected displacements + walk
+    circle figure (side-by-side 2-column), WL methodology notes.
+  - *Page 2*: field size heading, FS banner, field angle table + leaf span table
+    (side-by-side 2-column), field size methodology notes.
+  - *Page 3*: 5-panel portal diagnostic figure, caption, electronic signature block.
+- **Electronic signature**: Timestamp in the signature block now uses study
+  date/time, not the current time.
+
+### Added
+- **`batch_generate_reports.py`**: Standalone batch processor.  Scans `WL Test Data/`
+  for all sessions matching the three configured machines (identified via `PatientID`),
+  generates PDF reports and saves trend-DB entries for each.  Physicist assignment
+  is date-driven (configurable at the top of the script).
+  Usage: `python3 batch_generate_reports.py`
+
+---
+
 ## 2026-06-09 — 3D patient-coordinate setup error correction
 
 ### Changed

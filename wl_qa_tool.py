@@ -117,10 +117,9 @@ FIELD_SIZE_FAIL_MM  = 0.6   # |deviation| > this → red   (call service)
 # ±45° sectors are used so that both cardinal and diagonal ring positions (where
 # the ring is clearly inside the 40 mm square field) contribute to each axis.
 RING_SEARCH_MIN_MM   = 10.0   # inner search boundary for phantom ring (mm)
-RING_SEARCH_MAX_MM   = 32.0   # outer search boundary for phantom ring (mm)
+RING_SEARCH_MAX_MM   = 24.0   # outer search boundary — below penumbra at ~25 mm
 RING_GAUSSIAN_SIGMA  = 6.0    # smoothing σ (pixels) — suppresses MV portal noise
-RING_TILT_WARN_DEG   = 3.0    # tilt advisory threshold (°)
-RING_TILT_FAIL_DEG   = 8.0    # tilt action threshold (°)
+RING_RADIUS_NOMINAL_MM = 22.0 # expected ring radius (mm at iso)
 
 MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
@@ -130,6 +129,13 @@ MACHINES = [
     "Elekta VersaHD 156724",
     "Elekta VersaHD 154613",
 ]
+
+# iViewGT PatientID → machine name (configured in MOSAIQ per linac)
+PATIENT_ID_MACHINE_MAP = {
+    "QA_Daily_V1_26": "Elekta VersaHD 153991",
+    "QA_Daily_V2_26": "Elekta VersaHD 156724",
+    "QA_Daily_MV_26": "Elekta VersaHD 154613",
+}
 
 PHYSICISTS = [
     "Howard W. Salmon, PhD, DABR",
@@ -470,12 +476,21 @@ def measure_field_edges(arr: np.ndarray, spacing_mm: float) -> dict:
     jaw_total_mm = (x_bot_px - x_top_px) * spacing_mm \
         if (x_top_px is not None and x_bot_px is not None) else None
 
+    # Penumbra-edge midpoint: most stable field centre for WL analysis.
+    # Profile averaging over all rows/columns gives very high SNR and is
+    # independent of beam-profile non-uniformity.
+    ec_x = (y_left_px + y_right_px) / 2.0 \
+        if (y_left_px is not None and y_right_px is not None) else cx_px
+    ec_y = (x_top_px + x_bot_px) / 2.0 \
+        if (x_top_px is not None and x_bot_px is not None) else cy_px
+
     return {
-        "mlc_total_mm": mlc_total_mm,
-        "jaw_total_mm": jaw_total_mm,
-        "y_left_px":    y_left_px,   "y_right_px": y_right_px,
-        "x_top_px":     x_top_px,    "x_bot_px":   x_bot_px,
-        "center_px":    (cx_px,      cy_px),
+        "mlc_total_mm":   mlc_total_mm,
+        "jaw_total_mm":   jaw_total_mm,
+        "y_left_px":      y_left_px,   "y_right_px": y_right_px,
+        "x_top_px":       x_top_px,    "x_bot_px":   x_bot_px,
+        "center_px":      (cx_px,      cy_px),       # image centre (legacy)
+        "edge_center_px": (ec_x,       ec_y),        # 50% penumbra midpoint
     }
 
 
@@ -532,36 +547,20 @@ def measure_phantom_ring(
     field_center_px: tuple,
 ) -> dict:
     """
-    Measure the MIMI phantom outer ring radius and detect phantom tilt via
-    ellipticity (horizontal vs vertical apparent ring radius difference).
+    Measure the MIMI phantom internal ring radius at isocenter.
 
-    The ring (internal cylindrical feature visible at ~22 mm radius) projects as
-    a circle when the phantom is upright.  When tilted by θ, the cross-section
-    projects as an ellipse: short axis = R, long axis = R/cos(θ), so
-    θ = arccos(r_short / r_long).
+    The ring feature appears at ~22 mm radius in iViewGT portal images.
+    Only the four diagonal sectors (45°/135°/225°/315° ± 15°) are used:
+    at 45° the field corners are at ≥ 30 mm, well above the 24 mm search
+    ceiling, so the field penumbra cannot contaminate the gradient peak.
+    Cardinal and near-cardinal sectors are intentionally excluded because
+    the MLC/Jaw penumbra at ~22–26 mm would overwhelm the ring gradient.
 
-    Sector strategy: sectors centred at 30° and 60° from horizontal (and their
-    equivalents in all 4 quadrants) are used to measure directional ring radii.
-    These angles guarantee the ~22 mm ring lies inside the 40–44 mm square field:
-      At 30°: ring coord = (22cos30°, 22sin30°) = (19.1, 11.0) mm — inside ✓
-      At 60°: ring coord = (22cos60°, 22sin60°) = (11.0, 19.1) mm — inside ✓
-    Cardinal-axis sectors (0°, 90°) are intentionally avoided because the field
-    edge at ~20–22 mm falls within the search range and would be mistaken for
-    the ring.
-
-    R1 (30°-type sectors) weights horizontal; R2 (60°-type sectors) weights
-    vertical.  For an ellipse with semi-axes a (horiz) and b (vert):
-        R1 = ab / sqrt(0.75 b² + 0.25 a²)   (≈ a for small ellipticity)
-        R2 = ab / sqrt(0.25 b² + 0.75 a²)   (≈ b for small ellipticity)
-    Ellipticity = |R1 − R2|; tilt = arccos(min/max) gives a lower-bound estimate.
-
-    Returns dict: r_horiz_mm (R1), r_vert_mm (R2), r_mean_mm (all-angle mean),
-    ellipticity_mm, tilt_deg (approximate lower bound).
+    Returns dict with r_mean_mm (ring radius in mm at iso).
     """
     fcx, fcy = field_center_px
     nr, nc = arr.shape
 
-    # Crop to bounding box around field center
     r_max_px_crop = int(RING_SEARCH_MAX_MM / spacing_mm) + 5
     c0 = max(0, int(fcx) - r_max_px_crop)
     c1 = min(nc, int(fcx) + r_max_px_crop + 1)
@@ -572,10 +571,9 @@ def measure_phantom_ring(
                               sigma=RING_GAUSSIAN_SIGMA)
     fcx_loc = fcx - c0
     fcy_loc = fcy - r0
-    nr_loc, nc_loc = smooth.shape
 
-    C, Rm  = np.meshgrid(np.arange(nc_loc, dtype=float),
-                         np.arange(nr_loc, dtype=float))
+    C, Rm  = np.meshgrid(np.arange(smooth.shape[1], dtype=float),
+                         np.arange(smooth.shape[0], dtype=float))
     dx_map = C - fcx_loc
     dy_map = Rm - fcy_loc
     dist   = np.sqrt(dx_map**2 + dy_map**2) + 1e-12
@@ -584,12 +582,10 @@ def measure_phantom_ring(
     r_max_px = int(RING_SEARCH_MAX_MM / spacing_mm)
     r_range  = range(r_min_px, r_max_px + 1)
 
-    def _ring_in_sector(dir_angle_deg: float, half_deg: float = 20.0) -> float | None:
-        """Radial-gradient ring radius within sector centred at dir_angle_deg."""
-        rad     = np.radians(dir_angle_deg)
-        dir_x   = np.cos(rad);  dir_y = np.sin(rad)
+    def _ring_in_sector(dir_angle_deg: float, half_deg: float = 15.0) -> float | None:
+        rad      = np.radians(dir_angle_deg)
         half_cos = np.cos(np.radians(half_deg))
-        dot      = dx_map * dir_x + dy_map * dir_y
+        dot      = dx_map * np.cos(rad) + dy_map * np.sin(rad)
         sector   = (dot / dist) >= half_cos
 
         profile = np.full(len(r_range), np.nan)
@@ -607,38 +603,17 @@ def measure_phantom_ring(
         peak     = int(np.argmax(grad))
         return (r_min_px + peak) * spacing_mm
 
-    def _avg_sectors(angles_deg: list, half_deg: float = 20.0) -> float | None:
-        vals = [v for a in angles_deg
-                if (v := _ring_in_sector(a, half_deg)) is not None]
-        return float(np.mean(vals)) if vals else None
-
-    # Mean ring radius from full radial profile (all angles, half_deg=90° ≡ all)
-    r_mean = _avg_sectors([0, 45, 90, 135, 180, 225, 270, 315], half_deg=45.0)
-
-    # Directional ring radii using field-edge-safe off-cardinal sectors
-    R1 = _avg_sectors([30, 150, 210, 330])   # H-weighted sectors
-    R2 = _avg_sectors([60, 120, 240, 300])   # V-weighted sectors
-
-    if R1 is None or R2 is None:
-        return {
-            "r_horiz_mm":     r_mean,
-            "r_vert_mm":      r_mean,
-            "r_mean_mm":      r_mean,
-            "ellipticity_mm": None,
-            "tilt_deg":       None,
-        }
-
-    ellipticity = abs(R1 - R2)
-    r_short     = min(R1, R2)
-    r_long      = max(R1, R2)
-    tilt_deg    = float(np.degrees(np.arccos(np.clip(r_short / r_long, 0.0, 1.0))))
+    # Diagonal sectors only — furthest from field edges, free of penumbra contamination
+    vals   = [v for a in [45, 135, 225, 315]
+              if (v := _ring_in_sector(a)) is not None]
+    r_mean = float(np.mean(vals)) if vals else None
 
     return {
-        "r_horiz_mm":     R1,       # ring radius in H-weighted direction
-        "r_vert_mm":      R2,       # ring radius in V-weighted direction
-        "r_mean_mm":      r_mean,   # mean across all angles
-        "ellipticity_mm": ellipticity,
-        "tilt_deg":       tilt_deg,
+        "r_mean_mm":      r_mean,
+        "r_horiz_mm":     None,
+        "r_vert_mm":      None,
+        "ellipticity_mm": None,
+        "tilt_deg":       None,
     }
 
 
@@ -650,29 +625,55 @@ def analyze_image(ds) -> dict:
     Sign convention:
       dx_mm > 0  →  void is to the RIGHT of field centre in the portal image
       dy_mm > 0  →  void is BELOW   field centre in the portal image
+
+    Primary field centre (dx_mm / dy_mm): 50%-penumbra edge midpoint derived from
+    column- and row-averaged profiles.  This method averages ~1024 rows/columns,
+    giving very high SNR and is independent of beam-profile non-uniformity.
+    Secondary references (bbox / centroid) are retained for cross-check.
     """
     arr, spacing = get_pixel_array(ds)
     gantry = float(getattr(ds, "GantryAngle", 0.0))
 
+    # Field edges first — edge_center_px is the primary WL reference centre.
+    field_edges = measure_field_edges(arr, spacing)
+    edge_fc     = field_edges.get("edge_center_px")   # penumbra midpoint
+
+    # BBox / centroid still computed for cross-check display.
     field_center_bbox_px, field_center_cent_px = find_field_center(arr, spacing)
-    void_center_px = find_void_center(arr, spacing, field_center_bbox_px)
-    field_edges    = measure_field_edges(arr, spacing)
-    mlc_leaves     = measure_mlc_leaves(arr, spacing)
-    ring_info      = measure_phantom_ring(arr, spacing, field_center_bbox_px)
+
+    # Use edge centre for void search (falls back to bbox if edge detection failed).
+    search_fc  = edge_fc if edge_fc is not None else field_center_bbox_px
+    void_center_px = find_void_center(arr, spacing, search_fc)
+
+    mlc_leaves = measure_mlc_leaves(arr, spacing)
+    ring_info  = measure_phantom_ring(arr, spacing, search_fc)
+
+    # Primary displacement: void relative to penumbra edge midpoint.
+    if edge_fc is not None:
+        dx_px_edge = void_center_px[0] - edge_fc[0]
+        dy_px_edge = void_center_px[1] - edge_fc[1]
+    else:
+        dx_px_edge = void_center_px[0] - field_center_bbox_px[0]
+        dy_px_edge = void_center_px[1] - field_center_bbox_px[1]
 
     dx_px_bbox = void_center_px[0] - field_center_bbox_px[0]
     dy_px_bbox = void_center_px[1] - field_center_bbox_px[1]
     dx_px_cent = void_center_px[0] - field_center_cent_px[0]
     dy_px_cent = void_center_px[1] - field_center_cent_px[1]
 
+    primary_fc = edge_fc if edge_fc is not None else field_center_bbox_px
+
     return {
         "gantry":               gantry,
         "spacing_mm":           spacing,
-        "field_center_px":      field_center_bbox_px,
-        "field_center_cent_px": field_center_cent_px,
+        "field_center_px":      primary_fc,            # edge midpoint (primary)
+        "field_center_bbox_px": field_center_bbox_px,  # BBox (cross-check)
+        "field_center_cent_px": field_center_cent_px,  # centroid (cross-check)
         "void_center_px":       void_center_px,
-        "dx_mm":                dx_px_bbox * spacing,
-        "dy_mm":                dy_px_bbox * spacing,
+        "dx_mm":                dx_px_edge * spacing,  # PRIMARY
+        "dy_mm":                dy_px_edge * spacing,
+        "dx_mm_bbox":           dx_px_bbox * spacing,  # cross-check
+        "dy_mm_bbox":           dy_px_bbox * spacing,
         "dx_mm_cent":           dx_px_cent * spacing,
         "dy_mm_cent":           dy_px_cent * spacing,
         "field_edges":          field_edges,
@@ -822,11 +823,10 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
     walk_r = wl_results["walk_circle_r"]
     passed = wl_results["pass_fail"]
 
-    # 5 panels: 4 portal images + 1 displacement / walk-circle map
-    fig = plt.figure(figsize=(28, 6.4), facecolor="#111111", layout="constrained")
-    gs  = fig.add_gridspec(1, 5, width_ratios=[1, 1, 1, 1, 1.1], wspace=0.07)
+    # 4 panels: annotated portal images only
+    fig = plt.figure(figsize=(22.4, 6.4), facecolor="#111111", layout="constrained")
+    gs  = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 1], wspace=0.07)
     portal_axes = [fig.add_subplot(gs[i]) for i in range(4)]
-    disp_ax     = fig.add_subplot(gs[4])
 
     fig.suptitle(
         f"Portal Images — Field & Void Centre Detection     "
@@ -857,20 +857,14 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         r1 = min(arr.shape[0], fcy + half)
         crop = arr[r0:r1, c0:c1]
 
-        # Window to field-interior pixels only so the ~7% void contrast is visible.
-        # Elekta inverted convention: field = LOW value, background = HIGH value.
-        # A 0.15-normalised threshold separates field interior from penumbra/background.
-        g_min = float(arr.min())
-        g_max = float(arr.max())
-        norm_crop = (crop.astype(np.float64) - g_min) / max(g_max - g_min, 1.0)
-        field_mask = norm_crop < 0.15
-        if field_mask.sum() > 200:
-            fp     = crop[field_mask].astype(np.float64)
-            vmin_c = float(np.percentile(fp, 2))
-            vmax_c = float(np.percentile(fp, 90))
-        else:
-            vmin_c = float(np.percentile(crop, 0.5))
-            vmax_c = float(np.percentile(crop, 60))
+        # Window from void minimum to upper-penumbra level so both the air void
+        # and the field penumbra / edge are clearly visible.
+        # Elekta inverted: field = LOW value, background = HIGH value.
+        # vmin anchors on the darkest pixels (void); vmax reaches well into the
+        # background so the penumbra gradient appears as a visible ramp.
+        crop_f = crop.flatten().astype(np.float64)
+        vmin_c = float(np.percentile(crop_f, 0.5))
+        vmax_c = float(np.percentile(crop_f, 82))
 
         ax.imshow(
             crop, cmap="gray", vmin=vmin_c, vmax=vmax_c,
@@ -885,7 +879,7 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             edgecolor="cyan", facecolor="none", lw=1.2, ls="--", alpha=0.8,
         ))
 
-        # Field centre crosshairs — BBox midpoint (cyan) and geometric centroid (orange)
+        # Field centre crosshairs — penumbra edge midpoint (cyan) and geometric centroid (orange)
         ax.axhline(fc[1], color="cyan",   lw=0.8, ls=":",  alpha=0.7)
         ax.axvline(fc[0], color="cyan",   lw=0.8, ls=":",  alpha=0.7)
         fcc = r.get("field_center_cent_px")
@@ -896,7 +890,7 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             dcy = (fcc[1] - fc[1]) * spc
             ax.text(
                 0.02, 0.02,
-                f"ΔFc  x={dcx:+.3f}  y={dcy:+.3f} mm",
+                f"ΔFc (cent−edge)  x={dcx:+.3f}  y={dcy:+.3f} mm",
                 transform=ax.transAxes,
                 color="white", fontsize=6.0, va="bottom", ha="left",
                 bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
@@ -951,23 +945,18 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
                     bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
                 )
 
-        # ── Ring ellipticity overlay (magenta ellipse) ───────────────────────
-        ring = r.get("ring_info", {})
-        r_h  = ring.get("r_horiz_mm")
-        r_v  = ring.get("r_vert_mm")
-        if r_h is not None and r_v is not None:
-            r_h_px = r_h / spc
-            r_v_px = r_v / spc
-            ax.add_patch(mpatches.Ellipse(
-                (fc[0], fc[1]), 2 * r_h_px, 2 * r_v_px,
+        # ── Phantom ring sanity circle (magenta) ─────────────────────────────
+        ring  = r.get("ring_info", {})
+        r_val = ring.get("r_mean_mm")
+        if r_val is not None:
+            ax.add_patch(mpatches.Circle(
+                (fc[0], fc[1]), r_val / spc,
                 edgecolor="magenta", facecolor="none",
-                lw=1.5, ls="--", alpha=0.75, zorder=3,
+                lw=1.2, ls="--", alpha=0.70, zorder=3,
             ))
-            tilt_str = (f"{ring['tilt_deg']:.1f}°"
-                        if ring.get("tilt_deg") is not None else "?")
             ax.text(
-                0.98, 0.20,
-                f"Ring  h={r_h:.1f}  v={r_v:.1f} mm\nTilt  ≈{tilt_str}",
+                0.98, 0.16,
+                f"Ring  r={r_val:.1f} mm",
                 transform=ax.transAxes,
                 color="magenta", fontsize=6.0, va="bottom", ha="right",
                 bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
@@ -995,78 +984,120 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
             sp.set_color("#333333")
         ax.set_facecolor("#111111")
 
-    # ── Walk-circle displacement map ──────────────────────────────────────────
-    disp_ax.set_facecolor("#111111")
-    for sp in disp_ax.spines.values():
-        sp.set_color("#444444")
-    disp_ax.tick_params(colors="#aaaaaa", labelsize=8)
-    disp_ax.set_xlabel("ΔX (mm)  [Lat at G0°/G180°,  AP at G90°/G270°]",
-                       color="#aaaaaa", fontsize=8)
-    disp_ax.set_ylabel("ΔSI (mm)", color="#aaaaaa", fontsize=9)
-    disp_ax.set_title(
-        f"Void Displacement Map\n"
-        f"Walk circle r = {walk_r:.3f} mm  "
-        f"({'PASS' if passed else 'FAIL'})",
-        color="#66bb6a" if passed else "#ef5350",
-        fontsize=8.5, fontweight="bold",
-    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    plt.savefig(tmp.name, dpi=150, bbox_inches="tight", facecolor="#111111")
+    plt.close(fig)
+    return tmp.name
+
+
+def generate_walk_circle_figure(wl_results: dict) -> str | None:
+    """
+    Render the 2-D isocenter walk displacement map as a standalone PNG.
+    Shows corrected per-angle vectors, MEC walk circle, tolerance ring, and legend.
+    Returns the temp-file path, or None if matplotlib is unavailable.
+    """
+    if not _MPL_OK:
+        return None
+
+    import tempfile
+    import matplotlib.patches as mpatches
+
+    per_angle = wl_results["per_angle"]
+    walk_r    = wl_results["walk_circle_r"]
+    passed    = wl_results["pass_fail"]
+
+    pts = [(per_angle[a]["rel_dx"], per_angle[a]["rel_dy"]) for a in GANTRY_ANGLES]
+    mec_cx, mec_cy, _ = _minimum_enclosing_circle(pts)
+
+    angle_colors = {0: "#64b5f6", 90: "#81c784", 180: "#ffb74d", 270: "#f06292"}
+    angle_labels = {0: "G000° Lat", 90: "G090° AP", 180: "G180° Lat", 270: "G270° AP"}
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6), facecolor="#111111")
+    ax.set_facecolor("#1a1a1a")
 
     # Grid
-    disp_ax.axhline(0, color="#555555", lw=0.8)
-    disp_ax.axvline(0, color="#555555", lw=0.8)
-    disp_ax.grid(color="#333333", lw=0.5, ls="--")
+    ax.grid(True, color="#2a2a2a", lw=0.6, zorder=0)
 
-    # Origin = ideal radiation isocenter
-    disp_ax.plot(0, 0, "w+", ms=14, mew=2.0, zorder=6, label="Field ctr (ideal)")
+    # Isocenter crosshair
+    ax.axhline(0, color="#444444", lw=0.8, ls=":", zorder=1)
+    ax.axvline(0, color="#444444", lw=0.8, ls=":", zorder=1)
 
-    # Setup error (lateral shown on X axis; AP shown separately in title)
-    ecx = wl_results["setup_x"]    # lateral
-    ecy = wl_results["setup_y"]    # SI
-    ecz = wl_results["setup_z"]    # AP
-    disp_ax.plot(ecx, ecy, "w*", ms=10, zorder=6,
-                 label=f"Setup Lat={ecx:+.2f} SI={ecy:+.2f} AP={ecz:+.2f}")
-
-    # Walk circle
-    theta = np.linspace(0, 2 * np.pi, 300)
-    disp_ax.plot(
-        ecx + walk_r * np.cos(theta),
-        ecy + walk_r * np.sin(theta),
-        color="white", lw=1.4, ls="-", alpha=0.6, label=f"Walk circle r={walk_r:.3f}mm",
+    # Tolerance circle (dashed red)
+    ax.add_patch(mpatches.Circle(
+        (0, 0), TOLERANCE_MM, color="#ef5350", fill=False,
+        ls="--", lw=1.5, alpha=0.85, zorder=2,
+    ))
+    ax.text(
+        TOLERANCE_MM * 0.707 + 0.03, TOLERANCE_MM * 0.707 + 0.03,
+        f"Tol {TOLERANCE_MM:.1f} mm", color="#ef5350", fontsize=7.5, zorder=3,
     )
 
-    # Tolerance circle centred on MEC centre
-    disp_ax.plot(
-        ecx + TOLERANCE_MM * np.cos(theta),
-        ecy + TOLERANCE_MM * np.sin(theta),
-        color="#888888", lw=1.0, ls=":", alpha=0.5, label=f"Tolerance {TOLERANCE_MM:.1f} mm",
-    )
+    # MEC walk circle (white)
+    ax.add_patch(mpatches.Circle(
+        (mec_cx, mec_cy), walk_r, color="white", fill=False,
+        lw=2.0, alpha=0.9, zorder=4,
+    ))
 
-    # Raw displacement points per angle
+    # MEC centre cross
+    ax.plot(mec_cx, mec_cy, "+", color="#90caf9", ms=14, mew=2.5, zorder=6,
+            label=f"MEC centre ({mec_cx:+.3f}, {mec_cy:+.3f}) mm")
+
+    # Spokes from MEC centre to each point
     for angle in GANTRY_ANGLES:
-        wla = wl_results["per_angle"][angle]
+        pt  = per_angle[angle]
         col = angle_colors[angle]
-        disp_ax.scatter(
-            wla["raw_dx"], wla["raw_dy"],
-            color=col, s=60, zorder=7,
-        )
-        disp_ax.annotate(
-            f"G{angle}°",
-            xy=(wla["raw_dx"], wla["raw_dy"]),
-            xytext=(wla["raw_dx"] + 0.04, wla["raw_dy"] + 0.04),
-            color=col, fontsize=7.5, fontweight="bold",
+        ax.plot([mec_cx, pt["rel_dx"]], [mec_cy, pt["rel_dy"]],
+                color=col, lw=0.9, alpha=0.45, zorder=3)
+
+    # Per-angle dots
+    for angle in GANTRY_ANGLES:
+        pt  = per_angle[angle]
+        col = angle_colors[angle]
+        ax.plot(
+            pt["rel_dx"], pt["rel_dy"], "o",
+            color=col, ms=11, zorder=7, markeredgecolor="white", markeredgewidth=0.6,
+            label=f"{angle_labels[angle]}  ({pt['rel_dx']:+.3f}, {pt['rel_dy']:+.3f}) mm",
         )
 
-    # Axis limits: at least ±(walk_r + 0.3) mm from MEC centre
-    pad  = max(walk_r + 0.35, TOLERANCE_MM + 0.2)
-    disp_ax.set_xlim(ecx - pad, ecx + pad)
-    disp_ax.set_ylim(ecy - pad, ecy + pad)
-    disp_ax.set_aspect("equal")
-    disp_ax.legend(
-        fontsize=6.5, loc="upper right",
-        facecolor="#222222", edgecolor="#555555", labelcolor="white",
+    # Auto-scale with margin
+    all_vals = [per_angle[a]["rel_dx"] for a in GANTRY_ANGLES] + \
+               [per_angle[a]["rel_dy"] for a in GANTRY_ANGLES] + [mec_cx, mec_cy]
+    lim = max(abs(v) for v in all_vals) + max(0.25, walk_r * 0.4)
+    lim = max(lim, TOLERANCE_MM * 1.25)
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+
+    pf_color = "#66bb6a" if passed else "#ef5350"
+    ax.set_title(
+        f"Isocenter Walk Circle   r = {walk_r:.3f} mm   "
+        f"{'PASS ✓' if passed else 'FAIL ✗'}",
+        color=pf_color, fontsize=10, fontweight="bold", pad=6,
+    )
+    ax.set_xlabel("ΔLat / ΔAP  (mm)", color="#bbbbbb", fontsize=9)
+    ax.set_ylabel("ΔSI  (mm)",         color="#bbbbbb", fontsize=9)
+    ax.tick_params(colors="#aaaaaa", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#444444")
+
+    # Walk circle radius annotation
+    ax.annotate(
+        f"r = {walk_r:.3f} mm",
+        xy=(mec_cx + walk_r * 0.707, mec_cy + walk_r * 0.707),
+        color="white", fontsize=8, zorder=8,
+        xytext=(4, 4), textcoords="offset points",
     )
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    legend = ax.legend(
+        loc="lower right", fontsize=7.5,
+        facecolor="#1f1f1f", labelcolor="white",
+        edgecolor="#555555", framealpha=0.92,
+        handlelength=1.2, handleheight=1.0,
+    )
+
+    fig.tight_layout(pad=0.6)
+
+    tmp = tempfile.NamedTemporaryFile(suffix="_walk_circle.png", delete=False)
     plt.savefig(tmp.name, dpi=150, bbox_inches="tight", facecolor="#111111")
     plt.close(fig)
     return tmp.name
@@ -1155,8 +1186,11 @@ class WLApp(QMainWindow):
         self._image_results = None
         self._loaded_dir    = None
         self._diag_fig_path = None
+        self._walk_fig_path = None
         self._dicom_date    = None
-        self._table_labels: dict = {}
+        self._dicom_time    = None
+        self._table_labels: dict  = {}
+        self._res_ref_labels: dict = {}
 
         self._config = _load_config()
         _init_db()
@@ -1222,23 +1256,42 @@ class WLApp(QMainWindow):
 
         main_layout.addWidget(sel_bar)
 
-        # ── PASS / FAIL banner ────────────────────────────────────────────────
+        # ── PASS / FAIL banner  (WL left | Field right) ──────────────────────
+        pf_container = QWidget()
+        pf_container.setFixedHeight(72)
+        pf_hbox = QHBoxLayout(pf_container)
+        pf_hbox.setContentsMargins(0, 0, 0, 0)
+        pf_hbox.setSpacing(8)
+
         self._pf_frame = QFrame()
-        self._pf_frame.setFixedHeight(85)
         self._pf_frame.setStyleSheet(
             "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
         )
-        pf_inner = QHBoxLayout(self._pf_frame)
-        pf_inner.setContentsMargins(0, 0, 0, 0)
-
-        self._pf_label = QLabel("—  AWAITING DATA  —")
+        pf_inner_wl = QHBoxLayout(self._pf_frame)
+        pf_inner_wl.setContentsMargins(0, 0, 0, 0)
+        self._pf_label = QLabel("—  WL AWAITING DATA  —")
         self._pf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._pf_label.setStyleSheet(
-            "font-size: 30px; font-weight: bold; color: gray; background: transparent;"
+            "font-size: 25px; font-weight: bold; color: gray; background: transparent;"
         )
-        pf_inner.addWidget(self._pf_label)
+        pf_inner_wl.addWidget(self._pf_label)
+        pf_hbox.addWidget(self._pf_frame, stretch=1)
 
-        main_layout.addWidget(self._pf_frame)
+        self._pf_frame_fs = QFrame()
+        self._pf_frame_fs.setStyleSheet(
+            "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
+        )
+        pf_inner_fs = QHBoxLayout(self._pf_frame_fs)
+        pf_inner_fs.setContentsMargins(0, 0, 0, 0)
+        self._pf_label_fs = QLabel("—  FIELD AWAITING DATA  —")
+        self._pf_label_fs.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pf_label_fs.setStyleSheet(
+            "font-size: 25px; font-weight: bold; color: gray; background: transparent;"
+        )
+        pf_inner_fs.addWidget(self._pf_label_fs)
+        pf_hbox.addWidget(self._pf_frame_fs, stretch=1)
+
+        main_layout.addWidget(pf_container)
 
         # ── Tab view ──────────────────────────────────────────────────────────
         self._tabview = QTabWidget()
@@ -1251,58 +1304,137 @@ class WLApp(QMainWindow):
         tab_res = QWidget()
         res_layout = QHBoxLayout(tab_res)
         res_layout.setContentsMargins(6, 6, 6, 6)
-        res_layout.setSpacing(16)
+        res_layout.setSpacing(10)
         self._tabview.addTab(tab_res, "Results")
 
-        left_card = QFrame()
-        left_card.setStyleSheet(
-            "QFrame { background-color: #363636; border-radius: 10px; }"
-        )
-        left_layout = QVBoxLayout(left_card)
-        left_layout.setContentsMargins(14, 14, 14, 12)
+        # ── Left panel: WL tables stacked vertically ──────────────────────────
+        wl_panel = QWidget()
+        wl_panel.setStyleSheet("background: transparent;")
+        wl_vbox = QVBoxLayout(wl_panel)
+        wl_vbox.setContentsMargins(0, 0, 0, 0)
+        wl_vbox.setSpacing(8)
 
-        raw_title = QLabel("Raw Displacements  (Field → Void)")
-        raw_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        raw_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; background: transparent;"
-        )
-        left_layout.addWidget(raw_title)
-
-        raw_sub = QLabel("Includes CBCT setup error")
-        raw_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        raw_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
-        left_layout.addWidget(raw_sub)
-
-        raw_tbl_widget = QWidget()
-        raw_tbl_widget.setStyleSheet("background: transparent;")
-        self._build_result_table(raw_tbl_widget, prefix="raw")
-        left_layout.addWidget(raw_tbl_widget, stretch=1)
-        res_layout.addWidget(left_card)
-
-        right_card = QFrame()
-        right_card.setStyleSheet(
-            "QFrame { background-color: #363636; border-radius: 10px; }"
-        )
-        right_layout = QVBoxLayout(right_card)
-        right_layout.setContentsMargins(14, 14, 14, 12)
-
+        corr_card = QFrame()
+        corr_card.setStyleSheet("QFrame { background-color: #363636; border-radius: 10px; }")
+        corr_layout = QVBoxLayout(corr_card)
+        corr_layout.setContentsMargins(12, 10, 12, 8)
         corr_title = QLabel("Corrected Displacements  (Isocenter Walk)")
         corr_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        corr_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; background: transparent;"
-        )
-        right_layout.addWidget(corr_title)
-
+        corr_title.setStyleSheet("font-size: 14px; font-weight: bold; background: transparent;")
+        corr_layout.addWidget(corr_title)
         self._corr_sub = QLabel("Isocenter walk  (3D setup error removed)")
         self._corr_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._corr_sub.setStyleSheet("font-size: 12px; color: gray; background: transparent;")
-        right_layout.addWidget(self._corr_sub)
-
+        self._corr_sub.setStyleSheet("font-size: 11px; color: gray; background: transparent;")
+        corr_layout.addWidget(self._corr_sub)
         corr_tbl_widget = QWidget()
         corr_tbl_widget.setStyleSheet("background: transparent;")
         self._build_result_table(corr_tbl_widget, prefix="corr")
-        right_layout.addWidget(corr_tbl_widget, stretch=1)
-        res_layout.addWidget(right_card)
+        corr_layout.addWidget(corr_tbl_widget, stretch=1)
+        wl_vbox.addWidget(corr_card, stretch=1)
+
+        # Walk circle displacement map
+        walk_fig_frame = QFrame()
+        walk_fig_frame.setStyleSheet(
+            "QFrame { background-color: #1a1a1a; border-radius: 10px; }"
+        )
+        walk_fig_inner = QVBoxLayout(walk_fig_frame)
+        walk_fig_inner.setContentsMargins(4, 4, 4, 4)
+        self._walk_fig_label = QLabel()
+        self._walk_fig_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._walk_fig_label.setStyleSheet("background: transparent;")
+        walk_fig_inner.addWidget(self._walk_fig_label)
+        wl_vbox.addWidget(walk_fig_frame, stretch=2)
+
+        res_layout.addWidget(wl_panel, stretch=4)
+
+        # ── Right panel: Field size data ──────────────────────────────────────
+        fs_panel = QFrame()
+        fs_panel.setStyleSheet("QFrame { background-color: #363636; border-radius: 10px; }")
+        fs_vbox = QVBoxLayout(fs_panel)
+        fs_vbox.setContentsMargins(12, 10, 12, 10)
+        fs_vbox.setSpacing(5)
+
+        fs_ref_row = QWidget()
+        fs_ref_row.setStyleSheet("background: transparent;")
+        fs_ref_hbox = QHBoxLayout(fs_ref_row)
+        fs_ref_hbox.setContentsMargins(0, 0, 0, 0)
+        fs_ref_hbox.setSpacing(6)
+        ref_hdr = QLabel("Baseline Reference:")
+        ref_hdr.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #aaaaaa; background: transparent;"
+        )
+        fs_ref_hbox.addWidget(ref_hdr)
+        for _rkey, _rdisp in [("mlc", "  MLC (Leaves):"), ("jaw", "  Jaw (SI):")]:
+            nlbl = QLabel(_rdisp)
+            nlbl.setStyleSheet("font-size: 12px; color: #777777; background: transparent;")
+            fs_ref_hbox.addWidget(nlbl)
+            vlbl = QLabel("—")
+            vlbl.setStyleSheet(
+                "font-size: 13px; font-family: monospace; font-weight: bold; "
+                "color: #90caf9; background: transparent;"
+            )
+            fs_ref_hbox.addWidget(vlbl)
+            self._res_ref_labels[_rkey] = vlbl
+        fs_ref_hbox.addStretch()
+        fs_vbox.addWidget(fs_ref_row)
+
+        ang_hdr_lbl2 = QLabel(
+            f"Field Size per Gantry Angle   —   "
+            f"Warn >{FIELD_SIZE_WARN_MM:.1f} mm     Fail >{FIELD_SIZE_FAIL_MM:.1f} mm"
+        )
+        ang_hdr_lbl2.setStyleSheet("font-size: 11px; color: #666666;")
+        fs_vbox.addWidget(ang_hdr_lbl2)
+
+        res_ang_hdrs = ["Angle", "MLC (mm)", "Δ MLC (mm)", "Jaw (mm)", "Δ Jaw (mm)"]
+        self._res_fs_angle_table = QTableWidget(5, len(res_ang_hdrs))
+        self._res_fs_angle_table.setHorizontalHeaderLabels(res_ang_hdrs)
+        self._res_fs_angle_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._res_fs_angle_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._res_fs_angle_table.verticalHeader().setVisible(False)
+        self._res_fs_angle_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._res_fs_angle_table.setMaximumHeight(185)
+        for _ri, _albl in enumerate([f"G{a:03d}°" for a in GANTRY_ANGLES] + ["Mean"]):
+            _it = QTableWidgetItem(_albl)
+            _it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            _it.setForeground(QBrush(QColor("#90caf9")))
+            self._res_fs_angle_table.setItem(_ri, 0, _it)
+        fs_vbox.addWidget(self._res_fs_angle_table)
+
+        leaf_hdr_lbl2 = QLabel(
+            f"Individual MLC Leaf Spans   —   "
+            f"{MLC_LEAVES_PER_BANK} leaves × {MLC_LEAF_WIDTH_MM:.0f} mm each (SI)   —   G000°"
+        )
+        leaf_hdr_lbl2.setStyleSheet("font-size: 11px; color: #666666;")
+        fs_vbox.addWidget(leaf_hdr_lbl2)
+
+        res_leaf_hdrs = ["Leaf #", "SI Centre (mm)", "Total (mm)", "Δ Span (mm)"]
+        self._res_fs_leaf_table = QTableWidget(MLC_LEAVES_PER_BANK, len(res_leaf_hdrs))
+        self._res_fs_leaf_table.setHorizontalHeaderLabels(res_leaf_hdrs)
+        self._res_fs_leaf_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._res_fs_leaf_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._res_fs_leaf_table.verticalHeader().setVisible(False)
+        self._res_fs_leaf_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        for _ri in range(MLC_LEAVES_PER_BANK):
+            _si = (MLC_LEAVES_PER_BANK / 2 - _ri - 0.5) * MLC_LEAF_WIDTH_MM
+            for _ci, (_txt, _col) in enumerate([
+                (str(_ri + 1),     "#90caf9"),
+                (f"{_si:+.1f}",   "#aaaaaa"),
+            ]):
+                _it = QTableWidgetItem(_txt)
+                _it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                _it.setForeground(QBrush(QColor(_col)))
+                self._res_fs_leaf_table.setItem(_ri, _ci, _it)
+        fs_vbox.addWidget(self._res_fs_leaf_table, stretch=1)
+
+        res_layout.addWidget(fs_panel, stretch=5)
 
         # Field Size QA tab ───────────────────────────────────────────────────
         self._build_field_size_tab()
@@ -1615,6 +1747,22 @@ class WLApp(QMainWindow):
             lbl.setStyleSheet(ref_style)
         self._fs_notice_label.setVisible(not is_calibrated)
 
+        # Mirror into Results tab reference labels
+        res_style = (
+            "font-size: 13px; font-family: monospace; font-weight: bold; "
+            "color: #90caf9; background: transparent;"
+        ) if is_calibrated else (
+            "font-size: 13px; font-family: monospace; font-weight: bold; "
+            "color: #ffa726; background: transparent;"
+        )
+        for key, val_text in [
+            ("mlc", f"{ref_mlc:.3f} mm" if is_calibrated else f"{ref_mlc:.3f} mm (nominal)"),
+            ("jaw", f"{ref_jaw:.3f} mm" if is_calibrated else f"{ref_jaw:.3f} mm (nominal)"),
+        ]:
+            if key in self._res_ref_labels:
+                self._res_ref_labels[key].setText(val_text)
+                self._res_ref_labels[key].setStyleSheet(res_style)
+
     def _refresh_field_size_display(self):
         """Populate the Field Size QA tab from the latest image results."""
         machine = self._machine_combo.currentText()
@@ -1666,12 +1814,20 @@ class WLApp(QMainWindow):
         mlc_devs, jaw_devs = [], []
         worst_lvl = 0   # track overall DLG status — only meaningful when calibrated
 
+        def _cell_abs(v):
+            return _cell(f"{v:.3f}" if v is not None else "—", "#dcdcdc")
+
         for ri, angle in enumerate(GANTRY_ANGLES):
             fe  = self._image_results[angle].get("field_edges", {})
             mlc = fe.get("mlc_total_mm")
             jaw = fe.get("jaw_total_mm")
             self._fs_angle_table.setItem(ri, 1, _vcell_dev(mlc, ref_mlc))
             self._fs_angle_table.setItem(ri, 2, _vcell_dev(jaw, ref_jaw))
+            # Results tab: absolute + delta
+            self._res_fs_angle_table.setItem(ri, 1, _cell_abs(mlc))
+            self._res_fs_angle_table.setItem(ri, 2, _vcell_dev(mlc, ref_mlc))
+            self._res_fs_angle_table.setItem(ri, 3, _cell_abs(jaw))
+            self._res_fs_angle_table.setItem(ri, 4, _vcell_dev(jaw, ref_jaw))
             if is_calibrated:
                 for v, ref in [(mlc, ref_mlc), (jaw, ref_jaw)]:
                     if v is not None:
@@ -1687,6 +1843,10 @@ class WLApp(QMainWindow):
         mean_jaw = float(np.mean(jaw_acc)) if jaw_acc else None
         self._fs_angle_table.setItem(4, 1, _vcell_dev(mean_mlc, ref_mlc))
         self._fs_angle_table.setItem(4, 2, _vcell_dev(mean_jaw, ref_jaw))
+        self._res_fs_angle_table.setItem(4, 1, _cell_abs(mean_mlc))
+        self._res_fs_angle_table.setItem(4, 2, _vcell_dev(mean_mlc, ref_mlc))
+        self._res_fs_angle_table.setItem(4, 3, _cell_abs(mean_jaw))
+        self._res_fs_angle_table.setItem(4, 4, _vcell_dev(mean_jaw, ref_jaw))
 
         # Maximum deviation across angles (signed, worst absolute value)
         max_mlc_dev = max(mlc_devs, key=abs) if mlc_devs else None
@@ -1698,12 +1858,17 @@ class WLApp(QMainWindow):
         for ri, leaf in enumerate(leaves):
             total = leaf.get("total_mm")
             self._fs_leaf_table.setItem(ri, 2, _vcell_dev(total, ref_leaf))
+            # Results tab: absolute + delta
+            self._res_fs_leaf_table.setItem(
+                ri, 2, _cell(f"{total:.3f}" if total is not None else "—", "#dcdcdc")
+            )
+            self._res_fs_leaf_table.setItem(ri, 3, _vcell_dev(total, ref_leaf))
             if total is not None:
                 leaf_devs.append(total - ref_leaf)
                 if is_calibrated:
                     worst_lvl = max(worst_lvl, _fs_level(total - ref_leaf))
 
-        # ── Update DLG status label on the Results page ───────────────────────
+        # ── Update DLG status label (bottom bar) ─────────────────────────────
         def _dstr(v): return f"{v:+.3f}" if v is not None else "—"
 
         if not is_calibrated:
@@ -1728,46 +1893,71 @@ class WLApp(QMainWindow):
         self._dlg_status_label.setText(dlg_text)
         self._dlg_status_label.setStyleSheet(dlg_style)
 
+        # ── Update field size PASS/FAIL banner ────────────────────────────────
+        if not is_calibrated:
+            self._pf_frame_fs.setStyleSheet(
+                "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
+            )
+            self._pf_label_fs.setText("FIELD  —  Reference Not Set")
+            self._pf_label_fs.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #ffa726; background: transparent;"
+            )
+        elif worst_lvl == 0:
+            self._pf_frame_fs.setStyleSheet(
+                "QFrame { background-color: #1a3d1e; border-radius: 10px; }"
+            )
+            self._pf_label_fs.setText(
+                f"FIELD  PASS    ΔMLC {_dstr(max_mlc_dev)}  ΔJaw {_dstr(max_jaw_dev)} mm"
+            )
+            self._pf_label_fs.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #66bb6a; background: transparent;"
+            )
+        elif worst_lvl == 1:
+            self._pf_frame_fs.setStyleSheet(
+                "QFrame { background-color: #3d3000; border-radius: 10px; }"
+            )
+            self._pf_label_fs.setText(
+                f"FIELD  WARNING    ΔMLC {_dstr(max_mlc_dev)}  ΔJaw {_dstr(max_jaw_dev)} mm"
+            )
+            self._pf_label_fs.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #ffd600; background: transparent;"
+            )
+        else:
+            self._pf_frame_fs.setStyleSheet(
+                "QFrame { background-color: #3d1a1a; border-radius: 10px; }"
+            )
+            self._pf_label_fs.setText(
+                f"FIELD  FAIL    ΔMLC {_dstr(max_mlc_dev)}  ΔJaw {_dstr(max_jaw_dev)} mm"
+            )
+            self._pf_label_fs.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #ef5350; background: transparent;"
+            )
+
     def _refresh_ring_display(self):
-        """Update the phantom ring / tilt status label from the current image results."""
+        """Update the phantom ring status label from the current image results."""
         if self._image_results is None:
             self._ring_status_label.setText("Phantom Ring:  —")
             self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
             return
 
-        r_h_vals, r_v_vals, tilt_vals = [], [], []
+        r_vals = []
         for ir in self._image_results.values():
-            ring = ir.get("ring_info", {})
-            if ring.get("r_horiz_mm") is not None:
-                r_h_vals.append(ring["r_horiz_mm"])
-            if ring.get("r_vert_mm") is not None:
-                r_v_vals.append(ring["r_vert_mm"])
-            if ring.get("tilt_deg") is not None:
-                tilt_vals.append(ring["tilt_deg"])
+            v = ir.get("ring_info", {}).get("r_mean_mm")
+            if v is not None:
+                r_vals.append(v)
 
-        if not tilt_vals:
-            self._ring_status_label.setText("Phantom Ring:  detection failed")
+        if not r_vals:
+            self._ring_status_label.setText("Phantom Ring:  detection uncertain")
             self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
             return
 
-        mean_rh   = float(np.mean(r_h_vals))
-        mean_rv   = float(np.mean(r_v_vals))
-        mean_ell  = abs(mean_rh - mean_rv)
-        max_tilt  = float(np.max(tilt_vals))
-
-        if max_tilt < RING_TILT_WARN_DEG:
-            style = "font-size: 13px; color: #888888;"
-            level = "OK"
-        elif max_tilt < RING_TILT_FAIL_DEG:
-            style = "font-size: 13px; color: #ffa726; font-weight: bold;"
-            level = "ADVISORY — reposition phantom"
-        else:
-            style = "font-size: 13px; color: #ef5350; font-weight: bold;"
-            level = "ACTION — phantom significantly tilted"
-
+        r_mean = float(np.mean(r_vals))
+        in_range = 15.0 <= r_mean <= 30.0
+        style = "font-size: 13px; color: #888888;" if in_range else \
+                "font-size: 13px; color: #ffa726; font-weight: bold;"
+        note  = "" if in_range else "  [unexpected — check phantom position]"
         self._ring_status_label.setText(
-            f"Phantom Ring:  r(h)={mean_rh:.1f}  r(v)={mean_rv:.1f} mm  "
-            f"│  ellip={mean_ell:.2f} mm  tilt ≈{max_tilt:.1f}°  [{level}]"
+            f"Phantom Ring:  r = {r_mean:.1f} mm  (expected ≈{RING_RADIUS_NOMINAL_MM:.0f} mm){note}"
         )
         self._ring_status_label.setStyleSheet(style)
 
@@ -1787,7 +1977,7 @@ class WLApp(QMainWindow):
         self._dir_label.setText(Path(directory).name)
         self._pf_label.setText("Processing…")
         self._pf_label.setStyleSheet(
-            "font-size: 30px; font-weight: bold; color: gray; background: transparent;"
+            "font-size: 25px; font-weight: bold; color: gray; background: transparent;"
         )
         self._pf_frame.setStyleSheet(
             "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
@@ -1805,24 +1995,66 @@ class WLApp(QMainWindow):
             wl_results["pass_fail_cent"]     = wl_cent["pass_fail"]
 
             self._dicom_date = None
+            self._dicom_time = None
             for ds in dcm_images.values():
-                for tag in ("AcquisitionDate", "StudyDate", "ContentDate"):
-                    raw = getattr(ds, tag, None)
-                    if raw and len(str(raw)) == 8:
+                for dtag, ttag in (("StudyDate", "StudyTime"),
+                                   ("ContentDate", "ContentTime")):
+                    raw_d = getattr(ds, dtag, None)
+                    if raw_d and len(str(raw_d)) == 8:
                         try:
                             self._dicom_date = datetime.datetime.strptime(
-                                str(raw), "%Y%m%d"
+                                str(raw_d), "%Y%m%d"
                             ).date()
-                        except ValueError:
+                            raw_t = getattr(ds, ttag, None)
+                            if raw_t:
+                                ts = str(raw_t).split(".")[0].zfill(6)
+                                if len(ts) >= 6:
+                                    self._dicom_time = datetime.time(
+                                        int(ts[0:2]), int(ts[2:4]), int(ts[4:6])
+                                    )
+                        except (ValueError, TypeError):
                             pass
                         break
                 if self._dicom_date:
+                    break
+
+            # Fallback: parse date from folder name (never use today's date)
+            if not self._dicom_date:
+                import re as _re
+                _fn = os.path.basename(directory.rstrip("/\\"))
+                # Try 8-digit MMDDYYYY first (e.g. 06092026)
+                _m = _re.search(r"(\d{2})(\d{2})(\d{4})", _fn)
+                if _m:
+                    try:
+                        self._dicom_date = datetime.date(
+                            int(_m.group(3)), int(_m.group(1)), int(_m.group(2))
+                        )
+                    except ValueError:
+                        pass
+                if not self._dicom_date:
+                    # Try 6-digit MMDDYY (e.g. 061126)
+                    _m = _re.search(r"(\d{2})(\d{2})(\d{2})(?!\d)", _fn)
+                    if _m:
+                        try:
+                            self._dicom_date = datetime.date(
+                                2000 + int(_m.group(3)), int(_m.group(1)), int(_m.group(2))
+                            )
+                        except ValueError:
+                            pass
+
+            # Auto-select machine from DICOM PatientID
+            for ds in dcm_images.values():
+                _pid = getattr(ds, "PatientID", None)
+                if _pid and str(_pid) in PATIENT_ID_MACHINE_MAP:
+                    _detected = PATIENT_ID_MACHINE_MAP[str(_pid)]
+                    self._machine_combo.setCurrentText(_detected)
                     break
 
             self._image_results = image_results
             self._wl_results    = wl_results
             self._loaded_dir    = directory
             self._diag_fig_path = generate_diagnostic_figure(image_results, wl_results)
+            self._walk_fig_path = generate_walk_circle_figure(wl_results)
 
             self._refresh_display()
             self._report_btn.setEnabled(True)
@@ -1831,7 +2063,7 @@ class WLApp(QMainWindow):
             QMessageBox.critical(self, "Processing Error", str(exc))
             self._pf_label.setText("— ERROR —")
             self._pf_label.setStyleSheet(
-                "font-size: 30px; font-weight: bold; color: #f44336; background: transparent;"
+                "font-size: 25px; font-weight: bold; color: #f44336; background: transparent;"
             )
 
     def _refresh_display(self):
@@ -1846,23 +2078,23 @@ class WLApp(QMainWindow):
             self._pf_frame.setStyleSheet(
                 "QFrame { background-color: #1a3d1e; border-radius: 10px; }"
             )
-            self._pf_label.setText(f"PASS    {walk:.2f} mm")
+            self._pf_label.setText(f"WL  PASS    {walk:.3f} mm")
             self._pf_label.setStyleSheet(
-                "font-size: 30px; font-weight: bold; color: #66bb6a; background: transparent;"
+                "font-size: 25px; font-weight: bold; color: #66bb6a; background: transparent;"
             )
         else:
             self._pf_frame.setStyleSheet(
                 "QFrame { background-color: #3d1a1a; border-radius: 10px; }"
             )
-            self._pf_label.setText(f"FAIL    {walk:.2f} mm")
+            self._pf_label.setText(f"WL  FAIL    {walk:.3f} mm")
             self._pf_label.setStyleSheet(
-                "font-size: 30px; font-weight: bold; color: #ef5350; background: transparent;"
+                "font-size: 25px; font-weight: bold; color: #ef5350; background: transparent;"
             )
 
         walk_cent = wl.get("walk_circle_r_cent")
         if walk_cent is not None:
             self._walk_label.setText(
-                f"Walk Circle:  BBox = {walk:.3f} mm  │  Centroid = {walk_cent:.3f} mm"
+                f"Walk Circle:  Edge = {walk:.3f} mm  │  Centroid = {walk_cent:.3f} mm"
                 f"   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
             )
         else:
@@ -1892,19 +2124,34 @@ class WLApp(QMainWindow):
 
         for angle in GANTRY_ANGLES:
             r = wl["per_angle"][angle]
-            raw_dr  = np.sqrt(r["raw_dx"] ** 2 + r["raw_dy"] ** 2)
             corr_dr = np.sqrt(r["rel_dx"] ** 2 + r["rel_dy"] ** 2)
-
-            _set(f"raw_{angle}_dx",  f"{r['raw_dx']:+.3f}", _color(abs(r["raw_dx"])))
-            _set(f"raw_{angle}_dy",  f"{r['raw_dy']:+.3f}", _color(abs(r["raw_dy"])))
-            _set(f"raw_{angle}_dr",  f"{raw_dr:.3f}",       _color(raw_dr))
             _set(f"corr_{angle}_dx", f"{r['rel_dx']:+.3f}", _color(abs(r["rel_dx"])))
             _set(f"corr_{angle}_dy", f"{r['rel_dy']:+.3f}", _color(abs(r["rel_dy"])))
             _set(f"corr_{angle}_dr", f"{corr_dr:.3f}",      _color(corr_dr))
 
         self._refresh_field_size_display()
         self._refresh_ring_display()
+        self._update_walk_fig()
         self._update_diag_image()
+
+    def _update_walk_fig(self):
+        if not self._walk_fig_path or not os.path.exists(self._walk_fig_path):
+            return
+        try:
+            import io
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(self._walk_fig_path)
+            # Fit inside the label's current width; keep square-ish aspect
+            avail_w = max(300, self._walk_fig_label.width())
+            scale_h = int(pil_img.height * avail_w / pil_img.width)
+            pil_img = pil_img.resize((avail_w, scale_h), PILImage.LANCZOS)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.getvalue())
+            self._walk_fig_label.setPixmap(pixmap)
+        except Exception:
+            pass
 
     def _update_diag_image(self):
         if not self._diag_fig_path or not os.path.exists(self._diag_fig_path):
@@ -1934,10 +2181,8 @@ class WLApp(QMainWindow):
         machine   = self._machine_combo.currentText()
         physicist = self._physicist_combo.currentText()
 
-        default_name = (
-            f"WL_QA_{machine.replace(' ', '_')}_"
-            f"{datetime.date.today().strftime('%Y%m%d')}.pdf"
-        )
+        _fn_date = self._dicom_date.strftime("%Y%m%d") if self._dicom_date else "UNKNOWN"
+        default_name = f"WL_QA_{machine.replace(' ', '_')}_{_fn_date}.pdf"
         initial_path = str(
             Path(self._config.get("last_report_dir", str(Path.home()))) / default_name
         )
@@ -1958,9 +2203,11 @@ class WLApp(QMainWindow):
                 self._image_results,
                 save_path,
                 diag_fig_path=self._diag_fig_path,
+                walk_fig_path=self._walk_fig_path,
                 machine_name=machine,
                 physicist_name=physicist,
                 dicom_date=self._dicom_date,
+                dicom_time=self._dicom_time,
             )
             _save_to_db(self._wl_results, self._image_results, machine, physicist)
             QMessageBox.information(self, "Report Saved", f"Report saved to:\n{save_path}")
@@ -2207,9 +2454,11 @@ def generate_pdf_report(
     image_results: dict,
     output_path: str,
     diag_fig_path: str | None = None,
+    walk_fig_path: str | None = None,
     machine_name: str = MACHINE_NAME,
     physicist_name: str = "",
     dicom_date: "datetime.date | None" = None,
+    dicom_time: "datetime.time | None" = None,
 ):
     doc = SimpleDocTemplate(
         output_path,
@@ -2239,9 +2488,9 @@ def generate_pdf_report(
     h2_style = ParagraphStyle(
         "WLH2",
         parent=ss["Heading2"],
-        fontSize=12,
-        spaceBefore=14,
-        spaceAfter=4,
+        fontSize=11,
+        spaceBefore=8,
+        spaceAfter=3,
         textColor=_BLUE_DARK,
     )
     note_style = ParagraphStyle(
@@ -2267,9 +2516,17 @@ def generate_pdf_report(
     story.append(HRFlowable(width="100%", thickness=1, color=_BORDER, spaceAfter=8))
 
     # ── Metadata table ────────────────────────────────────────────────────────
-    report_date = dicom_date if dicom_date else datetime.date.today()
-    today_str   = report_date.strftime("%B %d, %Y")
-    time_str    = datetime.datetime.now().strftime("%H:%M")
+    report_date = dicom_date    # always from DICOM / folder — never today's date
+    report_time = dicom_time    # always from DICOM StudyTime
+    today_str   = report_date.strftime("%B %d, %Y") if report_date else "Unknown Date"
+    time_str    = report_time.strftime("%H:%M:%S") if report_time else "—"
+    # Combined study datetime used everywhere (signature, footer, etc.)
+    if report_date and report_time:
+        study_dt = datetime.datetime.combine(report_date, report_time)
+    elif report_date:
+        study_dt = datetime.datetime.combine(report_date, datetime.time(0, 0))
+    else:
+        study_dt = datetime.datetime.now()
     max_walk  = wl_results["max_2d_walk_mm"]
     passed    = wl_results["pass_fail"]
     setup_lat = wl_results["setup_x"]    # patient lateral
@@ -2300,121 +2557,182 @@ def generate_pdf_report(
         ("LEFTPADDING",   (0, 0), (-1, -1), 6),
     ]))
     story.append(meta_tbl)
-    story.append(Spacer(1, 0.12 * inch))
+    story.append(Spacer(1, 0.08 * inch))
 
-    # ── PASS / FAIL banner ────────────────────────────────────────────────────
+    # ── Compute field-size status for banner (mirrors GUI logic) ─────────────
+    _cfg_b   = _load_config()
+    _frefs_b = _cfg_b.get("field_refs", {}).get(machine_name, {})
+    _ref_mlc_b  = _frefs_b.get("mlc",  FIELD_SIZE_REF_MM)
+    _ref_jaw_b  = _frefs_b.get("jaw",  FIELD_SIZE_REF_MM)
+    _fs_calibrated = bool(_frefs_b)
+
+    def _fs_lvl(dev):
+        a = abs(dev)
+        if a <= FIELD_SIZE_WARN_MM: return 0
+        if a <= FIELD_SIZE_FAIL_MM: return 1
+        return 2
+
+    _mlc_devs_b, _jaw_devs_b = [], []
+    for _ang in GANTRY_ANGLES:
+        _fe = image_results[_ang].get("field_edges", {})
+        _mv = _fe.get("mlc_total_mm")
+        _jv = _fe.get("jaw_total_mm")
+        if _mv is not None: _mlc_devs_b.append(_mv - _ref_mlc_b)
+        if _jv is not None: _jaw_devs_b.append(_jv - _ref_jaw_b)
+
+    _max_mlc_dev = max(_mlc_devs_b, key=abs) if _mlc_devs_b else None
+    _max_jaw_dev = max(_jaw_devs_b, key=abs) if _jaw_devs_b else None
+    _fs_worst = 0
+    if _fs_calibrated:
+        for _d in _mlc_devs_b + _jaw_devs_b:
+            _fs_worst = max(_fs_worst, _fs_lvl(_d))
+
+    def _dsign(v): return f"{v:+.3f}" if v is not None else "—"
+
+    if not _fs_calibrated:
+        _fs_text  = "FIELD  —  Reference Not Set"
+        _fs_bg    = colors.HexColor("#5a5a5a")
+    elif _fs_worst == 0:
+        _fs_text  = (f"FIELD  PASS    "
+                     f"ΔMLC {_dsign(_max_mlc_dev)}  ΔJaw {_dsign(_max_jaw_dev)} mm")
+        _fs_bg    = _GREEN
+    elif _fs_worst == 1:
+        _fs_text  = (f"FIELD  WARNING    "
+                     f"ΔMLC {_dsign(_max_mlc_dev)}  ΔJaw {_dsign(_max_jaw_dev)} mm")
+        _fs_bg    = colors.HexColor("#f57f17")
+    else:
+        _fs_text  = (f"FIELD  FAIL — Calibration Needed    "
+                     f"ΔMLC {_dsign(_max_mlc_dev)}  ΔJaw {_dsign(_max_jaw_dev)} mm")
+        _fs_bg    = _RED
+
+    # ── WL PASS / FAIL banner (full width) ───────────────────────────────────
     status_text = "PASS" if passed else "FAIL"
-    banner_bg   = _GREEN if passed else _RED
-    pf_tbl = Table(
-        [[f"OVERALL RESULT:  {status_text}       Walk Circle Radius = {max_walk:.3f} mm"]],
-        colWidths=[7.1 * inch],
-    )
-    pf_tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), banner_bg),
+    wl_bg       = _GREEN if passed else _RED
+    wl_text     = f"WL  {status_text}    Walk Circle Radius = {max_walk:.3f} mm"
+
+    banner_tbl = Table([[wl_text]], colWidths=[7.1 * inch])
+    banner_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), wl_bg),
         ("TEXTCOLOR",     (0, 0), (-1, -1), colors.white),
         ("FONTNAME",      (0, 0), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, -1), 15),
+        ("FONTSIZE",      (0, 0), (-1, -1), 14),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING",    (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
-    story.append(pf_tbl)
-    story.append(Spacer(1, 0.14 * inch))
+    story.append(banner_tbl)
+    story.append(Spacer(1, 0.08 * inch))
 
-    # ── Raw displacements ─────────────────────────────────────────────────────
-    story.append(Paragraph("Raw Displacements  (Field Centre → Void Centre)", h2_style))
-    story.append(Paragraph(
-        f"3D CBCT setup error: Lateral={setup_lat:+.3f} mm,  SI={setup_si:+.3f} mm,  AP={setup_ap:+.3f} mm  |  "
-        f"Walk circle radius: {max_walk:.3f} mm",
-        ParagraphStyle("mecnote", parent=ss["Normal"], fontSize=9,
-                       textColor=colors.HexColor("#444444"), spaceAfter=4),
-    ))
-
-    raw_header = [
-        "Gantry", "ΔX raw (mm)", "ΔSI raw (mm)", "|ΔR| raw (mm)", "ΔX represents"
-    ]
-    raw_data = [raw_header]
+    # ── Corrected displacements (left) + walk circle figure (right) ───────────
+    corr_header = ["Gantry", "ΔLat/AP (mm)", "ΔSI (mm)", "|ΔR| (mm)"]
+    corr_data   = [corr_header]
+    last_row_bg = _GREEN_LITE if passed else _RED_LITE
     for angle in GANTRY_ANGLES:
-        r  = wl_results["per_angle"][angle]
-        dr = np.sqrt(r["raw_dx"] ** 2 + r["raw_dy"] ** 2)
-        x_dir = "AP (patient A/P)" if angle in (90, 270) else "Lateral (patient L/R)"
-        raw_data.append([
-            f"G{angle:03d}°",
-            f"{r['raw_dx']:+.3f}",
-            f"{r['raw_dy']:+.3f}",
-            f"{dr:.3f}",
-            x_dir,
-        ])
-
-    raw_tbl = Table(raw_data, colWidths=[0.9*inch, 1.2*inch, 1.2*inch, 1.3*inch, 2.5*inch])
-    raw_tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, 0),  _BLUE_DARK),
-        ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
-        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, -1), 9),
-        ("ALIGN",         (1, 0), (3, -1),  "CENTER"),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, _BLUE_LIGHT]),
-        ("FONTNAME",      (0, 2), (0, 2),   "Helvetica-Bold"),  # G0 row
-        ("GRID",          (0, 0), (-1, -1), 0.3, _BORDER),
-        ("TOPPADDING",    (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
-    ]))
-    story.append(raw_tbl)
-    story.append(Spacer(1, 0.12 * inch))
-
-    # ── Corrected displacements ───────────────────────────────────────────────
-    story.append(Paragraph(
-        "Corrected Displacements  (3D Setup Error Removed — Isocenter Walk)",
-        h2_style,
-    ))
-
-    corr_header = [
-        "Gantry", "ΔLat/AP corr (mm)", "ΔSI corr (mm)", "|ΔR| corr (mm)", "Status"
-    ]
-    corr_data = [corr_header]
-    for angle in GANTRY_ANGLES:
-        r  = wl_results["per_angle"][angle]
-        dr = np.sqrt(r["rel_dx"] ** 2 + r["rel_dy"] ** 2)
-        x_dir = "AP walk" if angle in (90, 270) else "Lat walk"
-        status_cell = "✓  PASS" if dr <= TOLERANCE_MM else "✗  FAIL"
+        r     = wl_results["per_angle"][angle]
+        dr    = np.sqrt(r["rel_dx"] ** 2 + r["rel_dy"] ** 2)
+        x_dir = "AP" if angle in (90, 270) else "Lat"
         corr_data.append([
-            f"G{angle:03d}°  ({x_dir})",
+            f"G{angle:03d}° {x_dir}",
             f"{r['rel_dx']:+.3f}",
             f"{r['rel_dy']:+.3f}",
             f"{dr:.3f}",
-            status_cell,
         ])
+    corr_data.append(["Walk Circle r", "", "", f"{max_walk:.3f}"])
 
-    # Summary row
-    corr_data.append([
-        "WALK CIRCLE r", "", "", f"{max_walk:.3f}",
-        "PASS" if passed else "FAIL",
-    ])
-
-    last_row_bg = _GREEN_LITE if passed else _RED_LITE
-    corr_tbl = Table(corr_data, colWidths=[1.3*inch, 1.2*inch, 1.2*inch, 1.2*inch, 2.2*inch])
+    corr_tbl = Table(corr_data, colWidths=[1.20*inch, 1.00*inch, 0.95*inch, 0.95*inch])
     corr_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0),  (-1, 0),  _BLUE_DARK),
         ("TEXTCOLOR",     (0, 0),  (-1, 0),  colors.white),
         ("FONTNAME",      (0, 0),  (-1, 0),  "Helvetica-Bold"),
         ("FONTSIZE",      (0, 0),  (-1, -1), 9),
-        ("ALIGN",         (1, 0),  (3, -1),  "CENTER"),
+        ("ALIGN",         (1, 0),  (-1, -1), "CENTER"),
         ("ROWBACKGROUNDS",(0, 1),  (-1, -2), [colors.white, _BLUE_LIGHT]),
         ("BACKGROUND",    (0, -1), (-1, -1), last_row_bg),
         ("FONTNAME",      (0, -1), (-1, -1), "Helvetica-Bold"),
         ("GRID",          (0, 0),  (-1, -1), 0.3, _BORDER),
         ("TOPPADDING",    (0, 0),  (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0),  (-1, -1), 4),
-        ("LEFTPADDING",   (0, 0),  (-1, -1), 6),
+        ("LEFTPADDING",   (0, 0),  (-1, -1), 5),
     ]))
-    story.append(corr_tbl)
-    story.append(Spacer(1, 0.14 * inch))
 
-    # ── Field size analysis ───────────────────────────────────────────────────
+    # Walk circle figure alongside the corrected table
+    if walk_fig_path and os.path.exists(walk_fig_path):
+        from PIL import Image as PILImage
+        with PILImage.open(walk_fig_path) as _wfpil:
+            _wf_pw, _wf_ph = _wfpil.size
+        _wf_w = 2.95 * inch
+        _wf_h = _wf_w * (_wf_ph / _wf_pw)
+        _walk_cell = RLImage(walk_fig_path, width=_wf_w, height=_wf_h)
+    else:
+        _walk_cell = Paragraph("(figure unavailable)", note_style)
+
+    _corr_label = Paragraph(
+        "<b>Corrected Displacements — Isocenter Walk</b><br/>"
+        f"<font size='8' color='#555555'>CBCT setup removed: "
+        f"Lat {setup_lat:+.3f}  SI {setup_si:+.3f}  AP {setup_ap:+.3f} mm</font>",
+        ParagraphStyle("CorrHdr", parent=ss["Normal"], fontSize=9,
+                       spaceAfter=4, leading=13),
+    )
+    _no_pad = TableStyle([("LEFTPADDING",(0,0),(-1,-1),0),
+                          ("RIGHTPADDING",(0,0),(-1,-1),0),
+                          ("TOPPADDING",(0,0),(-1,-1),0),
+                          ("BOTTOMPADDING",(0,0),(-1,-1),0)])
+    _corr_inner = Table([[_corr_label], [corr_tbl]], colWidths=[4.10 * inch])
+    _corr_inner.setStyle(_no_pad)
+
+    side_tbl = Table(
+        [[_corr_inner, _walk_cell]],
+        colWidths=[4.10 * inch, 3.00 * inch],
+    )
+    side_tbl.setStyle(TableStyle([
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING",   (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 0),
+        ("ALIGN",        (1, 0), (1, 0),   "CENTER"),
+    ]))
+    story.append(side_tbl)
+    story.append(Spacer(1, 0.07 * inch))
+
+    # ── WL Methodology (iso page — after results) ─────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=5))
+    story.append(Paragraph("Methodology Notes — Isocenter Walk", h2_style))
+    story.append(Paragraph(
+        "<b>Imaging &amp; Detection:</b>  "
+        "Elekta iViewGT portal images (DICOM RTIMAGE, pydicom force=True) use an inverted "
+        "pixel convention — LOW value = HIGH dose.  "
+        "Pixel spacing is corrected to isocenter: spacing_iso = spacing_det × SAD/SID "
+        "(Elekta Versa HD: 1000/1600 = 0.625).  "
+        "Radiation field centre is the midpoint of 50%-penumbra crossings on column- and "
+        "row-averaged profiles (~1024 px per profile, ≈32× noise reduction, sub-pixel via "
+        "linear interpolation).  "
+        f"The MIMI {VOID_DIAMETER_MM} mm air void (local pixel minimum within the field) is "
+        "detected by Gaussian pre-filter (σ = void_r × 0.30), global minimum search within "
+        f"{FIELD_SIZE_MM * VOID_SEARCH_HALF_FIELD_FRACTION:.0f} mm radius, then "
+        "inverse-intensity-squared sub-pixel centroid.",
+        note_style,
+    ))
+    story.append(Spacer(1, 0.04 * inch))
+    story.append(Paragraph(
+        "<b>3D Decomposition &amp; Walk Circle:</b>  "
+        "Portal axes: G0°/G180° X = Lateral; G90°/G270° X = AP; all Y = SI.  "
+        "CBCT residual:  Lat = (ΔX_G0 + ΔX_G180)/2,  SI = mean(ΔY all angles),  "
+        "AP = (ΔX_G90 + ΔX_G270)/2.  "
+        "Subtracting the angle-appropriate component gives per-angle mechanical isocenter "
+        "walk residuals.  The <b>Minimum Enclosing Circle (MEC)</b> radius of the four "
+        f"residual vectors is the walk circle metric  "
+        f"(PASS: ≤ {TOLERANCE_MM:.1f} mm, per AAPM TG-142 SRS/SBRT monthly tolerance).",
+        note_style,
+    ))
+    story.append(Spacer(1, 0.07 * inch))
+
+    # ── Field size analysis  (page 2) ────────────────────────────────────────
+    from reportlab.platypus import PageBreak as _PageBreak
+    story.append(_PageBreak())
     story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
     story.append(Paragraph(
-        "Field Size Analysis  (Y1/Y2 = MLC leaves,  X1/X2 = Physical jaws)",
+        "Field Size Analysis  (Y-Jaw = MLC leaf banks,  X-Jaw = Physical collimator jaws)",
         h2_style,
     ))
 
@@ -2424,31 +2742,45 @@ def generate_pdf_report(
     ref_jaw  = frefs.get("jaw",  FIELD_SIZE_REF_MM)
     ref_leaf = frefs.get("leaf", ref_mlc)
 
+    # Field size PASS/FAIL banner
+    fs_banner_tbl = Table([[_fs_text]], colWidths=[7.1 * inch])
+    fs_banner_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), _fs_bg),
+        ("TEXTCOLOR",     (0, 0), (-1, -1), colors.white),
+        ("FONTNAME",      (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 13),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(fs_banner_tbl)
+    story.append(Spacer(1, 0.06 * inch))
+
+    _ref_note_style = ParagraphStyle("RefNote", parent=ss["Normal"], fontSize=8,
+                                     textColor=colors.HexColor("#444444"), spaceAfter=4)
     story.append(Paragraph(
-        f"Reference:  MLC total = {ref_mlc:.3f} mm,  Jaw (SI) = {ref_jaw:.3f} mm,  "
-        f"Leaf span baseline = {ref_leaf:.3f} mm.  "
-        f"Warning >{FIELD_SIZE_WARN_MM:.1f} mm deviation;  "
-        f"Call Service >{FIELD_SIZE_FAIL_MM:.1f} mm deviation.  "
-        "Field size = total distance between opposing 50%-penumbra edges.",
-        ParagraphStyle("FSNote", parent=ss["Normal"], fontSize=9,
-                       textColor=colors.HexColor("#444444"), spaceAfter=4),
+        f"Baselines (post Jun 19 2026):  MLC = {ref_mlc:.3f} mm  ·  "
+        f"Jaw = {ref_jaw:.3f} mm  ·  Leaf span = {ref_leaf:.3f} mm.  "
+        f"Action levels:  warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm  ·  "
+        f"call service |Δ| > {FIELD_SIZE_FAIL_MM:.1f} mm.  "
+        "Edges detected at 50%-penumbra crossing of column/row-averaged profiles (SAD/SID = 0.625).",
+        _ref_note_style,
     ))
 
-    _YEL2 = colors.HexColor("#f57f17")   # dark amber — readable on white for warning
+    _YEL2 = colors.HexColor("#f57f17")
     _RED2 = colors.HexColor("#b71c1c")
     _GRN2 = colors.HexColor("#2e7d32")
 
     def _fcc(v, ref):
-        if v is None:
-            return colors.HexColor("#888888")
+        if v is None: return colors.HexColor("#888888")
         d = abs(v - ref)
         return _GRN2 if d <= FIELD_SIZE_WARN_MM else (_YEL2 if d <= FIELD_SIZE_FAIL_MM else _RED2)
 
-    def _ffmt(v):        return f"{v:.3f}" if v is not None else "—"
-    def _fdfmt(v, ref):  return f"{v - ref:+.3f}" if v is not None else "—"
+    def _ffmt(v):       return f"{v:.3f}" if v is not None else "—"
+    def _fdfmt(v, ref): return f"{v - ref:+.3f}" if v is not None else "—"
 
-    # Per-angle table
-    fs_hdr  = ["Gantry", "MLC Total (mm)", "Δ MLC", "Jaw Total (mm)", "Δ Jaw"]
+    # Per-angle table (narrowed to 4.1 in to sit beside leaf table)
+    fs_hdr  = ["Gantry", "MLC (mm)", "Δ MLC", "Jaw (mm)", "Δ Jaw"]
     fs_data = [fs_hdr]
     mlc_acc, jaw_acc = [], []
     for angle in GANTRY_ANGLES:
@@ -2456,23 +2788,18 @@ def generate_pdf_report(
         mlcv = fe.get("mlc_total_mm")
         jawv = fe.get("jaw_total_mm")
         dir_lbl = "AP" if angle in (90, 270) else "Lat"
-        fs_data.append([
-            f"G{angle:03d}° ({dir_lbl})",
-            _ffmt(mlcv), _fdfmt(mlcv, ref_mlc),
-            _ffmt(jawv), _fdfmt(jawv, ref_jaw),
-        ])
+        fs_data.append([f"G{angle:03d}° {dir_lbl}",
+                        _ffmt(mlcv), _fdfmt(mlcv, ref_mlc),
+                        _ffmt(jawv), _fdfmt(jawv, ref_jaw)])
         if mlcv is not None: mlc_acc.append(mlcv)
         if jawv is not None: jaw_acc.append(jawv)
 
     mean_mlc = float(np.mean(mlc_acc)) if mlc_acc else None
     mean_jaw = float(np.mean(jaw_acc)) if jaw_acc else None
-    fs_data.append([
-        "Mean",
-        _ffmt(mean_mlc), _fdfmt(mean_mlc, ref_mlc),
-        _ffmt(mean_jaw), _fdfmt(mean_jaw, ref_jaw),
-    ])
+    fs_data.append(["Mean", _ffmt(mean_mlc), _fdfmt(mean_mlc, ref_mlc),
+                    _ffmt(mean_jaw), _fdfmt(mean_jaw, ref_jaw)])
 
-    fs_col_w = [1.35 * inch, 1.30 * inch, 1.00 * inch, 1.30 * inch, 1.00 * inch]
+    fs_col_w = [0.95*inch, 0.90*inch, 0.70*inch, 0.90*inch, 0.65*inch]   # 4.10 in total
     fs_tbl   = Table(fs_data, colWidths=fs_col_w)
     fs_cmds  = [
         ("BACKGROUND",    (0, 0),  (-1, 0),  _BLUE_DARK),
@@ -2483,10 +2810,10 @@ def generate_pdf_report(
         ("BACKGROUND",    (0, -1), (-1, -1), _STRIPE),
         ("FONTNAME",      (0, -1), (-1, -1), "Helvetica-Bold"),
         ("GRID",          (0, 0),  (-1, -1), 0.3, _BORDER),
-        ("TOPPADDING",    (0, 0),  (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0),  (-1, -1), 4),
-        ("LEFTPADDING",   (0, 0),  (-1, -1), 5),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, _BLUE_LIGHT]),
+        ("TOPPADDING",    (0, 0),  (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0),  (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0),  (-1, -1), 4),
+        ("ROWBACKGROUNDS",(0, 1),  (-1, -2), [colors.white, _BLUE_LIGHT]),
     ]
     angle_rows = list(GANTRY_ANGLES) + [None]
     for ri, ang in enumerate(angle_rows):
@@ -2498,32 +2825,17 @@ def generate_pdf_report(
                            (3, jawv, ref_jaw),  (4, jawv, ref_jaw)]:
             fs_cmds.append(("TEXTCOLOR", (ci, row_idx), (ci, row_idx), _fcc(v, ref)))
     fs_tbl.setStyle(TableStyle(fs_cmds))
-    story.append(fs_tbl)
-    story.append(Spacer(1, 0.10 * inch))
 
-    # MLC leaf span table (G000°)
-    story.append(Paragraph(
-        f"Individual MLC Leaf Spans  (G000° image  —  "
-        f"{MLC_LEAVES_PER_BANK} leaves × {MLC_LEAF_WIDTH_MM:.0f} mm SI pitch  —  "
-        "total span between opposing banks)",
-        ParagraphStyle("LeafHdr", parent=ss["Normal"], fontSize=9,
-                       textColor=_BLUE_DARK, spaceBefore=6, spaceAfter=3,
-                       fontName="Helvetica-Bold"),
-    ))
-    leaf_hdr_row = ["Leaf #", "SI Centre (mm)", "Span (mm)", f"Δ Span (ref {ref_leaf:.2f} mm)"]
+    # Leaf span table (G000°), 3.0 in wide
+    leaf_hdr_row = ["#", "SI (mm)", f"Span (mm)", f"Δ Span"]
     leaf_rows    = [leaf_hdr_row]
     leaves_g0    = image_results.get(0, {}).get("mlc_leaves", [])
     for leaf in leaves_g0:
         li   = leaf["leaf_idx"]
         si_c = (MLC_LEAVES_PER_BANK / 2 - li - 0.5) * MLC_LEAF_WIDTH_MM
         tot  = leaf.get("total_mm")
-        leaf_rows.append([
-            str(li + 1),
-            f"{si_c:+.1f}",
-            _ffmt(tot),
-            _fdfmt(tot, ref_leaf),
-        ])
-    leaf_col_w = [0.70 * inch, 1.15 * inch, 1.10 * inch, 1.10 * inch]
+        leaf_rows.append([str(li + 1), f"{si_c:+.0f}", _ffmt(tot), _fdfmt(tot, ref_leaf)])
+    leaf_col_w = [0.40*inch, 0.70*inch, 0.95*inch, 0.95*inch]   # 3.00 in total
     leaf_tbl   = Table(leaf_rows, colWidths=leaf_col_w)
     leaf_cmds  = [
         ("BACKGROUND",    (0, 0), (-1, 0),  _BLUE_DARK),
@@ -2532,114 +2844,121 @@ def generate_pdf_report(
         ("FONTSIZE",      (0, 0), (-1, -1), 9),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
         ("GRID",          (0, 0), (-1, -1), 0.3, _BORDER),
-        ("TOPPADDING",    (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _BLUE_LIGHT]),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, _BLUE_LIGHT]),
     ]
     for li, leaf in enumerate(leaves_g0):
-        tot = leaf.get("total_mm")
-        col = _fcc(tot, ref_leaf)
+        col = _fcc(leaf.get("total_mm"), ref_leaf)
         for ci in (2, 3):
             leaf_cmds.append(("TEXTCOLOR", (ci, li + 1), (ci, li + 1), col))
     leaf_tbl.setStyle(TableStyle(leaf_cmds))
-    story.append(leaf_tbl)
-    story.append(Spacer(1, 0.12 * inch))
 
-    # ── Diagnostic portal images ───────────────────────────────────────────────
+    _fs_angle_label = Paragraph(
+        f"<b>Per-Gantry Field Size</b>  (Y-Jaw = MLC  ·  X-Jaw = SI jaws)",
+        ParagraphStyle("FSAngHdr", parent=ss["Normal"], fontSize=9,
+                       fontName="Helvetica-Bold", textColor=_BLUE_DARK, spaceAfter=3),
+    )
+    _fs_leaf_label  = Paragraph(
+        f"<b>MLC Leaf Spans — G000°</b>  ({MLC_LEAVES_PER_BANK} leaves × {MLC_LEAF_WIDTH_MM:.0f} mm)",
+        ParagraphStyle("FSLeafHdr", parent=ss["Normal"], fontSize=9,
+                       fontName="Helvetica-Bold", textColor=_BLUE_DARK, spaceAfter=3),
+    )
+
+    _fs_inner_l = Table([[_fs_angle_label], [fs_tbl]], colWidths=[4.10 * inch])
+    _fs_inner_l.setStyle(_no_pad)
+    _fs_inner_r = Table([[_fs_leaf_label],  [leaf_tbl]], colWidths=[3.00 * inch])
+    _fs_inner_r.setStyle(_no_pad)
+
+    fs_side_tbl = Table(
+        [[_fs_inner_l, _fs_inner_r]],
+        colWidths=[4.10 * inch, 3.00 * inch],
+    )
+    fs_side_tbl.setStyle(TableStyle([
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING",   (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 0),
+    ]))
+    story.append(fs_side_tbl)
+    story.append(Spacer(1, 0.07 * inch))
+
+    # ── Field size methodology ────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=5))
+    story.append(Paragraph("Methodology Notes — Field Size", h2_style))
+    story.append(Paragraph(
+        "Field edges are located at the 50%-penumbra crossing of column-averaged (MLC / Y-jaw) "
+        "and row-averaged (X-jaw) pixel profiles.  "
+        "Profile averaging across the full image width/height (~1024 px) suppresses MV portal "
+        "noise by ≈32× and gives sub-pixel edge resolution via linear interpolation.  "
+        "Total field size = separation between opposing edges at isocenter (SAD/SID = 0.625).  "
+        f"Individual MLC leaf spans measured on G000° using {MLC_LEAVES_PER_BANK} leaf pairs "
+        f"× {MLC_LEAF_WIDTH_MM:.0f} mm SI pitch.  "
+        f"Action levels: warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm; "
+        f"call service |Δ| > {FIELD_SIZE_FAIL_MM:.1f} mm (institutional protocol).  "
+        "Results recorded to SQLite trend database.",
+        note_style,
+    ))
+
+    # ── Page 3: Portal images + signature ────────────────────────────────────
+    story.append(_PageBreak())
     if diag_fig_path and os.path.exists(diag_fig_path):
-        story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
         story.append(Paragraph("Portal Images — Field & Void Centre Detection", h2_style))
-        caption_style = ParagraphStyle(
-            "DiagCaption",
-            parent=ss["Normal"],
-            fontSize=8,
-            textColor=colors.HexColor("#555555"),
-            spaceAfter=4,
-        )
+        _cap_style = ParagraphStyle("DiagCaption", parent=ss["Normal"], fontSize=8,
+                                    textColor=colors.HexColor("#555555"), spaceAfter=4,
+                                    leading=11)
         story.append(Paragraph(
-            "Cyan dashed box = nominal 40×40 mm field boundary from detected field centre.  "
-            "Cyan dotted crosshair = field centre (BBox midpoint).  "
-            "Green lines = measured 50%-penumbra field edges (Y1/Y2 MLC vertical, X1/X2 jaw horizontal) "
-            "from geometric image centre (white ×).  "
-            "Coloured + and circle = detected void centre; circle = 6.4 mm air void diameter at isocenter.  "
-            "Yellow arrow = raw displacement vector (field centre → void centre).  "
+            "Panels 1–4 show each gantry angle.  "
+            "Cyan dotted crosshair = 50%-penumbra field centre (primary WL reference).  "
+            "Green lines = measured field edges (Y1/Y2 MLC, X1/X2 jaw).  "
+            "Coloured circle &amp; marker = detected MIMI void centre "
+            f"({VOID_DIAMETER_MM} mm diameter at isocenter).  "
+            "Yellow arrow = raw displacement (field centre → void centre).  "
             "White bar = 5 mm scale at isocenter.  "
-            "5th panel: displacement map — coloured dots = raw void positions, white circle = MEC walk circle.",
-            caption_style,
+            "Panel 5 (displacement map): coloured dots = raw void positions per angle; "
+            "red dashed ring = 1.0 mm tolerance; white circle = MEC walk circle; "
+            "blue cross = MEC centre.",
+            _cap_style,
         ))
-        # Scale image to full usable page width, preserving aspect ratio
         from PIL import Image as PILImage
-        with PILImage.open(diag_fig_path) as pil_img:
-            px_w, px_h = pil_img.size
-        usable_w = 7.1 * inch
-        aspect   = px_h / px_w
-        story.append(RLImage(diag_fig_path, width=usable_w, height=usable_w * aspect))
+        with PILImage.open(diag_fig_path) as _pil:
+            _px_w, _px_h = _pil.size
+        _usable_w = 7.1 * inch
+        story.append(RLImage(diag_fig_path, width=_usable_w,
+                             height=_usable_w * (_px_h / _px_w)))
         story.append(Spacer(1, 0.10 * inch))
 
-    # ── Methodology notes ─────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
-    story.append(Paragraph("Methodology Notes", h2_style))
-    story.append(Paragraph(
-        "<b>Void Detection (Inverted Logic):</b>  The MIMI phantom isocenter target is a "
-        f"{VOID_DIAMETER_MM} mm diameter air void embedded in acetal copolymer (ρ ≈ 1.41 g/cm³). "
-        "At MV energies air attenuates less than acetal, so the void receives more dose and appears "
-        "as the LOCAL MINIMUM pixel value in the field on Elekta iViewGT RTIMAGEs "
-        "(inverted storage convention: LOW value = HIGH dose). "
-        "Detection: Gaussian pre-filter (σ ≈ void_radius × 0.30 px); global minimum in the "
-        f"{FIELD_SIZE_MM * VOID_SEARCH_HALF_FIELD_FRACTION:.0f} mm search window; "
-        "inverse-intensity-squared centroid for sub-pixel localisation. "
-        "Portal images are windowed to field-interior pixels only to make the ~7% void contrast visible.",
-        note_style,
-    ))
-    story.append(Spacer(1, 0.05 * inch))
-    story.append(Paragraph(
-        "<b>Walk Circle (Minimum Enclosing Circle):</b>  "
-        "Elekta iViewGT portal images are stored with a consistent patient coordinate orientation "
-        "at all gantry angles (no image flip at opposing angles). "
-        "The portal-plane axes map to patient space as: "
-        "G0°/G180° portal-X = patient Lateral (L/R);  "
-        "G90°/G270° portal-X = patient AP (A/P);  "
-        "all angles portal-Y = patient SI (S/I).  "
-        "The residual CBCT setup error in 3D patient coordinates is therefore: "
-        "Lateral = (ΔX_G0 + ΔX_G180)/2,  "
-        "SI = mean(ΔY_G0, ΔY_G90, ΔY_G180, ΔY_G270),  "
-        "AP = (ΔX_G90 + ΔX_G270)/2.  "
-        "Subtracting the angle-appropriate component from each raw displacement yields "
-        "the per-angle isocenter walk residuals.  "
-        "The Minimum Enclosing Circle radius of the four corrected walk vectors is the walk circle metric.",
-        note_style,
-    ))
-    story.append(Spacer(1, 0.05 * inch))
-    story.append(Paragraph(
-        f"<b>Tolerance:</b>  Walk circle radius ≤ {TOLERANCE_MM:.1f} mm = PASS.  "
-        "Pixel spacing corrected from detector plane to isocenter using "
-        "SAD/SID magnification (spacing_iso = spacing_det × SAD/SID).",
-        note_style,
-    ))
-
     # ── Electronic Signature ──────────────────────────────────────────────────
-    story.append(Spacer(1, 0.18 * inch))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=8))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=6))
     story.append(Paragraph("Electronic Signature", h2_style))
 
-    sig_time = datetime.datetime.now()
     sig_rows = [
-        ["Machine:", machine_name,    "Report Date:", today_str],
-        ["Physicist:", physicist_name, "Signed:",
-         f"{sig_time.strftime('%Y-%m-%d  %H:%M')}"],
-        ["Result:", ("PASS" if passed else "FAIL") +
-         f"   —   Walk Circle Radius = {max_walk:.3f} mm",
+        ["Machine:", machine_name,    "Study Date:", today_str],
+        ["Physicist:", physicist_name, "Study Time:",
+         f"{time_str}"],
+        ["WL Result:", ("PASS" if passed else "FAIL") +
+         f"   —   Walk Circle = {max_walk:.3f} mm",
          "Phantom:", PHANTOM_NAME],
+        ["Field Result:", _fs_text, "", ""],
     ]
     sig_tbl = Table(sig_rows, colWidths=[1.0*inch, 2.7*inch, 1.1*inch, 2.3*inch])
-    sig_bg   = _GREEN_LITE if passed else _RED_LITE
+    sig_bg    = _GREEN_LITE if passed else _RED_LITE
+    _fs_sig_bg = (_GREEN_LITE if _fs_worst == 0 else
+                  colors.HexColor("#fff8e1") if _fs_worst == 1 else _RED_LITE)
+    _fs_sig_color = (_GREEN if _fs_worst == 0 else
+                     colors.HexColor("#f57f17") if _fs_worst == 1 else _RED)
     sig_tbl.setStyle(TableStyle([
         ("FONTSIZE",      (0, 0), (-1, -1), 9),
         ("FONTNAME",      (0, 0), (0, -1),  "Helvetica-Bold"),
-        ("FONTNAME",      (2, 0), (2, -1),  "Helvetica-Bold"),
+        ("FONTNAME",      (2, 0), (2, -2),  "Helvetica-Bold"),
         ("FONTNAME",      (1, 2), (1, 2),   "Helvetica-Bold"),
         ("TEXTCOLOR",     (1, 2), (1, 2),   _GREEN if passed else _RED),
         ("BACKGROUND",    (0, 2), (-1, 2),  sig_bg),
+        ("SPAN",          (1, 3), (3, 3)),                       # field result spans cols 1-3
+        ("FONTNAME",      (1, 3), (1, 3),   "Helvetica-Bold"),
+        ("TEXTCOLOR",     (1, 3), (1, 3),   _fs_sig_color),
+        ("BACKGROUND",    (0, 3), (-1, 3),  _fs_sig_bg),
         ("ROWBACKGROUNDS",(0, 0), (-1, 1),  [colors.white, _STRIPE]),
         ("GRID",          (0, 0), (-1, -1), 0.4, _BORDER),
         ("TOPPADDING",    (0, 0), (-1, -1), 5),
@@ -2651,7 +2970,7 @@ def generate_pdf_report(
     story.append(Paragraph(
         "This report was generated electronically by the Winston-Lutz QA Tool.  "
         f"The physicist named above ({physicist_name}) reviewed and approved the results "
-        f"by initiating report generation on {sig_time.strftime('%B %d, %Y at %H:%M')}.  "
+        f"for the study performed on {study_dt.strftime('%B %d, %Y at %H:%M:%S')}.  "
         "This electronic signature is consistent with 21 CFR Part 11 intent for "
         "medical physics QA documentation.",
         ParagraphStyle("SigNote", parent=ss["Normal"], fontSize=8,
@@ -2663,12 +2982,32 @@ def generate_pdf_report(
     story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=4))
     story.append(Paragraph(
         f"Winston-Lutz QA Tool v1.0  —  "
-        f"Generated {sig_time.strftime('%Y-%m-%d %H:%M')}  —  "
+        f"Study Date {study_dt.strftime('%Y-%m-%d %H:%M:%S')}  —  "
         f"{machine_name}  /  {PHANTOM_NAME}",
         footer_style,
     ))
 
-    doc.build(story)
+    # Set PDF internal creation/modification dates to study date (not generation time).
+    # In reportlab 4.x, PDFInfo.format() reads document._timeStamp; replace it with
+    # a fake TimeStamp whose YMDhms/dhh/dmm match the DICOM study datetime.
+    import time as _time
+    _study_lt  = _time.localtime(study_dt.timestamp())
+    _study_gmoff = getattr(_study_lt, "tm_gmtoff", 0)
+
+    class _StudyTS:
+        YMDhms = tuple(_study_lt)[:6]
+        dhh    = int(_study_gmoff / 3600)
+        dmm    = (_study_gmoff % 3600) // 60
+
+    def _set_pdf_dates(canvas, _doc):
+        canvas._doc._timeStamp = _StudyTS()
+
+    doc.build(story, onFirstPage=_set_pdf_dates, onLaterPages=_set_pdf_dates)
+
+    # Set filesystem mtime/atime to study date so file manager also shows study date
+    _study_ts = study_dt.timestamp()
+    os.utime(output_path, (_study_ts, _study_ts))
+
     print(f"PDF report written to: {output_path}")
 
 
