@@ -202,6 +202,9 @@ def load_dicom_images(directory: str) -> dict:
     for f in dcm_files:
         try:
             ds = pydicom.dcmread(str(f), stop_before_pixels=False, force=True)
+            if identify_pf_dicom(ds):
+                skipped.append(f"{f.name} (PF image — excluded from WL analysis)")
+                continue
             gantry = float(getattr(ds, "GantryAngle", -999))
             if gantry < 0:
                 skipped.append(f.name)
@@ -1284,10 +1287,14 @@ def generate_pf_figure(pf_results: dict) -> str | None:
         row_lo = max(0, r0 - pad_r);  row_hi = min(inv.shape[0], r1 + pad_r)
         col_lo = max(0, c0 - pad_c);  col_hi = min(inv.shape[1], c1 + pad_c)
 
-        # Use inverted (dose = bright) array so background is dark, no blowout
-        crop_inv   = inv[row_lo:row_hi, col_lo:col_hi]
-        field_inv  = inv[r0:r1+1, c0:c1+1]
-        vlo, vhi   = float(np.percentile(field_inv, 2)), float(np.percentile(field_inv, 98))
+        # Use inverted (dose = bright) array so background is dark, no blowout.
+        # Window from the central 90% of field rows to exclude end-of-picket
+        # penumbra / hot-spot artefacts that would otherwise clip the display.
+        crop_inv  = inv[row_lo:row_hi, col_lo:col_hi]
+        trim_r    = max(1, (r1 - r0) // 20)
+        core_inv  = inv[r0 + trim_r : r1 - trim_r + 1, c0 : c1 + 1]
+        vlo = float(np.percentile(core_inv, 5))
+        vhi = float(np.percentile(core_inv, 95))
 
         ax_img.imshow(crop_inv, cmap="gray", vmin=vlo, vmax=vhi,
                       aspect="equal", origin="upper")
