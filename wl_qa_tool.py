@@ -143,6 +143,11 @@ PHYSICISTS = [
     "Logen Hall, MS, DABR",
 ]
 
+# ── Picket Fence constants ─────────────────────────────────────────────────────
+PF_TOLERANCE_MM  = 1.5   # Per-leaf centre deviation PASS/FAIL threshold (mm)
+PF_LEAF_WIDTH_MM = 5.0   # Agility inner MLC leaf width at isocenter (mm)
+PF_LEAVES_TOTAL  = 80    # Central leaves tested: 40 per bank
+
 DB_PATH     = Path(__file__).parent / "wl_qa_history.db"
 CONFIG_PATH = Path(__file__).parent / "wl_qa_config.json"
 
@@ -1103,6 +1108,280 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
     return tmp.name
 
 
+# ── Picket Fence ─────────────────────────────────────────────────────────────
+
+def identify_pf_dicom(ds) -> bool:
+    """Return True if this DICOM is a picket fence portal image."""
+    label = str(getattr(ds, "RTImageLabel",       "") or "").upper()
+    desc  = str(getattr(ds, "SeriesDescription",  "") or "").upper()
+    return "PF" in label or "PICKET" in label or "PF" in desc.split()
+
+
+def _find_pf_edge(profile: np.ndarray, threshold: float, rising: bool):
+    """Sub-pixel edge position where profile crosses threshold."""
+    if rising:
+        for i in range(1, len(profile)):
+            if profile[i] >= threshold > profile[i - 1]:
+                span = profile[i] - profile[i - 1]
+                return i - 1 + (threshold - profile[i - 1]) / span if span else float(i)
+    else:
+        for i in range(len(profile) - 2, -1, -1):
+            if profile[i] >= threshold > profile[i + 1]:
+                span = profile[i] - profile[i + 1]
+                return i + 1 - (threshold - profile[i + 1]) / span if span else float(i)
+    return None
+
+
+def analyze_picket_fence(ds) -> dict:
+    """
+    Analyse a single-picket EPID portal image (1 cm gap, 20 cm length,
+    central 80 leaves = 40 per bank at 5 mm each).
+
+    Returns a dict with per-leaf deviations and summary statistics.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    arr, spacing_iso = get_pixel_array(ds)   # arr in raw counts; spacing in mm/px at iso
+    rows, cols = arr.shape
+
+    # Invert: low pixel = high dose → normalised so high dose = 1.0
+    arr_f  = arr.astype(np.float32)
+    inv    = (arr_f.max() - arr_f) / max(arr_f.max() - arr_f.min(), 1.0)
+    smooth = gaussian_filter(inv, sigma=1.5)
+
+    # Detect field bounding box.
+    # The picket is narrow (≈1 cm / ~40 px out of 1024) so the row-direction
+    # profile must be taken over the column band only, not the full image width.
+    threshold_detect = 0.12
+    col_prof = smooth.mean(axis=0)          # average along rows → column profile
+    c_mask   = col_prof > threshold_detect
+    if not c_mask.any():
+        raise ValueError("Picket Fence: cannot detect field columns in DICOM image.")
+    c_where = np.where(c_mask)[0]
+    c0, c1  = int(c_where[0]), int(c_where[-1])
+
+    # Row profile: take the max within the detected column band so the narrow
+    # picket isn't diluted by background pixels in the rest of the image.
+    row_prof = smooth[:, c0:c1 + 1].max(axis=1)
+    r_mask   = row_prof > threshold_detect
+    if not r_mask.any():
+        raise ValueError("Picket Fence: cannot detect field rows in DICOM image.")
+    r_where = np.where(r_mask)[0]
+    r0, r1  = int(r_where[0]), int(r_where[-1])
+
+    field_px_rows = r1 - r0
+    leaf_px       = PF_LEAF_WIDTH_MM / spacing_iso        # px per leaf
+    n_leaves      = max(1, round(field_px_rows / leaf_px))
+
+    # Expanded column window for edge detection (include penumbra on each side)
+    pad_col = max(8, int(8.0 / spacing_iso))
+    col_lo  = max(0, c0 - pad_col)
+    col_hi  = min(cols - 1, c1 + pad_col)
+
+    centers, left_edges, right_edges, leaf_y_mm = [], [], [], []
+    field_centre_row = (r0 + r1) / 2.0
+
+    for i in range(n_leaves):
+        rl = r0 + int(round(i       * field_px_rows / n_leaves))
+        rr = r0 + int(round((i + 1) * field_px_rows / n_leaves))
+        rr = min(rr, rows)
+        if rr <= rl:
+            continue
+
+        profile = smooth[rl:rr, col_lo:col_hi].mean(axis=0)
+        peak = float(profile.max())
+        if peak < 0.08:
+            continue
+
+        half = peak * 0.50
+        le   = _find_pf_edge(profile, half, rising=True)
+        re   = _find_pf_edge(profile, half, rising=False)
+        if le is None or re is None:
+            continue
+
+        centers.append(col_lo + (le + re) / 2.0)
+        left_edges.append(col_lo + le)
+        right_edges.append(col_lo + re)
+        leaf_y_mm.append(((rl + rr) / 2.0 - field_centre_row) * spacing_iso)
+
+    if not centers:
+        raise ValueError("Picket Fence: no leaf edges could be detected.")
+
+    centers      = np.array(centers,      dtype=np.float64)
+    left_edges   = np.array(left_edges,   dtype=np.float64)
+    right_edges  = np.array(right_edges,  dtype=np.float64)
+    leaf_y_mm    = np.array(leaf_y_mm,    dtype=np.float64)
+
+    nominal_col      = float(centers.mean())
+    deviations_mm    = (centers - nominal_col) * spacing_iso
+    widths_mm        = (right_edges - left_edges) * spacing_iso
+    max_dev          = float(np.abs(deviations_mm).max())
+
+    # Study date/time from DICOM
+    pf_date, pf_time = None, None
+    for dtag, ttag in (("StudyDate", "StudyTime"), ("ContentDate", "ContentTime")):
+        raw_d = getattr(ds, dtag, None)
+        if raw_d and len(str(raw_d)) == 8:
+            try:
+                pf_date = datetime.datetime.strptime(str(raw_d), "%Y%m%d").date()
+                raw_t   = getattr(ds, ttag, None)
+                if raw_t:
+                    ts = str(raw_t).split(".")[0].zfill(6)
+                    if len(ts) >= 6:
+                        pf_time = datetime.time(int(ts[0:2]), int(ts[2:4]), int(ts[4:6]))
+            except (ValueError, TypeError):
+                pass
+            if pf_date:
+                break
+
+    return {
+        "leaf_y_mm":          leaf_y_mm,
+        "leaf_deviations_mm": deviations_mm,
+        "leaf_widths_mm":     widths_mm,
+        "nominal_col":        nominal_col,
+        "max_deviation_mm":   max_dev,
+        "rms_deviation_mm":   float(np.sqrt(np.mean(deviations_mm ** 2))),
+        "n_leaves":           len(centers),
+        "pass_fail":          max_dev <= PF_TOLERANCE_MM,
+        "spacing_iso_mm":     float(spacing_iso),
+        "field_bounds":       (r0, r1, c0, c1),
+        "_image_array":       arr_f,
+        "study_date":         pf_date,
+        "study_time":         pf_time,
+    }
+
+
+def generate_pf_figure(pf_results: dict) -> str | None:
+    """Two-panel diagnostic figure: portal image (left) + leaf deviation chart (right)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+
+        arr         = pf_results["_image_array"]
+        r0, r1, c0, c1 = pf_results["field_bounds"]
+        sp          = pf_results["spacing_iso_mm"]
+        n_leaves    = pf_results["n_leaves"]
+        deviations  = pf_results["leaf_deviations_mm"]
+        leaf_y      = pf_results["leaf_y_mm"]
+        nominal_col = pf_results["nominal_col"]
+        max_dev     = pf_results["max_deviation_mm"]
+        rms_dev     = pf_results["rms_deviation_mm"]
+        passed      = pf_results["pass_fail"]
+
+        fig, (ax_img, ax_dev) = plt.subplots(
+            1, 2, figsize=(13, 9),
+            gridspec_kw={"width_ratios": [1, 2.5]},
+        )
+        fig.patch.set_facecolor("#1e1e1e")
+
+        # ── Portal image panel ────────────────────────────────────────────────
+        pad_r = max(10, int(15 / sp))
+        pad_c = max(20, int(30 / sp))
+        row_lo = max(0, r0 - pad_r);  row_hi = min(arr.shape[0], r1 + pad_r)
+        col_lo = max(0, c0 - pad_c);  col_hi = min(arr.shape[1], c1 + pad_c)
+        crop   = arr[row_lo:row_hi, col_lo:col_hi]
+
+        field_px = arr[r0:r1+1, c0:c1+1]
+        vlo, vhi = np.percentile(field_px, [2, 98])
+
+        ax_img.imshow(crop, cmap="gray", vmin=vlo, vmax=vhi,
+                      aspect="equal", origin="upper")
+        ax_img.set_facecolor("#1e1e1e")
+        ax_img.set_axis_off()
+
+        field_rows = r1 - r0
+        nom_crop_col = nominal_col - col_lo
+
+        # Leaf grid lines
+        for i in range(n_leaves + 1):
+            row_crop = r0 + i * (field_rows / n_leaves) - row_lo
+            ax_img.axhline(row_crop, color="#80cbc4", alpha=0.30,
+                           linewidth=0.5, zorder=2)
+
+        # Nominal centre line
+        ax_img.axvline(nom_crop_col, color="yellow", linewidth=1.0,
+                       alpha=0.65, linestyle="--", zorder=3)
+
+        # Per-leaf deviation dots
+        for i, (_, dev) in enumerate(zip(leaf_y, deviations)):
+            row_crop = r0 + i * (field_rows / n_leaves) + \
+                       (field_rows / n_leaves) / 2 - row_lo
+            col_crop = nom_crop_col + dev / sp
+            c = "#4caf50" if abs(dev) < PF_TOLERANCE_MM * 0.67 else \
+                "#ff9800" if abs(dev) <= PF_TOLERANCE_MM else "#f44336"
+            ax_img.plot(col_crop, row_crop, "o", color=c,
+                        markersize=3.5, markeredgecolor="#111111",
+                        markeredgewidth=0.4, zorder=5)
+
+        ax_img.set_title("Portal Image", color="white", fontsize=11, pad=4)
+
+        # ── Deviation chart ───────────────────────────────────────────────────
+        ax_dev.set_facecolor("#252525")
+        for sp_edge in ax_dev.spines.values():
+            sp_edge.set_color("#555555")
+
+        for y, dev in zip(leaf_y, deviations):
+            c = "#4caf50" if abs(dev) < PF_TOLERANCE_MM * 0.67 else \
+                "#ff9800" if abs(dev) <= PF_TOLERANCE_MM else "#f44336"
+            ax_dev.barh(y, dev, height=PF_LEAF_WIDTH_MM * 0.80,
+                        color=c, edgecolor="#1e1e1e", linewidth=0.4, zorder=3)
+
+        ax_dev.axvline(0,                  color="white",   linewidth=1.0,
+                       alpha=0.55, zorder=4)
+        ax_dev.axvline(+PF_TOLERANCE_MM,   color="#ef5350", linewidth=1.4,
+                       linestyle="--", zorder=4,
+                       label=f"±{PF_TOLERANCE_MM:.1f} mm tolerance")
+        ax_dev.axvline(-PF_TOLERANCE_MM,   color="#ef5350", linewidth=1.4,
+                       linestyle="--", zorder=4)
+
+        ax_dev.set_xlabel("Deviation from Nominal Centre (mm)",
+                          color="white", fontsize=10)
+        ax_dev.set_ylabel("Leaf Position  —  SI direction (mm)",
+                          color="white", fontsize=10)
+        ax_dev.set_title("Per-Leaf Centre Deviation",
+                         color="white", fontsize=11, pad=4)
+        ax_dev.tick_params(colors="white", labelsize=9)
+        ax_dev.invert_yaxis()   # superior (negative Y) at top
+
+        result_col = "#4caf50" if passed else "#ef5350"
+        ax_dev.text(
+            0.98, 0.02,
+            f"Max |Δ| = {max_dev:.2f} mm\n"
+            f"RMS   = {rms_dev:.2f} mm\n"
+            f"Leaves = {n_leaves}\n"
+            f"{'PASS ✓' if passed else 'FAIL ✗'}",
+            transform=ax_dev.transAxes, ha="right", va="bottom",
+            color=result_col, fontsize=10, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#1e1e1e",
+                      edgecolor="#555555", alpha=0.85),
+        )
+        ax_dev.legend(loc="upper right", framealpha=0.3,
+                      labelcolor="white", fontsize=9,
+                      facecolor="#1e1e1e", edgecolor="#555555")
+
+        xlim = max(PF_TOLERANCE_MM * 1.5, max_dev * 1.25, 0.5)
+        ax_dev.set_xlim(-xlim, xlim)
+
+        pf_title_col = "#66bb6a" if passed else "#ef5350"
+        fig.suptitle(
+            f"Picket Fence — MLC Leaf Position Accuracy   "
+            f"{'PASS ✓' if passed else 'FAIL ✗'}",
+            color=pf_title_col, fontsize=13, fontweight="bold", y=0.995,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+        tmp = tempfile.NamedTemporaryFile(suffix="_pf.png", delete=False)
+        fig.savefig(tmp.name, dpi=130, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return tmp.name
+    except Exception as exc:
+        print(f"PF figure error: {exc}")
+        return None
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 def _apply_dark_theme(app: QApplication) -> None:
@@ -1189,6 +1468,8 @@ class WLApp(QMainWindow):
         self._walk_fig_path = None
         self._dicom_date    = None
         self._dicom_time    = None
+        self._pf_results    = None   # picket fence results (None if not performed today)
+        self._pf_fig_path   = None
         self._table_labels: dict  = {}
         self._res_ref_labels: dict = {}
 
@@ -1225,6 +1506,11 @@ class WLApp(QMainWindow):
         self._load_btn.setMinimumWidth(210)
         self._load_btn.clicked.connect(self._load_directory)
         top_layout.addWidget(self._load_btn)
+
+        self._pf_load_btn = QPushButton("Load Picket Fence")
+        self._pf_load_btn.setMinimumWidth(170)
+        self._pf_load_btn.clicked.connect(self._load_pf_directory)
+        top_layout.addWidget(self._pf_load_btn)
 
         main_layout.addWidget(top_bar)
 
@@ -1290,6 +1576,21 @@ class WLApp(QMainWindow):
         )
         pf_inner_fs.addWidget(self._pf_label_fs)
         pf_hbox.addWidget(self._pf_frame_fs, stretch=1)
+
+        self._pf_frame_picket = QFrame()
+        self._pf_frame_picket.setStyleSheet(
+            "QFrame { background-color: #2b2b2b; border-radius: 10px; }"
+        )
+        pf_inner_picket = QHBoxLayout(self._pf_frame_picket)
+        pf_inner_picket.setContentsMargins(0, 0, 0, 0)
+        self._pf_label_picket = QLabel("—  PF AWAITING DATA  —")
+        self._pf_label_picket.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pf_label_picket.setStyleSheet(
+            "font-size: 25px; font-weight: bold; color: gray; background: transparent;"
+        )
+        pf_inner_picket.addWidget(self._pf_label_picket)
+        pf_hbox.addWidget(self._pf_frame_picket, stretch=1)
+        self._pf_frame_picket.setVisible(False)   # shown only when PF data loaded
 
         main_layout.addWidget(pf_container)
 
@@ -1438,6 +1739,7 @@ class WLApp(QMainWindow):
 
         # Field Size QA tab ───────────────────────────────────────────────────
         self._build_field_size_tab()
+        self._build_pf_tab()
 
         # Portal Images tab ───────────────────────────────────────────────────
         tab_img = QWidget()
@@ -1660,6 +1962,63 @@ class WLApp(QMainWindow):
                 item.setForeground(QBrush(QColor(col)))
                 self._fs_leaf_table.setItem(ri, ci, item)
         fs_layout.addWidget(self._fs_leaf_table, stretch=1)
+
+    def _build_pf_tab(self):
+        """Build the Picket Fence tab (shown always; content appears after PF load)."""
+        tab_pf = QWidget()
+        pf_layout = QVBoxLayout(tab_pf)
+        pf_layout.setContentsMargins(6, 6, 6, 6)
+        pf_layout.setSpacing(6)
+        self._tabview.addTab(tab_pf, "Picket Fence")
+
+        # Stats card
+        self._pf_stats_card = QFrame()
+        self._pf_stats_card.setStyleSheet(
+            "QFrame { background-color: #363636; border-radius: 8px; }"
+        )
+        stats_layout = QHBoxLayout(self._pf_stats_card)
+        stats_layout.setContentsMargins(16, 8, 16, 8)
+        stats_layout.setSpacing(30)
+
+        for key, label_text in [
+            ("_pf_stat_leaves",  "Leaves"),
+            ("_pf_stat_max",     "Max |Δ| (mm)"),
+            ("_pf_stat_rms",     "RMS (mm)"),
+            ("_pf_stat_width",   "Avg Width (mm)"),
+        ]:
+            col = QWidget()
+            col.setStyleSheet("background: transparent;")
+            col_v = QVBoxLayout(col)
+            col_v.setContentsMargins(0, 0, 0, 0)
+            col_v.setSpacing(2)
+            name_lbl = QLabel(label_text)
+            name_lbl.setStyleSheet("color:#aaaaaa; font-size:12px; background:transparent;")
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val_lbl = QLabel("—")
+            val_lbl.setStyleSheet("color:#dcdcdc; font-size:17px; font-weight:bold; "
+                                  "font-family:monospace; background:transparent;")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col_v.addWidget(name_lbl)
+            col_v.addWidget(val_lbl)
+            stats_layout.addWidget(col)
+            setattr(self, key, val_lbl)
+
+        stats_layout.addStretch()
+        self._pf_stats_card.setVisible(False)
+        pf_layout.addWidget(self._pf_stats_card)
+
+        # Placeholder / figure area
+        self._pf_img_label = QLabel(
+            "Load a Picket Fence DICOM directory or file to view results.\n"
+            "PF images in the same WL directory are detected automatically."
+        )
+        self._pf_img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pf_img_label.setStyleSheet("font-size: 14px; color: #888888;")
+
+        pf_scroll = QScrollArea()
+        pf_scroll.setWidgetResizable(True)
+        pf_scroll.setWidget(self._pf_img_label)
+        pf_layout.addWidget(pf_scroll, stretch=1)
 
     def _get_field_refs(self, machine_name: str) -> dict:
         """Return per-machine field size reference values.
@@ -2056,7 +2415,23 @@ class WLApp(QMainWindow):
             self._diag_fig_path = generate_diagnostic_figure(image_results, wl_results)
             self._walk_fig_path = generate_walk_circle_figure(wl_results)
 
+            # Auto-detect picket fence image in the same directory
+            self._pf_results  = None
+            self._pf_fig_path = None
+            for _pf_path in sorted(Path(directory).iterdir()):
+                if not _pf_path.is_file():
+                    continue
+                try:
+                    _ds_pf = pydicom.dcmread(str(_pf_path), force=True)
+                    if identify_pf_dicom(_ds_pf):
+                        self._pf_results  = analyze_picket_fence(_ds_pf)
+                        self._pf_fig_path = generate_pf_figure(self._pf_results)
+                        break
+                except Exception:
+                    pass
+
             self._refresh_display()
+            self._refresh_pf_display()
             self._report_btn.setEnabled(True)
 
         except Exception as exc:
@@ -2065,6 +2440,123 @@ class WLApp(QMainWindow):
             self._pf_label.setStyleSheet(
                 "font-size: 25px; font-weight: bold; color: #f44336; background: transparent;"
             )
+
+    def _load_pf_directory(self):
+        """Load a picket fence DICOM from a directory or single file."""
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Picket Fence DICOM Directory",
+            self._config.get("last_dicom_dir", str(Path.home())),
+        )
+        if not path:
+            return
+        try:
+            found = False
+            for candidate in sorted(Path(path).iterdir()):
+                if not candidate.is_file():
+                    continue
+                try:
+                    ds_pf = pydicom.dcmread(str(candidate), force=True)
+                    if identify_pf_dicom(ds_pf):
+                        self._pf_results  = analyze_picket_fence(ds_pf)
+                        self._pf_fig_path = generate_pf_figure(self._pf_results)
+                        found = True
+                        break
+                except Exception:
+                    pass
+            if not found:
+                # Try loading every file as a PF image regardless of label
+                for candidate in sorted(Path(path).iterdir()):
+                    if not candidate.is_file():
+                        continue
+                    try:
+                        ds_pf = pydicom.dcmread(str(candidate), force=True)
+                        if getattr(ds_pf, "Modality", "") == "RTIMAGE":
+                            self._pf_results  = analyze_picket_fence(ds_pf)
+                            self._pf_fig_path = generate_pf_figure(self._pf_results)
+                            found = True
+                            break
+                    except Exception:
+                        pass
+            if not found:
+                QMessageBox.warning(self, "Picket Fence",
+                                    "No RTIMAGE DICOM found in that directory.")
+                return
+            self._refresh_pf_display()
+        except Exception as exc:
+            QMessageBox.critical(self, "Picket Fence Error", str(exc))
+
+    def _refresh_pf_display(self):
+        """Update PF banner, stats card, and figure tab from self._pf_results."""
+        if self._pf_results is None:
+            self._pf_frame_picket.setVisible(False)
+            self._pf_stats_card.setVisible(False)
+            self._pf_img_label.setText(
+                "Load a Picket Fence DICOM directory or file to view results.\n"
+                "PF images in the same WL directory are detected automatically."
+            )
+            self._pf_img_label.setPixmap(QPixmap())
+            return
+
+        pf    = self._pf_results
+        ok    = pf["pass_fail"]
+        maxd  = pf["max_deviation_mm"]
+        rms   = pf["rms_deviation_mm"]
+        n     = pf["n_leaves"]
+        avg_w = float(np.mean(pf["leaf_widths_mm"])) if len(pf["leaf_widths_mm"]) else 0.0
+
+        # Banner
+        self._pf_frame_picket.setVisible(True)
+        if ok:
+            self._pf_frame_picket.setStyleSheet(
+                "QFrame { background-color: #1a3d1e; border-radius: 10px; }"
+            )
+            self._pf_label_picket.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #66bb6a; background: transparent;"
+            )
+            self._pf_label_picket.setText(
+                f"✓  PF PASS  —  Max |Δ| = {maxd:.2f} mm  (Tol ≤ {PF_TOLERANCE_MM:.1f} mm)"
+            )
+        else:
+            self._pf_frame_picket.setStyleSheet(
+                "QFrame { background-color: #3d1a1a; border-radius: 10px; }"
+            )
+            self._pf_label_picket.setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #ef5350; background: transparent;"
+            )
+            self._pf_label_picket.setText(
+                f"✗  PF FAIL  —  Max |Δ| = {maxd:.2f} mm  (Tol ≤ {PF_TOLERANCE_MM:.1f} mm)"
+            )
+
+        # Stats card
+        self._pf_stats_card.setVisible(True)
+        self._pf_stat_leaves.setText(str(n))
+        col_max = "#4caf50" if maxd <= PF_TOLERANCE_MM else "#ef5350"
+        self._pf_stat_max.setText(f"{maxd:.3f}")
+        self._pf_stat_max.setStyleSheet(
+            f"color:{col_max}; font-size:17px; font-weight:bold; "
+            "font-family:monospace; background:transparent;"
+        )
+        self._pf_stat_rms.setText(f"{rms:.3f}")
+        self._pf_stat_width.setText(f"{avg_w:.2f}")
+
+        # Figure
+        if self._pf_fig_path:
+            try:
+                import io
+                from PIL import Image as PILImage
+                pil_img = PILImage.open(self._pf_fig_path)
+                avail_w = max(900, self.width() - 60)
+                scale_h = int(pil_img.height * avail_w / pil_img.width)
+                pil_img = pil_img.resize((avail_w, scale_h), PILImage.LANCZOS)
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                pixmap = QPixmap()
+                pixmap.loadFromData(buf.getvalue())
+                self._pf_img_label.setPixmap(pixmap)
+                self._pf_img_label.adjustSize()
+            except Exception as exc:
+                self._pf_img_label.setText(f"Figure error: {exc}")
 
     def _refresh_display(self):
         if self._wl_results is None:
@@ -2208,6 +2700,8 @@ class WLApp(QMainWindow):
                 physicist_name=physicist,
                 dicom_date=self._dicom_date,
                 dicom_time=self._dicom_time,
+                pf_results=self._pf_results,
+                pf_fig_path=self._pf_fig_path,
             )
             _save_to_db(self._wl_results, self._image_results, machine, physicist)
             QMessageBox.information(self, "Report Saved", f"Report saved to:\n{save_path}")
@@ -2459,6 +2953,8 @@ def generate_pdf_report(
     physicist_name: str = "",
     dicom_date: "datetime.date | None" = None,
     dicom_time: "datetime.time | None" = None,
+    pf_results: dict | None = None,
+    pf_fig_path: str | None = None,
 ):
     doc = SimpleDocTemplate(
         output_path,
@@ -2901,7 +3397,90 @@ def generate_pdf_report(
         note_style,
     ))
 
-    # ── Page 3: Portal images + signature ────────────────────────────────────
+    # ── Page 3 (optional): Picket Fence ──────────────────────────────────────
+    if pf_results is not None:
+        story.append(_PageBreak())
+        pf_ok   = pf_results["pass_fail"]
+        pf_maxd = pf_results["max_deviation_mm"]
+        pf_rms  = pf_results["rms_deviation_mm"]
+        pf_n    = pf_results["n_leaves"]
+        pf_avgw = float(np.mean(pf_results["leaf_widths_mm"])) \
+                  if len(pf_results["leaf_widths_mm"]) else 0.0
+        pf_col  = "#1a3d1e" if pf_ok else "#3d1a1a"
+        pf_tcol = colors.HexColor("#66bb6a" if pf_ok else "#ef5350")
+
+        story.append(Paragraph("Picket Fence QA — MLC Leaf Position Accuracy", h2_style))
+        story.append(Spacer(1, 0.06 * inch))
+
+        # PF PASS/FAIL banner
+        pf_banner_tbl = Table(
+            [[Paragraph(
+                f"{'PASS ✓' if pf_ok else 'FAIL ✗'}  —  "
+                f"Max |Δ| = {pf_maxd:.2f} mm   "
+                f"(Tolerance ≤ {PF_TOLERANCE_MM:.1f} mm)",
+                ParagraphStyle("PFBanner", parent=ss["Normal"],
+                               fontSize=17, fontName="Helvetica-Bold",
+                               textColor=pf_tcol, alignment=TA_CENTER),
+            )]],
+            colWidths=[7.10 * inch],
+        )
+        pf_banner_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor(pf_col)),
+            ("ROUNDEDCORNERS", [8]),
+            ("TOPPADDING",    (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        story.append(pf_banner_tbl)
+        story.append(Spacer(1, 0.10 * inch))
+
+        # Summary stats table
+        pf_stats_data = [
+            ["Leaves analysed", "Max |Δ| (mm)", "RMS (mm)", "Avg Width (mm)"],
+            [str(pf_n), f"{pf_maxd:.3f}", f"{pf_rms:.3f}", f"{pf_avgw:.2f}"],
+        ]
+        pf_stats_tbl = Table(pf_stats_data, colWidths=[1.77 * inch] * 4)
+        pf_stats_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0),  colors.HexColor("#2e3a4a")),
+            ("BACKGROUND",    (0, 1), (-1, 1),  colors.HexColor("#1e2530")),
+            ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.HexColor("#aaaaaa")),
+            ("TEXTCOLOR",     (0, 1), (-1, 1),  colors.HexColor("#dcdcdc")),
+            ("TEXTCOLOR",     (1, 1), (1, 1),   pf_tcol),
+            ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, 0),  10),
+            ("FONTNAME",      (0, 1), (-1, 1),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 1), (-1, 1),  13),
+            ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#3a3a3a")),
+            ("ROUNDEDCORNERS", [4]),
+        ]))
+        story.append(pf_stats_tbl)
+        story.append(Spacer(1, 0.10 * inch))
+
+        # PF figure
+        if pf_fig_path and os.path.exists(pf_fig_path):
+            fig_w, fig_h = 7.10 * inch, 4.80 * inch
+            story.append(RLImage(pf_fig_path, width=fig_w, height=fig_h))
+            story.append(Spacer(1, 0.06 * inch))
+
+        # Methodology note
+        story.append(Paragraph(
+            f"<b>Picket Fence methodology:</b>  A single 1 cm MLC gap is delivered at G0° "
+            f"and imaged on the EPID at SID = 1600 mm.  The central {PF_LEAVES_TOTAL} "
+            f"Agility leaves ({PF_LEAVES_TOTAL // 2} per bank, "
+            f"{PF_LEAF_WIDTH_MM:.0f} mm wide each at isocenter) contribute a "
+            f"{PF_LEAVES_TOTAL // 2 * PF_LEAF_WIDTH_MM:.0f} mm long picket.  "
+            f"For each leaf the 50% penumbra edge is located on both sides; the leaf "
+            f"centre is their midpoint.  Deviation = leaf centre − mean of all leaf centres "
+            f"(removes any residual phantom setup offset).  "
+            f"<b>PASS criterion: all leaf deviations within "
+            f"±{PF_TOLERANCE_MM:.1f} mm.</b>",
+            note_style,
+        ))
+
+    # ── Page 3/4: Portal images + signature ──────────────────────────────────
     story.append(_PageBreak())
     if diag_fig_path and os.path.exists(diag_fig_path):
         story.append(Paragraph("Portal Images — Field & Void Centre Detection", h2_style))

@@ -8,6 +8,30 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## 2026-06-30 — Picket Fence MLC leaf position QA
+
+### Added
+- **Picket Fence QA tab**: Analyses a single 1 cm MLC picket imaged on the EPID
+  (SID 1600 mm, central 80 Agility leaves, 5 mm each, 20 cm field length).
+  - Auto-detected when a PF DICOM is present in the same WL directory (identified
+    by `RTImageLabel` or `SeriesDescription` containing "PF").
+  - Manually loadable via **Load Picket Fence** button (separate folder supported).
+  - Per-leaf centre deviation is shown in a portal image overlay + horizontal bar chart.
+  - Stats card: N leaves, Max |Δ|, RMS, average measured width.
+  - PASS/FAIL banner (green/red) appears alongside the WL and Field Size banners
+    only on days when PF data is present.
+- **PDF PF page**: When PF data is loaded, the report gains an additional page
+  (between Field Size and Portal Images) showing the PASS/FAIL banner, summary
+  stats table, diagnostic figure, and methodology note.  On non-PF days the page
+  is absent — the report stays at 3 pages.
+- **`PF_TOLERANCE_MM`** constant (1.5 mm) and `PF_LEAF_WIDTH_MM` (5 mm) at top of
+  `wl_qa_tool.py`.
+- **Algorithm**: Gaussian pre-filter → column-band row detection → per-leaf 50%
+  penumbra edge finding → deviation = leaf centre − mean of all leaf centres
+  (removes residual phantom offset).
+
+---
+
 ## 2026-06-30 — Study-date PDF, machine auto-detection, 3-page report, batch processor
 
 ### Changed

@@ -22,7 +22,8 @@ algorithm, and generates a signed PDF QA report — in seconds.
 | **Pass/Fail** | Walk circle radius ≤ 1.0 mm |
 | **Machine detection** | Auto-selects machine from DICOM `PatientID` tag |
 | **Report date** | Always uses DICOM `StudyDate`/`StudyTime` — never today's date |
-| **Output** | 3-page PDF report + SQLite trend database |
+| **Picket Fence QA** | MLC leaf position accuracy — auto-detected or manually loaded |
+| **Output** | 3–4 page PDF report + SQLite trend database |
 | **Batch processing** | `batch_generate_reports.py` — all sessions, all machines |
 | **Platforms** | Linux · Windows · macOS |
 
@@ -157,7 +158,27 @@ all use the DICOM `StudyDate`/`StudyTime` — never the generation date.
 
 Each report generation automatically saves a record to `wl_qa_history.db`.
 
-### 5. View trend analysis
+### 5. Picket Fence QA (optional — performed weekly or as scheduled)
+
+If a PF DICOM is present in the same directory as the WL images, it is
+auto-detected and analysed automatically.  To load PF data from a separate
+folder, click **Load Picket Fence**.
+
+The **Picket Fence** tab shows:
+- A portal image with a per-leaf measurement overlay
+- A horizontal bar chart of per-leaf centre deviations (green / orange / red)
+- Summary stats: N leaves, Max |Δ|, RMS, average measured width
+
+A third PASS/FAIL banner (green/red) appears alongside the WL and Field Size
+banners only on days when PF data is loaded.
+
+**Pass criterion:** all leaf centre deviations ≤ ±1.5 mm (`PF_TOLERANCE_MM`).
+
+When the PDF report is generated on a PF day, it includes an extra page with
+the PF results between the Field Size and Portal Images pages (4 pages total).
+On non-PF days the report remains 3 pages.
+
+### 6. View trend analysis
 Click **View Trends** at any time to see a per-machine time-series plot of
 walk circle radius with tolerance and advisory lines, plus a scrollable table
 of all historical records.
