@@ -1175,7 +1175,10 @@ def analyze_picket_fence(ds) -> dict:
 
     field_px_rows = r1 - r0
     leaf_px       = PF_LEAF_WIDTH_MM / spacing_iso        # px per leaf
-    n_leaves      = max(1, round(field_px_rows / leaf_px))
+    # Cap at the expected leaf pair count: the 12% detection threshold sits
+    # outside the geometric field edge so the measured height is slightly
+    # taller than nominal, causing round() to give one extra leaf.
+    n_leaves      = min(max(1, round(field_px_rows / leaf_px)), PF_LEAVES_TOTAL // 2)
 
     # Expanded column window for edge detection (include penumbra on each side)
     pad_col = max(8, int(8.0 / spacing_iso))
@@ -3532,27 +3535,47 @@ def generate_pdf_report(
 
     sig_rows = [
         ["Machine:", machine_name,    "Study Date:", today_str],
-        ["Physicist:", physicist_name, "Study Time:",
-         f"{time_str}"],
+        ["Physicist:", physicist_name, "Study Time:", time_str],
         ["WL Result:", ("PASS" if passed else "FAIL") +
          f"   —   Walk Circle = {max_walk:.3f} mm",
          "Phantom:", PHANTOM_NAME],
         ["Field Result:", _fs_text, "", ""],
     ]
-    sig_tbl = Table(sig_rows, colWidths=[1.0*inch, 2.7*inch, 1.1*inch, 2.3*inch])
     sig_bg    = _GREEN_LITE if passed else _RED_LITE
     _fs_sig_bg = (_GREEN_LITE if _fs_worst == 0 else
                   colors.HexColor("#fff8e1") if _fs_worst == 1 else _RED_LITE)
     _fs_sig_color = (_GREEN if _fs_worst == 0 else
                      colors.HexColor("#f57f17") if _fs_worst == 1 else _RED)
-    sig_tbl.setStyle(TableStyle([
+
+    # PF row (only when PF data was acquired)
+    _pf_row_idx = None
+    if pf_results is not None:
+        _pf_ok      = pf_results.get("pass_fail", False)
+        _pf_maxd    = pf_results.get("max_deviation_mm", 0.0)
+        _pf_n       = pf_results.get("n_leaves", 0)
+        _pf_text    = (f"PASS — Max |Δ| = {_pf_maxd:.2f} mm  "
+                       f"({_pf_n} leaves,  Tol ≤ {PF_TOLERANCE_MM:.1f} mm  "
+                       f"Warn ≥ {PF_WARN_MM:.1f} mm)"
+                       if _pf_ok else
+                       f"FAIL — Max |Δ| = {_pf_maxd:.2f} mm  "
+                       f"({_pf_n} leaves,  Tol ≤ {PF_TOLERANCE_MM:.1f} mm)")
+        _pf_warn    = (_pf_maxd >= PF_WARN_MM and _pf_maxd < PF_TOLERANCE_MM)
+        _pf_sig_bg  = (_GREEN_LITE if _pf_ok and not _pf_warn else
+                       colors.HexColor("#fff8e1") if _pf_warn else _RED_LITE)
+        _pf_sig_col = (_GREEN if _pf_ok and not _pf_warn else
+                       colors.HexColor("#f57f17") if _pf_warn else _RED)
+        _pf_row_idx = len(sig_rows)
+        sig_rows.append(["PF Result:", _pf_text, "", ""])
+
+    sig_tbl = Table(sig_rows, colWidths=[1.0*inch, 2.7*inch, 1.1*inch, 2.3*inch])
+    sig_style = [
         ("FONTSIZE",      (0, 0), (-1, -1), 9),
         ("FONTNAME",      (0, 0), (0, -1),  "Helvetica-Bold"),
         ("FONTNAME",      (2, 0), (2, -2),  "Helvetica-Bold"),
         ("FONTNAME",      (1, 2), (1, 2),   "Helvetica-Bold"),
         ("TEXTCOLOR",     (1, 2), (1, 2),   _GREEN if passed else _RED),
         ("BACKGROUND",    (0, 2), (-1, 2),  sig_bg),
-        ("SPAN",          (1, 3), (3, 3)),                       # field result spans cols 1-3
+        ("SPAN",          (1, 3), (3, 3)),
         ("FONTNAME",      (1, 3), (1, 3),   "Helvetica-Bold"),
         ("TEXTCOLOR",     (1, 3), (1, 3),   _fs_sig_color),
         ("BACKGROUND",    (0, 3), (-1, 3),  _fs_sig_bg),
@@ -3561,7 +3584,15 @@ def generate_pdf_report(
         ("TOPPADDING",    (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("LEFTPADDING",   (0, 0), (-1, -1), 6),
-    ]))
+    ]
+    if _pf_row_idx is not None:
+        sig_style += [
+            ("SPAN",       (1, _pf_row_idx), (3, _pf_row_idx)),
+            ("FONTNAME",   (1, _pf_row_idx), (1, _pf_row_idx), "Helvetica-Bold"),
+            ("TEXTCOLOR",  (1, _pf_row_idx), (1, _pf_row_idx), _pf_sig_col),
+            ("BACKGROUND", (0, _pf_row_idx), (-1, _pf_row_idx), _pf_sig_bg),
+        ]
+    sig_tbl.setStyle(TableStyle(sig_style))
     story.append(sig_tbl)
     story.append(Spacer(1, 0.06 * inch))
     story.append(Paragraph(
