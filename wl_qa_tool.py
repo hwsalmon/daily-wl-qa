@@ -144,7 +144,8 @@ PHYSICISTS = [
 ]
 
 # ── Picket Fence constants ─────────────────────────────────────────────────────
-PF_TOLERANCE_MM  = 1.5   # Per-leaf centre deviation PASS/FAIL threshold (mm)
+PF_TOLERANCE_MM  = 0.5   # Per-leaf centre deviation FAIL threshold (mm)
+PF_WARN_MM       = 0.4   # Per-leaf centre deviation WARNING threshold (mm)
 PF_LEAF_WIDTH_MM = 5.0   # Agility inner MLC leaf width at isocenter (mm)
 PF_LEAVES_TOTAL  = 80    # Central leaves tested: 40 per bank
 
@@ -1246,6 +1247,7 @@ def analyze_picket_fence(ds) -> dict:
         "spacing_iso_mm":     float(spacing_iso),
         "field_bounds":       (r0, r1, c0, c1),
         "_image_array":       arr_f,
+        "_inv_array":         inv,    # normalised 0-1, high dose = high value
         "study_date":         pf_date,
         "study_time":         pf_time,
     }
@@ -1259,7 +1261,7 @@ def generate_pf_figure(pf_results: dict) -> str | None:
         import matplotlib.pyplot as plt
         import tempfile
 
-        arr         = pf_results["_image_array"]
+        inv         = pf_results["_inv_array"]      # normalised 0-1, high dose = bright
         r0, r1, c0, c1 = pf_results["field_bounds"]
         sp          = pf_results["spacing_iso_mm"]
         n_leaves    = pf_results["n_leaves"]
@@ -1279,19 +1281,20 @@ def generate_pf_figure(pf_results: dict) -> str | None:
         # ── Portal image panel ────────────────────────────────────────────────
         pad_r = max(10, int(15 / sp))
         pad_c = max(20, int(30 / sp))
-        row_lo = max(0, r0 - pad_r);  row_hi = min(arr.shape[0], r1 + pad_r)
-        col_lo = max(0, c0 - pad_c);  col_hi = min(arr.shape[1], c1 + pad_c)
-        crop   = arr[row_lo:row_hi, col_lo:col_hi]
+        row_lo = max(0, r0 - pad_r);  row_hi = min(inv.shape[0], r1 + pad_r)
+        col_lo = max(0, c0 - pad_c);  col_hi = min(inv.shape[1], c1 + pad_c)
 
-        field_px = arr[r0:r1+1, c0:c1+1]
-        vlo, vhi = np.percentile(field_px, [2, 98])
+        # Use inverted (dose = bright) array so background is dark, no blowout
+        crop_inv   = inv[row_lo:row_hi, col_lo:col_hi]
+        field_inv  = inv[r0:r1+1, c0:c1+1]
+        vlo, vhi   = float(np.percentile(field_inv, 2)), float(np.percentile(field_inv, 98))
 
-        ax_img.imshow(crop, cmap="gray", vmin=vlo, vmax=vhi,
+        ax_img.imshow(crop_inv, cmap="gray", vmin=vlo, vmax=vhi,
                       aspect="equal", origin="upper")
         ax_img.set_facecolor("#1e1e1e")
         ax_img.set_axis_off()
 
-        field_rows = r1 - r0
+        field_rows   = r1 - r0
         nom_crop_col = nominal_col - col_lo
 
         # Leaf grid lines
@@ -1304,13 +1307,13 @@ def generate_pf_figure(pf_results: dict) -> str | None:
         ax_img.axvline(nom_crop_col, color="yellow", linewidth=1.0,
                        alpha=0.65, linestyle="--", zorder=3)
 
-        # Per-leaf deviation dots
+        # Per-leaf deviation dots — green / orange (warn) / red (fail)
         for i, (_, dev) in enumerate(zip(leaf_y, deviations)):
             row_crop = r0 + i * (field_rows / n_leaves) + \
                        (field_rows / n_leaves) / 2 - row_lo
             col_crop = nom_crop_col + dev / sp
-            c = "#4caf50" if abs(dev) < PF_TOLERANCE_MM * 0.67 else \
-                "#ff9800" if abs(dev) <= PF_TOLERANCE_MM else "#f44336"
+            c = "#4caf50" if abs(dev) < PF_WARN_MM else \
+                "#ff9800" if abs(dev) < PF_TOLERANCE_MM else "#f44336"
             ax_img.plot(col_crop, row_crop, "o", color=c,
                         markersize=3.5, markeredgecolor="#111111",
                         markeredgewidth=0.4, zorder=5)
@@ -1323,17 +1326,23 @@ def generate_pf_figure(pf_results: dict) -> str | None:
             sp_edge.set_color("#555555")
 
         for y, dev in zip(leaf_y, deviations):
-            c = "#4caf50" if abs(dev) < PF_TOLERANCE_MM * 0.67 else \
-                "#ff9800" if abs(dev) <= PF_TOLERANCE_MM else "#f44336"
+            c = "#4caf50" if abs(dev) < PF_WARN_MM else \
+                "#ff9800" if abs(dev) < PF_TOLERANCE_MM else "#f44336"
             ax_dev.barh(y, dev, height=PF_LEAF_WIDTH_MM * 0.80,
                         color=c, edgecolor="#1e1e1e", linewidth=0.4, zorder=3)
 
-        ax_dev.axvline(0,                  color="white",   linewidth=1.0,
-                       alpha=0.55, zorder=4)
-        ax_dev.axvline(+PF_TOLERANCE_MM,   color="#ef5350", linewidth=1.4,
+        ax_dev.axvline(0, color="white", linewidth=1.0, alpha=0.55, zorder=4)
+        # Warning lines (orange)
+        ax_dev.axvline(+PF_WARN_MM, color="#ff9800", linewidth=1.2,
                        linestyle="--", zorder=4,
-                       label=f"±{PF_TOLERANCE_MM:.1f} mm tolerance")
-        ax_dev.axvline(-PF_TOLERANCE_MM,   color="#ef5350", linewidth=1.4,
+                       label=f"±{PF_WARN_MM:.1f} mm warning")
+        ax_dev.axvline(-PF_WARN_MM, color="#ff9800", linewidth=1.2,
+                       linestyle="--", zorder=4)
+        # Fail lines (red)
+        ax_dev.axvline(+PF_TOLERANCE_MM, color="#ef5350", linewidth=1.4,
+                       linestyle="--", zorder=4,
+                       label=f"±{PF_TOLERANCE_MM:.1f} mm fail")
+        ax_dev.axvline(-PF_TOLERANCE_MM, color="#ef5350", linewidth=1.4,
                        linestyle="--", zorder=4)
 
         ax_dev.set_xlabel("Deviation from Nominal Centre (mm)",
@@ -1361,7 +1370,8 @@ def generate_pf_figure(pf_results: dict) -> str | None:
                       labelcolor="white", fontsize=9,
                       facecolor="#1e1e1e", edgecolor="#555555")
 
-        xlim = max(PF_TOLERANCE_MM * 1.5, max_dev * 1.25, 0.5)
+        # Zoom in: show ±(2× fail tol) or data max with margin, min 0.3 mm
+        xlim = max(PF_TOLERANCE_MM * 2.0, max_dev * 1.5, 0.3)
         ax_dev.set_xlim(-xlim, xlim)
 
         pf_title_col = "#66bb6a" if passed else "#ef5350"
@@ -2531,7 +2541,8 @@ class WLApp(QMainWindow):
         # Stats card
         self._pf_stats_card.setVisible(True)
         self._pf_stat_leaves.setText(str(n))
-        col_max = "#4caf50" if maxd <= PF_TOLERANCE_MM else "#ef5350"
+        col_max = "#4caf50" if maxd < PF_WARN_MM else \
+                  "#ff9800" if maxd < PF_TOLERANCE_MM else "#ef5350"
         self._pf_stat_max.setText(f"{maxd:.3f}")
         self._pf_stat_max.setStyleSheet(
             f"color:{col_max}; font-size:17px; font-weight:bold; "
@@ -3476,7 +3487,7 @@ def generate_pdf_report(
             f"centre is their midpoint.  Deviation = leaf centre − mean of all leaf centres "
             f"(removes any residual phantom setup offset).  "
             f"<b>PASS criterion: all leaf deviations within "
-            f"±{PF_TOLERANCE_MM:.1f} mm.</b>",
+            f"±{PF_TOLERANCE_MM:.1f} mm (warning ≥ ±{PF_WARN_MM:.1f} mm).</b>",
             note_style,
         ))
 
