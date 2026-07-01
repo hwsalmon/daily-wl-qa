@@ -113,17 +113,6 @@ FIELD_SIZE_FAIL_MM  = 0.6   # MLC |deviation| > this → red   (call service)
 FIELD_SIZE_JAW_WARN_MM = 0.6   # Physical jaw |deviation| > this → orange (warning)
 FIELD_SIZE_JAW_FAIL_MM = 0.8   # Physical jaw |deviation| > this → red   (call service)
 
-# ── Phantom ring constants ─────────────────────────────────────────────────────
-# The MIMI phantom has an internal cylindrical feature whose shadow appears as a
-# ring at ~22 mm radius in portal images. Ellipticity (horizontal vs vertical
-# apparent radius) indicates phantom tilt: θ = arccos(r_short / r_long).
-# ±45° sectors are used so that both cardinal and diagonal ring positions (where
-# the ring is clearly inside the 40 mm square field) contribute to each axis.
-RING_SEARCH_MIN_MM   = 10.0   # inner search boundary for phantom ring (mm)
-RING_SEARCH_MAX_MM   = 24.0   # outer search boundary — below penumbra at ~25 mm
-RING_GAUSSIAN_SIGMA  = 6.0    # smoothing σ (pixels) — suppresses MV portal noise
-RING_RADIUS_NOMINAL_MM = 22.0 # expected ring radius (mm at iso)
-
 MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
 
@@ -555,82 +544,6 @@ def measure_mlc_leaves(
     return leaves
 
 
-def measure_phantom_ring(
-    arr: np.ndarray,
-    spacing_mm: float,
-    field_center_px: tuple,
-) -> dict:
-    """
-    Measure the MIMI phantom internal ring radius at isocenter.
-
-    The ring feature appears at ~22 mm radius in iViewGT portal images.
-    Only the four diagonal sectors (45°/135°/225°/315° ± 15°) are used:
-    at 45° the field corners are at ≥ 30 mm, well above the 24 mm search
-    ceiling, so the field penumbra cannot contaminate the gradient peak.
-    Cardinal and near-cardinal sectors are intentionally excluded because
-    the MLC/Jaw penumbra at ~22–26 mm would overwhelm the ring gradient.
-
-    Returns dict with r_mean_mm (ring radius in mm at iso).
-    """
-    fcx, fcy = field_center_px
-    nr, nc = arr.shape
-
-    r_max_px_crop = int(RING_SEARCH_MAX_MM / spacing_mm) + 5
-    c0 = max(0, int(fcx) - r_max_px_crop)
-    c1 = min(nc, int(fcx) + r_max_px_crop + 1)
-    r0 = max(0, int(fcy) - r_max_px_crop)
-    r1 = min(nr, int(fcy) + r_max_px_crop + 1)
-
-    smooth  = gaussian_filter(arr[r0:r1, c0:c1].astype(np.float64),
-                              sigma=RING_GAUSSIAN_SIGMA)
-    fcx_loc = fcx - c0
-    fcy_loc = fcy - r0
-
-    C, Rm  = np.meshgrid(np.arange(smooth.shape[1], dtype=float),
-                         np.arange(smooth.shape[0], dtype=float))
-    dx_map = C - fcx_loc
-    dy_map = Rm - fcy_loc
-    dist   = np.sqrt(dx_map**2 + dy_map**2) + 1e-12
-
-    r_min_px = int(RING_SEARCH_MIN_MM / spacing_mm)
-    r_max_px = int(RING_SEARCH_MAX_MM / spacing_mm)
-    r_range  = range(r_min_px, r_max_px + 1)
-
-    def _ring_in_sector(dir_angle_deg: float, half_deg: float = 15.0) -> float | None:
-        rad      = np.radians(dir_angle_deg)
-        half_cos = np.cos(np.radians(half_deg))
-        dot      = dx_map * np.cos(rad) + dy_map * np.sin(rad)
-        sector   = (dot / dist) >= half_cos
-
-        profile = np.full(len(r_range), np.nan)
-        for i, r in enumerate(r_range):
-            mask = (dist >= r - 0.5) & (dist < r + 0.5) & sector
-            if mask.sum() >= 3:
-                profile[i] = float(smooth[mask].mean())
-
-        valid = ~np.isnan(profile)
-        if valid.sum() < 5:
-            return None
-        x        = np.arange(len(profile))
-        interp_p = np.interp(x, x[valid], profile[valid])
-        grad     = np.abs(np.gradient(interp_p))
-        peak     = int(np.argmax(grad))
-        return (r_min_px + peak) * spacing_mm
-
-    # Diagonal sectors only — furthest from field edges, free of penumbra contamination
-    vals   = [v for a in [45, 135, 225, 315]
-              if (v := _ring_in_sector(a)) is not None]
-    r_mean = float(np.mean(vals)) if vals else None
-
-    return {
-        "r_mean_mm":      r_mean,
-        "r_horiz_mm":     None,
-        "r_vert_mm":      None,
-        "ellipticity_mm": None,
-        "tilt_deg":       None,
-    }
-
-
 def analyze_image(ds) -> dict:
     """
     Full analysis of one EPID DICOM image.
@@ -660,7 +573,6 @@ def analyze_image(ds) -> dict:
     void_center_px = find_void_center(arr, spacing, search_fc)
 
     mlc_leaves = measure_mlc_leaves(arr, spacing)
-    ring_info  = measure_phantom_ring(arr, spacing, search_fc)
 
     # Primary displacement: void relative to penumbra edge midpoint.
     if edge_fc is not None:
@@ -692,7 +604,6 @@ def analyze_image(ds) -> dict:
         "dy_mm_cent":           dy_px_cent * spacing,
         "field_edges":          field_edges,
         "mlc_leaves":           mlc_leaves,
-        "ring_info":            ring_info,
         "pixel_array":          arr,
     }
 
@@ -871,14 +782,23 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
         r1 = min(arr.shape[0], fcy + half)
         crop = arr[r0:r1, c0:c1]
 
-        # Window from void minimum to upper-penumbra level so both the air void
-        # and the field penumbra / edge are clearly visible.
-        # Elekta inverted: field = LOW value, background = HIGH value.
-        # vmin anchors on the darkest pixels (void); vmax reaches well into the
-        # background so the penumbra gradient appears as a visible ramp.
-        crop_f = crop.flatten().astype(np.float64)
-        vmin_c = float(np.percentile(crop_f, 0.5))
-        vmax_c = float(np.percentile(crop_f, 82))
+        # Window tightly around the air void itself so it stands out clearly.
+        # Elekta inverted: field = LOW value, background = HIGH value; the void
+        # is a subtle local minimum riding on top of the much larger field→
+        # background range, so windowing off the whole crop (as before) buries
+        # it in mid-gray. Instead stretch contrast using only a small ROI
+        # centred on the detected void — this saturates the field edge/
+        # background to black/white but maximises void visibility.
+        void_r_px_est = (VOID_DIAMETER_MM / 2.0) / spc
+        win_half = max(20, int(void_r_px_est * 5))
+        vcx, vcy = int(round(vc[0])), int(round(vc[1]))
+        wc0 = max(0,            vcx - win_half)
+        wc1 = min(arr.shape[1], vcx + win_half)
+        wr0 = max(0,            vcy - win_half)
+        wr1 = min(arr.shape[0], vcy + win_half)
+        void_roi = arr[wr0:wr1, wc0:wc1].astype(np.float64)
+        vmin_c = float(np.percentile(void_roi, 1))
+        vmax_c = float(np.percentile(void_roi, 97))
 
         ax.imshow(
             crop, cmap="gray", vmin=vmin_c, vmax=vmax_c,
@@ -958,23 +878,6 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
                     color="#00e676", fontsize=6.0, va="bottom", ha="right",
                     bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
                 )
-
-        # ── Phantom ring sanity circle (magenta) ─────────────────────────────
-        ring  = r.get("ring_info", {})
-        r_val = ring.get("r_mean_mm")
-        if r_val is not None:
-            ax.add_patch(mpatches.Circle(
-                (fc[0], fc[1]), r_val / spc,
-                edgecolor="magenta", facecolor="none",
-                lw=1.2, ls="--", alpha=0.70, zorder=3,
-            ))
-            ax.text(
-                0.98, 0.16,
-                f"Ring  r={r_val:.1f} mm",
-                transform=ax.transAxes,
-                color="magenta", fontsize=6.0, va="bottom", ha="right",
-                bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
-            )
 
         # 5 mm scale bar
         bar_px = 5.0 / spc
@@ -1813,10 +1716,6 @@ class WLApp(QMainWindow):
         self._dlg_status_label.setStyleSheet("font-size: 13px; color: #888888;")
         left_vbox.addWidget(self._dlg_status_label)
 
-        self._ring_status_label = QLabel("Phantom Ring:  —")
-        self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
-        left_vbox.addWidget(self._ring_status_label)
-
         bottom_layout.addWidget(left_status)
         bottom_layout.addStretch()
 
@@ -2327,34 +2226,6 @@ class WLApp(QMainWindow):
                 "font-size: 22px; font-weight: bold; color: #ef5350; background: transparent;"
             )
 
-    def _refresh_ring_display(self):
-        """Update the phantom ring status label from the current image results."""
-        if self._image_results is None:
-            self._ring_status_label.setText("Phantom Ring:  —")
-            self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
-            return
-
-        r_vals = []
-        for ir in self._image_results.values():
-            v = ir.get("ring_info", {}).get("r_mean_mm")
-            if v is not None:
-                r_vals.append(v)
-
-        if not r_vals:
-            self._ring_status_label.setText("Phantom Ring:  detection uncertain")
-            self._ring_status_label.setStyleSheet("font-size: 13px; color: #888888;")
-            return
-
-        r_mean = float(np.mean(r_vals))
-        in_range = 15.0 <= r_mean <= 30.0
-        style = "font-size: 13px; color: #888888;" if in_range else \
-                "font-size: 13px; color: #ffa726; font-weight: bold;"
-        note  = "" if in_range else "  [unexpected — check phantom position]"
-        self._ring_status_label.setText(
-            f"Phantom Ring:  r = {r_mean:.1f} mm  (expected ≈{RING_RADIUS_NOMINAL_MM:.0f} mm){note}"
-        )
-        self._ring_status_label.setStyleSheet(style)
-
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _load_directory(self):
@@ -2658,7 +2529,6 @@ class WLApp(QMainWindow):
             _set(f"corr_{angle}_dr", f"{corr_dr:.3f}",      _color(corr_dr))
 
         self._refresh_field_size_display()
-        self._refresh_ring_display()
         self._update_walk_fig()
         self._update_diag_image()
 
