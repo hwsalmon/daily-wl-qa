@@ -1,8 +1,14 @@
-# Winston-Lutz Daily QA Tool
+# Daily QA - WL - DLG - Picket Fence
 
 Standalone Python GUI for daily Winston-Lutz (WL) mechanical isocenter QA on
 Elekta Versa HD LINACs using the Standard Imaging MIMI Phantom (6.4 mm air void).
-Optionally includes Picket Fence MLC leaf position QA on days it is performed.
+Also includes physical-jaw/MLC field-size (DLG) QA and Picket Fence MLC leaf
+position QA on days it is performed.
+
+`APP_NAME` (top of `wl_qa_tool.py`) holds the display name used in the window
+title, header, dialogs, and PDF report/footer. "Winston-Lutz"/"WL" is kept in
+methodology text and internal identifiers since it names the actual clinical
+test, distinct from the app's branding.
 
 ## Running the app
 
@@ -21,9 +27,10 @@ pip install PySide6 pydicom opencv-python scipy reportlab matplotlib pillow
 All imports are checked at startup; missing packages are reported with the exact
 `pip install` command and the process exits.
 
-## Machine configuration
+## Machine and physicist configuration
 
-Three Elekta Versa HD LINACs are configured in `MACHINES` (line ~115):
+`MACHINES` and `PHYSICISTS` (top of `wl_qa_tool.py`) are the **default** lists
+used only on first run:
 
 | Serial | Name in app |
 |--------|-------------|
@@ -31,13 +38,20 @@ Three Elekta Versa HD LINACs are configured in `MACHINES` (line ~115):
 | 156724 | Elekta VersaHD 156724 |
 | 154613 | Elekta VersaHD 154613 |
 
-Three physicists are configured in `PHYSICISTS` (line ~121):
 - Howard W. Salmon, PhD, DABR
 - Shawn Hollars, MS, DABR
 - Logen Hall, MS, DABR
 
-`PATIENT_ID_MACHINE_MAP` (line ~132) maps the Elekta iViewGT `PatientID` DICOM
-tag to a machine name for automatic dropdown selection on directory load:
+At runtime the app reads `self._machines` / `self._physicists`, seeded from
+`config["machines"]` / `config["physicists"]` in `wl_qa_config.json` if
+present, else falling back to the `MACHINES`/`PHYSICISTS` constants. **Adding
+or removing a machine or physicist is done through the in-app Settings
+dialog** (see below) — editing the module constants is only needed to change
+the factory defaults for a fresh install.
+
+`PATIENT_ID_MACHINE_MAP` (module constant, not settings-editable) maps the
+Elekta iViewGT `PatientID` DICOM tag to a machine name for automatic dropdown
+selection on directory load:
 
 ```python
 PATIENT_ID_MACHINE_MAP = {
@@ -48,9 +62,29 @@ PATIENT_ID_MACHINE_MAP = {
 ```
 
 `PatientID` is the only reliable machine identifier in iViewGT DICOM headers —
-there is no serial number or station name tag.
+there is no serial number or station name tag. Adding a machine here still
+requires a code change (and the machine name must also exist in the
+Settings-managed machine list to appear in the dropdown).
 
-To add machines or physicists, edit those three structures — no other code changes needed.
+## Settings dialog
+
+Opened via the **Settings** button next to the Machine/Physicist dropdowns.
+Three tabs, all implemented in `WLApp._show_settings()` and its
+`_build_settings_*` helpers:
+
+- **Machines** / **Physicists** — add/remove entries in a `QListWidget`.
+  Changes persist immediately to `config["machines"]` / `config["physicists"]`
+  in `wl_qa_config.json` via `_save_machines_physicists()`, and the main
+  window's dropdowns refresh live while preserving the current selection.
+  At least one entry must remain in each list.
+- **Field Size Reference** — manual numeric MLC/Jaw reference entry per
+  machine (`QDoubleSpinBox`, 3 decimal places), writing into
+  `config["field_refs"][machine]`. This supplements — does not replace — the
+  **Set Current as Reference** button on the Field Size QA tab, which derives
+  the reference from a live measurement instead. Manual entry is for cases
+  where the exact baseline is already known (e.g. after a physical
+  calibration) and rounds to 3 decimals, same as the rest of the app's
+  `.3f` display formatting.
 
 ## DICOM input format
 
@@ -117,6 +151,24 @@ the four corrected walk vectors gives the walk circle metric.
 
 **PASS: walk circle radius ≤ 1.0 mm** (`TOLERANCE_MM` constant).
 
+## Field Size QA thresholds
+
+MLC (leaf bank) and physical jaw deviations use **independent** action
+levels — the jaw mechanism is less precise than the MLC leaves, so it gets a
+wider tolerance:
+
+| Axis | Warn | Fail | Constants |
+|------|------|------|-----------|
+| MLC (leaf banks) | 0.4 mm | 0.6 mm | `FIELD_SIZE_WARN_MM` / `FIELD_SIZE_FAIL_MM` |
+| Physical jaw | 0.6 mm | 0.8 mm | `FIELD_SIZE_JAW_WARN_MM` / `FIELD_SIZE_JAW_FAIL_MM` |
+
+`_fs_level(dev, kind)` (GUI) and `_fs_lvl(dev, kind)` / `_fcc(v, ref, kind)`
+(PDF) take a `kind` of `"mlc"` or `"jaw"` to select the correct threshold
+pair. Individual leaf-span deviations always use the MLC thresholds (leaves
+are MLC hardware). The reference values themselves come from
+`_get_field_refs(machine)` — either the **Set Current as Reference** button
+(Field Size QA tab) or manual entry in the Settings dialog.
+
 ## Picket Fence QA
 
 Performed on days the test is acquired (typically weekly or as scheduled).
@@ -164,8 +216,23 @@ Two-panel matplotlib figure (13 × 9 in):
 ## Trend database
 
 Results are saved to `wl_qa_history.db` (SQLite, same directory as the script)
-every time a PDF report is generated. The `View Trends` button plots walk circle
-radius over time per machine.
+every time a PDF report is generated. The `View Trends` button opens a
+**machine picker → test picker → chart** flow (`_show_trends()` and its
+`_build_trend_*_page()` helpers, using a `QStackedWidget`):
+
+1. Pick a machine (only machines with existing DB records are listed).
+2. Pick a test: Walk Circle Radius (WL), Field Size — MLC, or Field Size —
+   Jaw. MLC/Jaw trends plot deviation from that machine's current reference
+   (`_get_field_refs()`), colour-coded pass/warn/fail using the same
+   thresholds as the GUI/PDF (see Field Size QA thresholds above).
+3. Chart + table for that machine/test, with "Change Test"/"Change Machine"
+   back-navigation. Stale pages are removed from the stack as new ones
+   replace them (`stack.removeWidget(old); old.deleteLater()`) so repeated
+   navigation doesn't leak widgets or leave back-buttons pointing at stale
+   pages.
+
+PF results are not yet stored in the trend DB (still a pending idea below),
+so Picket Fence is not one of the selectable tests.
 
 The DB is created automatically on first run. Schema: `wl_records` table with
 date, time, machine\_name, physicist\_name, walk\_circle\_r, pass\_fail,
@@ -212,12 +279,30 @@ Older databases are migrated automatically by `_init_db()` (ALTER TABLE ADD COLU
 ## Diagnostic figure (WL)
 
 Five panels generated by matplotlib Agg backend (no display required):
-- Panels 1–4: portal image crop for each cardinal angle, windowed to field-interior
-  pixels (2nd–90th percentile of pixels where normalised value < 0.15).
-  Overlays: cyan field boundary, crosshair, coloured void marker, yellow
-  displacement arrow, white 5 mm scale bar.
+- Panels 1–4: portal image crop for each cardinal angle. **Windowing is
+  computed from a small ROI centred on the detected void** (± `5 ×` the
+  void radius, 1st–97th percentile of that ROI only) rather than the whole
+  crop — the void is a subtle local minimum riding on top of the much larger
+  field→background intensity range, so windowing off the whole crop buried it
+  in near-uniform dark gray. Void-local windowing saturates the field
+  edge/background to black/white but renders the void as a clearly visible
+  dark circle. Overlays: cyan field boundary, crosshair, coloured void
+  marker, yellow displacement arrow, white 5 mm scale bar. (The magenta
+  phantom-ring sanity circle that used to appear here was removed along with
+  the ring-detection feature — see below.)
 - Panel 5: 2-D displacement map — coloured dots for each angle, white MEC walk
   circle, blue MEC centre cross.
+
+### Phantom ring detection — removed
+
+`measure_phantom_ring()` (MIMI internal ring radius sanity check, ~22 mm) and
+its GUI status label / diagnostic-figure overlay were removed. The check was
+a secondary sanity indicator, not a PASS/FAIL criterion, and cluttered the
+portal-image panels without adding QA value beyond the void/field detection
+already performed. If ring-based phantom-tilt detection is wanted again,
+the previous implementation (sector-gradient search between
+`RING_SEARCH_MIN_MM`/`RING_SEARCH_MAX_MM`) is recoverable from git history
+prior to the "Remove phantom ring detection" commit.
 
 Figure is saved as a temp PNG and embedded in the GUI (Portal Images tab) and PDF.
 The GUI renders it via `QPixmap.loadFromData()` (PySide6).
@@ -226,11 +311,15 @@ The GUI renders it via `QPixmap.loadFromData()` (PySide6).
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
+| `APP_NAME` | "Daily QA - WL - DLG - Picket Fence" | App branding — window title, header, dialogs, PDF |
 | `TOLERANCE_MM` | 1.0 | WL PASS/FAIL threshold (mm) |
 | `VOID_DIAMETER_MM` | 6.4 | MIMI air void diameter (mm) |
 | `FIELD_SIZE_MM` | 40.0 | Nominal WL field size (mm) |
 | `VOID_SEARCH_HALF_FIELD_FRACTION` | 0.50 | Search radius = 50% of field half-width |
 | `GAUSSIAN_SIGMA_FRACTION` | 0.30 | WL pre-filter σ as fraction of void radius |
+| `FIELD_SIZE_REF_MM` | 40.0 | Nominal field-size reference before a machine is calibrated |
+| `FIELD_SIZE_WARN_MM` / `FIELD_SIZE_FAIL_MM` | 0.4 / 0.6 | MLC field-size warn/fail (mm) |
+| `FIELD_SIZE_JAW_WARN_MM` / `FIELD_SIZE_JAW_FAIL_MM` | 0.6 / 0.8 | Physical jaw field-size warn/fail (mm) |
 | `PF_TOLERANCE_MM` | 0.5 | PF FAIL threshold per leaf (mm) |
 | `PF_WARN_MM` | 0.4 | PF WARNING threshold per leaf (mm) |
 | `PF_LEAF_WIDTH_MM` | 5.0 | Agility inner leaf width at isocenter (mm) |
@@ -246,7 +335,9 @@ run_wl_qa.bat              — Windows double-click launcher
 setup_windows.bat          — Windows first-time setup (embeddable Python)
 requirements.txt           — pip dependency list
 wl_qa_history.db           — SQLite trend database (auto-created, not in git)
-wl_qa_config.json          — last-used paths (auto-created, not in git)
+wl_qa_config.json          — last-used paths, machines/physicists lists, and
+                             per-machine field-size references (auto-created,
+                             not in git)
 CLAUDE.md                  — this file
 .gitignore                 — excludes __pycache__, *.pyc, *.pdf, *.db,
                              WL Test Data/, PicketFence/
@@ -255,21 +346,31 @@ WL Test Data/              — clinical DICOM sessions (not committed)
 PicketFence/               — PF sample DICOM (not committed — clinical data)
 ```
 
-## Current application state (as of 2026-06-30)
+## Current application state (as of 2026-07-01)
 
 ### Features complete and tested
 - WL void detection, walk circle, 3D CBCT setup error decomposition
-- Field size QA (MLC/jaw deviation, leaf span)
+- Field size QA (MLC/jaw deviation, leaf span) with independent MLC vs.
+  physical-jaw warn/fail tolerances
 - Machine auto-detection from DICOM `PatientID`
 - Study-date PDF (DICOM StudyDate → filename, PDF metadata, filesystem mtime)
 - 3-page PDF (WL / Field Size / Portal images + signature)
-- SQLite trend database with per-machine time-series chart
+- SQLite trend database with a machine-picker → test-picker → chart flow
+  (Walk Circle, Field Size MLC, Field Size Jaw)
 - Batch report generator (`batch_generate_reports.py`)
 - Picket Fence QA tab: auto-detect or manual load, per-leaf deviation analysis,
   portal image + deviation chart figure, PASS/FAIL/warning banner
 - PF page in PDF (inserted between Field Size and Portal Images pages)
 - PF result row in electronic signature block
 - PF DICOM excluded from WL/field-size analysis when co-located in same folder
+- Settings dialog: add/remove machines and physicists (persisted, live-refreshes
+  the dropdowns), manual per-machine MLC/Jaw field-size reference entry
+- App branding ("Daily QA - WL - DLG - Picket Fence") centralized in `APP_NAME`
+  and applied across window title, header, dialogs, and PDF report/footer
+- Portal-image panels window off a void-local ROI so the air void renders as
+  a clearly visible dark circle instead of near-uniform gray
+- Phantom ring (MIMI internal-ring) detection removed — was a secondary
+  sanity check, not a PASS/FAIL criterion, and cluttered the portal panels
 
 ### Known behaviour / edge cases
 - 156724 Jun 22 session in `WL Test Data/` has a missing G180 image — batch

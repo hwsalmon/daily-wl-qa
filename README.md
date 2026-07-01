@@ -1,7 +1,8 @@
-# Daily WL QA
+# Daily QA - WL - DLG - Picket Fence
 
-**Daily Winston-Lutz isocenter walk QA for Elekta Versa HD LINACs**
-using the Standard Imaging MIMI Phantom (6.4 mm air void).
+**Daily Winston-Lutz isocenter walk, field-size (DLG), and Picket Fence QA
+for Elekta Versa HD LINACs** using the Standard Imaging MIMI Phantom
+(6.4 mm air void).
 
 ![App Icon](icon.png)
 
@@ -19,8 +20,9 @@ algorithm, and generates a signed PDF QA report — in seconds.
 | **Input** | Elekta iViewGT RTIMAGE DICOM files (4 cardinal angles) |
 | **Phantom** | Standard Imaging MIMI — 6.4 mm air void |
 | **Algorithm** | MEC of all 4 corrected walk residuals |
-| **Pass/Fail** | Walk circle radius ≤ 1.0 mm |
+| **Pass/Fail** | Walk circle radius ≤ 1.0 mm; MLC field size ±0.4/0.6 mm warn/fail; jaw field size ±0.6/0.8 mm warn/fail |
 | **Machine detection** | Auto-selects machine from DICOM `PatientID` tag |
+| **Settings** | In-app dialog to add/remove machines and physicists, and manually enter field-size references |
 | **Report date** | Always uses DICOM `StudyDate`/`StudyTime` — never today's date |
 | **Picket Fence QA** | MLC leaf position accuracy — auto-detected or manually loaded |
 | **Output** | 3–4 page PDF report + SQLite trend database |
@@ -130,7 +132,9 @@ DICOM tag — no manual selection needed for the three configured Versa HD units
   (Lateral / SI / AP mm) derived from all four images.
 - **Portal Images tab** — 5-panel diagnostic figure: one portal image per angle
   (field boundary overlay, crosshair, void marker, displacement arrow, scale bar)
-  plus a 2-D displacement map showing the walk circle.
+  plus a 2-D displacement map showing the walk circle. Each portal image is
+  windowed around the detected void itself so it renders as a clearly visible
+  dark circle rather than being lost against the field's overall brightness.
 
 ### 4. Generate report
 Click **Generate Daily Report (PDF)**.
@@ -191,30 +195,36 @@ plus a **PF Result row** in the electronic signature block.
 On non-PF days the report remains 3 pages.
 
 ### 6. View trend analysis
-Click **View Trends** at any time to see a per-machine time-series plot of
-walk circle radius with tolerance and advisory lines, plus a scrollable table
-of all historical records.
+Click **View Trends** at any time. You'll first pick a **machine**, then an
+**individual test** — Walk Circle Radius, Field Size (MLC), or Field Size
+(Jaw) — and see that combination's time-series chart (with tolerance/warning
+lines) plus a scrollable table of all historical records. Use "Change Test"
+or "Change Machine" to switch without re-opening the dialog.
 
 ---
 
 ## Machine and physicist configuration
 
-Machines, physicists, and the PatientID → machine mapping are defined near the
-top of `wl_qa_tool.py` (lines ~115–135):
+**Adding or removing a machine or physicist:** click **Settings** in the main
+window, then use the **Machines** / **Physicists** tabs to add or remove
+entries. Changes are saved to `wl_qa_config.json` immediately and the
+dropdowns update right away — no code changes or restart needed.
+
+**Field size reference:** the same Settings dialog has a **Field Size
+Reference** tab to manually type in a machine's MLC/Jaw baseline (e.g. after
+a physical calibration where the exact numbers are already known). This is
+in addition to the **Set Current as Reference** button on the Field Size QA
+tab, which derives the baseline from a live measurement instead.
+
+The `MACHINES` and `PHYSICISTS` lists near the top of `wl_qa_tool.py` are only
+the **factory defaults** used the first time the app runs (before
+`wl_qa_config.json` exists) — edit them only to change what a fresh install
+starts with.
+
+The PatientID → machine mapping used for automatic dropdown selection is
+still a code-level setting:
 
 ```python
-MACHINES = [
-    "Elekta VersaHD 153991",
-    "Elekta VersaHD 156724",
-    "Elekta VersaHD 154613",
-]
-
-PHYSICISTS = [
-    "Howard W. Salmon, PhD, DABR",
-    "Shawn Hollars, MS, DABR",
-    "Logen Hall, MS, DABR",
-]
-
 # Maps Elekta iViewGT PatientID → machine name for auto-detection
 PATIENT_ID_MACHINE_MAP = {
     "QA_Daily_V1_26": "Elekta VersaHD 153991",
@@ -223,9 +233,10 @@ PATIENT_ID_MACHINE_MAP = {
 }
 ```
 
-To add or change machines or physicists, edit those three structures and save —
-no other changes are needed.  When a loaded DICOM directory contains a recognised
-`PatientID`, the machine dropdown selects automatically.
+When a loaded DICOM directory contains a recognised `PatientID`, the machine
+dropdown selects automatically. Adding a new mapping here requires a code
+change, and the machine name must also exist in the Settings-managed machine
+list to appear in the dropdown.
 
 ---
 
@@ -280,9 +291,16 @@ Subtracting the angle-appropriate component from each raw displacement yields
 pure mechanical walk residuals. The **Minimum Enclosing Circle** radius of those
 four residual vectors is the walk circle metric.
 
-### Pass/Fail criterion
+### Pass/Fail criteria
 
-Walk circle radius ≤ **1.0 mm** (editable via `TOLERANCE_MM` in `wl_qa_tool.py`).
+- **Walk circle radius** ≤ **1.0 mm** (`TOLERANCE_MM`).
+- **Field size — MLC**: warn > 0.4 mm, fail > 0.6 mm deviation from reference
+  (`FIELD_SIZE_WARN_MM` / `FIELD_SIZE_FAIL_MM`).
+- **Field size — physical jaw**: warn > 0.6 mm, fail > 0.8 mm deviation from
+  reference (`FIELD_SIZE_JAW_WARN_MM` / `FIELD_SIZE_JAW_FAIL_MM`) — a wider
+  tolerance than MLC since the jaw mechanism is less precise.
+
+All four constants are in `wl_qa_tool.py`.
 
 ### Void detection
 
@@ -311,7 +329,9 @@ icon_512.png               App icon (512 px master)
 icon.ico                   Windows multi-resolution icon (16–256 px)
 CLAUDE.md                  Developer / AI assistant reference
 wl_qa_history.db           SQLite trend database (auto-created, not in git)
-wl_qa_config.json          Last-used paths (auto-created, not in git)
+wl_qa_config.json          Last-used paths, machines/physicists lists, and
+                           per-machine field-size references (auto-created,
+                           not in git)
 ```
 
 ---

@@ -8,6 +8,67 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## 2026-07-01 — Remove phantom ring detection; improve void visibility
+
+### Removed
+- **Phantom ring detection**: deleted `measure_phantom_ring()`, its constants
+  (`RING_SEARCH_MIN_MM`, `RING_SEARCH_MAX_MM`, `RING_GAUSSIAN_SIGMA`,
+  `RING_RADIUS_NOMINAL_MM`), the `ring_info` field on image results, the
+  magenta dashed ring overlay on each portal panel, and the "Phantom Ring:"
+  status label/refresh logic in the bottom status bar. It was a secondary
+  sanity indicator (not a PASS/FAIL criterion) that cluttered the portal
+  images without adding QA value beyond the existing void/field detection.
+
+### Changed
+- **Portal image windowing (diagnostic figure)**: the 4 portal panels now
+  compute contrast windowing from a small ROI centred on the *detected void*
+  (± 5× void radius, 1st–97th percentile of that ROI) instead of the whole
+  field crop. Previously the void — a subtle local minimum riding on a much
+  larger field→background intensity range — was windowed into near-uniform
+  dark gray and effectively invisible. The new windowing saturates the field
+  edge/background to black/white but renders the void as a clearly visible
+  dark circle.
+
+---
+
+## 2026-07-01 — Settings dialog, split jaw tolerance, rebuilt trends, app rename
+
+### Added
+- **Settings dialog**: new "Settings" button opens a dialog with three tabs:
+  - **Machines** / **Physicists** — add/remove entries directly in the app
+    (`QListWidget` + Add/Remove buttons). Persisted to `wl_qa_config.json`;
+    the main window's dropdowns refresh live and keep the current selection.
+    At least one entry must remain in each list.
+  - **Field Size Reference** — manual numeric MLC/Jaw reference entry per
+    machine, supplementing the existing "Set Current as Reference" button
+    (which derives the reference from a live measurement instead).
+  - `MACHINES`/`PHYSICISTS` module constants are now only the factory
+    defaults used on first run; the app reads/writes
+    `config["machines"]`/`config["physicists"]` at runtime.
+
+### Changed
+- **Physical jaw field-size tolerance split from MLC**: jaw deviations now
+  warn at **0.6 mm** and fail at **0.8 mm** (`FIELD_SIZE_JAW_WARN_MM` /
+  `FIELD_SIZE_JAW_FAIL_MM`), independent of the existing MLC thresholds
+  (0.4 mm warn / 0.6 mm fail). Updated across the GUI (Field Size QA tab,
+  Results tab, PASS/WARN/FAIL banners) and the PDF report (banner, tables,
+  methodology notes). Individual leaf-span deviations continue to use the
+  MLC thresholds.
+- **View Trends rebuilt**: replaced the single fixed walk-circle-only chart
+  with a **machine picker → test picker → chart** flow. Pick a machine (only
+  machines with existing records are listed), then a test — Walk Circle
+  Radius, Field Size (MLC), or Field Size (Jaw) — and see that combination's
+  trend chart and history table, colour-coded with the same thresholds used
+  elsewhere in the app. "Change Test"/"Change Machine" buttons navigate back
+  without reopening the dialog.
+- **App renamed**: branding changed from "Winston-Lutz Daily QA" to
+  **"Daily QA - WL - DLG - Picket Fence"** across the window title, header
+  label, Settings/Trends dialog titles, and the PDF report title/footer
+  (centralized in a new `APP_NAME` constant). "Winston-Lutz"/"WL" is kept in
+  clinical/methodology text since that names the actual test, not the app.
+
+---
+
 ## 2026-06-30 — Picket Fence display polish and bug fixes
 
 ### Changed
