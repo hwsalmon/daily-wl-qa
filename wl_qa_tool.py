@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily Winston-Lutz QA Tool — Elekta Versa HD / Standard Imaging MIMI Phantom
+Daily QA - WL - DLG - Picket Fence — Elekta Versa HD / Standard Imaging MIMI Phantom
 
 Air void detection: the MIMI phantom uses a 6.4 mm diameter AIR VOID as the
 isocenter target. Air attenuates less than the surrounding acetal copolymer
@@ -28,7 +28,8 @@ try:
         QComboBox, QTabWidget, QFrame, QDialog, QScrollArea,
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
         QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
-        QHeaderView,
+        QHeaderView, QDoubleSpinBox, QListWidget, QListWidgetItem,
+        QLineEdit, QInputDialog, QStackedWidget,
     )
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush
@@ -107,8 +108,10 @@ VOID_AREA_MAX_RATIO = 4.0
 FIELD_SIZE_REF_MM   = 40.0                              # Nominal total field size (both axes)
 MLC_LEAVES_PER_BANK = 8                                 # Leaves per MLC bank
 MLC_LEAF_WIDTH_MM   = FIELD_SIZE_MM / MLC_LEAVES_PER_BANK  # 5.0 mm per leaf (SI)
-FIELD_SIZE_WARN_MM  = 0.4   # |deviation| > this → orange (warning)
-FIELD_SIZE_FAIL_MM  = 0.6   # |deviation| > this → red   (call service)
+FIELD_SIZE_WARN_MM  = 0.4   # MLC |deviation| > this → orange (warning)
+FIELD_SIZE_FAIL_MM  = 0.6   # MLC |deviation| > this → red   (call service)
+FIELD_SIZE_JAW_WARN_MM = 0.6   # Physical jaw |deviation| > this → orange (warning)
+FIELD_SIZE_JAW_FAIL_MM = 0.8   # Physical jaw |deviation| > this → red   (call service)
 
 # ── Phantom ring constants ─────────────────────────────────────────────────────
 # The MIMI phantom has an internal cylindrical feature whose shadow appears as a
@@ -123,6 +126,8 @@ RING_RADIUS_NOMINAL_MM = 22.0 # expected ring radius (mm at iso)
 
 MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
+
+APP_NAME = "Daily QA - WL - DLG - Picket Fence"
 
 MACHINES = [
     "Elekta VersaHD 153991",
@@ -1471,7 +1476,7 @@ class WLApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Winston-Lutz Daily QA  —  Elekta Versa HD / MIMI Phantom")
+        self.setWindowTitle(f"{APP_NAME}  —  Elekta Versa HD / MIMI Phantom")
         self.resize(1160, 860)
         self.setMinimumSize(960, 720)
 
@@ -1494,6 +1499,8 @@ class WLApp(QMainWindow):
         self._res_ref_labels: dict = {}
 
         self._config = _load_config()
+        self._machines   = list(self._config.get("machines", MACHINES))
+        self._physicists = list(self._config.get("physicists", PHYSICISTS))
         _init_db()
         self._build_ui()
         # Show saved calibration values (or first-use notice) immediately on startup
@@ -1513,7 +1520,7 @@ class WLApp(QMainWindow):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(0, 0, 0, 0)
 
-        title_lbl = QLabel("Winston-Lutz Daily QA")
+        title_lbl = QLabel(APP_NAME)
         title_lbl.setStyleSheet("font-size: 24px; font-weight: bold;")
         top_layout.addWidget(title_lbl)
         top_layout.addStretch()
@@ -1544,7 +1551,7 @@ class WLApp(QMainWindow):
         sel_layout.addWidget(machine_lbl)
 
         self._machine_combo = QComboBox()
-        self._machine_combo.addItems(MACHINES)
+        self._machine_combo.addItems(self._machines)
         self._machine_combo.setMinimumWidth(240)
         self._machine_combo.currentIndexChanged.connect(self._update_field_ref_labels)
         sel_layout.addWidget(self._machine_combo)
@@ -1555,10 +1562,15 @@ class WLApp(QMainWindow):
         sel_layout.addWidget(physicist_lbl)
 
         self._physicist_combo = QComboBox()
-        self._physicist_combo.addItems(PHYSICISTS)
+        self._physicist_combo.addItems(self._physicists)
         self._physicist_combo.setMinimumWidth(300)
         sel_layout.addWidget(self._physicist_combo)
         sel_layout.addStretch()
+
+        self._settings_btn = QPushButton("Settings")
+        self._settings_btn.setMinimumWidth(110)
+        self._settings_btn.clicked.connect(self._show_settings)
+        sel_layout.addWidget(self._settings_btn)
 
         main_layout.addWidget(sel_bar)
 
@@ -1701,7 +1713,8 @@ class WLApp(QMainWindow):
 
         ang_hdr_lbl2 = QLabel(
             f"Field Size per Gantry Angle   —   "
-            f"Warn >{FIELD_SIZE_WARN_MM:.1f} mm     Fail >{FIELD_SIZE_FAIL_MM:.1f} mm"
+            f"MLC: Warn >{FIELD_SIZE_WARN_MM:.1f} mm  Fail >{FIELD_SIZE_FAIL_MM:.1f} mm   —   "
+            f"Jaw: Warn >{FIELD_SIZE_JAW_WARN_MM:.1f} mm  Fail >{FIELD_SIZE_JAW_FAIL_MM:.1f} mm"
         )
         ang_hdr_lbl2.setStyleSheet("font-size: 11px; color: #666666;")
         fs_vbox.addWidget(ang_hdr_lbl2)
@@ -1922,9 +1935,9 @@ class WLApp(QMainWindow):
         ang_hdr_lbl = QLabel(
             "Field Size per Gantry Angle  "
             "— MLC leaves (Lat at G0°/G180°, AP at G90°/G270°)  "
+            f"[Warn >{FIELD_SIZE_WARN_MM:.1f} mm, Call Service >{FIELD_SIZE_FAIL_MM:.1f} mm]  "
             "— Jaw (always SI)  "
-            f"— Warning >{FIELD_SIZE_WARN_MM:.1f} mm  "
-            f"— Call Service >{FIELD_SIZE_FAIL_MM:.1f} mm"
+            f"[Warn >{FIELD_SIZE_JAW_WARN_MM:.1f} mm, Call Service >{FIELD_SIZE_JAW_FAIL_MM:.1f} mm]"
         )
         ang_hdr_lbl.setStyleSheet("font-size: 12px; color: #888888;")
         fs_layout.addWidget(ang_hdr_lbl)
@@ -2159,11 +2172,13 @@ class WLApp(QMainWindow):
 
         from PySide6.QtGui import QFont as _QFont
 
-        def _fs_level(dev: float) -> int:
-            """0=pass, 1=warn, 2=fail"""
+        def _fs_level(dev: float, kind: str = "mlc") -> int:
+            """0=pass, 1=warn, 2=fail. kind='jaw' uses the wider physical-jaw tolerance."""
             a = abs(dev)
-            if a <= FIELD_SIZE_WARN_MM:  return 0
-            if a <= FIELD_SIZE_FAIL_MM:  return 1
+            warn, fail = (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM) if kind == "jaw" \
+                else (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
+            if a <= warn:  return 0
+            if a <= fail:  return 1
             return 2
 
         _FS_COLORS = ["#66bb6a", "#ffd600", "#ef5350"]   # pass / warn(yellow) / fail(red)
@@ -2179,12 +2194,12 @@ class WLApp(QMainWindow):
 
         def _dfmt(v, ref):  return f"{v - ref:+.3f}" if v is not None else "—"
 
-        def _vcell_dev(v, ref):
+        def _vcell_dev(v, ref, kind: str = "mlc"):
             """Δ from reference cell — grey dash when reference not yet calibrated."""
             if not is_calibrated:
                 return _cell("—", "#555555")
             dev   = (v - ref) if v is not None else None
-            lvl   = _fs_level(dev) if dev is not None else -1
+            lvl   = _fs_level(dev, kind) if dev is not None else -1
             color = _FS_COLORS[lvl] if lvl >= 0 else "#888888"
             bold  = (lvl == 2)
             return _cell(_dfmt(v, ref), color, bold)
@@ -2201,16 +2216,16 @@ class WLApp(QMainWindow):
             mlc = fe.get("mlc_total_mm")
             jaw = fe.get("jaw_total_mm")
             self._fs_angle_table.setItem(ri, 1, _vcell_dev(mlc, ref_mlc))
-            self._fs_angle_table.setItem(ri, 2, _vcell_dev(jaw, ref_jaw))
+            self._fs_angle_table.setItem(ri, 2, _vcell_dev(jaw, ref_jaw, "jaw"))
             # Results tab: absolute + delta
             self._res_fs_angle_table.setItem(ri, 1, _cell_abs(mlc))
             self._res_fs_angle_table.setItem(ri, 2, _vcell_dev(mlc, ref_mlc))
             self._res_fs_angle_table.setItem(ri, 3, _cell_abs(jaw))
-            self._res_fs_angle_table.setItem(ri, 4, _vcell_dev(jaw, ref_jaw))
+            self._res_fs_angle_table.setItem(ri, 4, _vcell_dev(jaw, ref_jaw, "jaw"))
             if is_calibrated:
-                for v, ref in [(mlc, ref_mlc), (jaw, ref_jaw)]:
+                for v, ref, kind in [(mlc, ref_mlc, "mlc"), (jaw, ref_jaw, "jaw")]:
                     if v is not None:
-                        worst_lvl = max(worst_lvl, _fs_level(v - ref))
+                        worst_lvl = max(worst_lvl, _fs_level(v - ref, kind))
             if mlc is not None:
                 mlc_acc.append(mlc)
                 mlc_devs.append(mlc - ref_mlc)
@@ -2221,11 +2236,11 @@ class WLApp(QMainWindow):
         mean_mlc = float(np.mean(mlc_acc)) if mlc_acc else None
         mean_jaw = float(np.mean(jaw_acc)) if jaw_acc else None
         self._fs_angle_table.setItem(4, 1, _vcell_dev(mean_mlc, ref_mlc))
-        self._fs_angle_table.setItem(4, 2, _vcell_dev(mean_jaw, ref_jaw))
+        self._fs_angle_table.setItem(4, 2, _vcell_dev(mean_jaw, ref_jaw, "jaw"))
         self._res_fs_angle_table.setItem(4, 1, _cell_abs(mean_mlc))
         self._res_fs_angle_table.setItem(4, 2, _vcell_dev(mean_mlc, ref_mlc))
         self._res_fs_angle_table.setItem(4, 3, _cell_abs(mean_jaw))
-        self._res_fs_angle_table.setItem(4, 4, _vcell_dev(mean_jaw, ref_jaw))
+        self._res_fs_angle_table.setItem(4, 4, _vcell_dev(mean_jaw, ref_jaw, "jaw"))
 
         # Maximum deviation across angles (signed, worst absolute value)
         max_mlc_dev = max(mlc_devs, key=abs) if mlc_devs else None
@@ -2729,30 +2744,212 @@ class WLApp(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Report Error", str(exc))
 
-    def _show_trends(self):
-        """Open a dialog showing walk-circle-radius trend per machine."""
+    # ── Settings dialog ──────────────────────────────────────────────────────
+
+    def _show_settings(self):
+        """Open the Settings dialog: machines, physicists, manual field-size reference."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("Winston-Lutz Trend Analysis")
-        dlg.resize(1000, 700)
+        dlg.setWindowTitle(f"{APP_NAME} — Settings")
+        dlg.resize(560, 480)
         dlg_layout = QVBoxLayout(dlg)
 
+        tabs = QTabWidget()
+        dlg_layout.addWidget(tabs)
+
+        tabs.addTab(self._build_settings_list_tab("machines"), "Machines")
+        tabs.addTab(self._build_settings_list_tab("physicists"), "Physicists")
+        tabs.addTab(self._build_settings_refs_tab(), "Field Size Reference")
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        dlg_layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        dlg.exec()
+
+    def _build_settings_list_tab(self, kind: str) -> QWidget:
+        """kind is 'machines' or 'physicists' — a simple add/remove name list."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        source = self._machines if kind == "machines" else self._physicists
+        singular = "machine" if kind == "machines" else "physicist"
+
+        list_widget = QListWidget()
+        list_widget.addItems(source)
+        layout.addWidget(list_widget)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton(f"Add {singular.title()}")
+        remove_btn = QPushButton(f"Remove Selected")
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        def _add():
+            text, ok = QInputDialog.getText(
+                tab, f"Add {singular.title()}", f"{singular.title()} name:"
+            )
+            text = text.strip()
+            if not ok or not text:
+                return
+            if text in source:
+                QMessageBox.warning(tab, "Duplicate", f"'{text}' is already in the list.")
+                return
+            source.append(text)
+            list_widget.addItem(text)
+            self._save_machines_physicists()
+
+        def _remove():
+            item = list_widget.currentItem()
+            if item is None:
+                return
+            name = item.text()
+            if len(source) <= 1:
+                QMessageBox.warning(
+                    tab, "Cannot Remove", f"At least one {singular} must remain."
+                )
+                return
+            reply = QMessageBox.question(
+                tab, f"Remove {singular.title()}",
+                f"Remove '{name}' from the {singular} list?\n\n"
+                "Historical records already saved to the trend database are not affected.",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            source.remove(name)
+            list_widget.takeItem(list_widget.row(item))
+            self._save_machines_physicists()
+
+        add_btn.clicked.connect(_add)
+        remove_btn.clicked.connect(_remove)
+        return tab
+
+    def _save_machines_physicists(self):
+        """Persist the current machine/physicist lists and refresh the combo boxes."""
+        self._config["machines"]   = list(self._machines)
+        self._config["physicists"] = list(self._physicists)
+        _save_config(self._config)
+
+        cur_machine = self._machine_combo.currentText()
+        self._machine_combo.blockSignals(True)
+        self._machine_combo.clear()
+        self._machine_combo.addItems(self._machines)
+        if cur_machine in self._machines:
+            self._machine_combo.setCurrentText(cur_machine)
+        self._machine_combo.blockSignals(False)
+        self._update_field_ref_labels()
+
+        cur_physicist = self._physicist_combo.currentText()
+        self._physicist_combo.clear()
+        self._physicist_combo.addItems(self._physicists)
+        if cur_physicist in self._physicists:
+            self._physicist_combo.setCurrentText(cur_physicist)
+
+    def _build_settings_refs_tab(self) -> QWidget:
+        """Manual numeric entry of the MLC/Jaw field-size reference per machine."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        note = QLabel(
+            "Manually enter this machine's reference (baseline) field size, e.g. after a "
+            "physical calibration where the exact values are already known. This is an "
+            "alternative to 'Set Current as Reference' on the Field Size QA tab."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        layout.addWidget(note)
+
+        form = QHBoxLayout()
+        form.addWidget(QLabel("Machine:"))
+        machine_combo = QComboBox()
+        machine_combo.addItems(self._machines)
+        machine_combo.setCurrentText(self._machine_combo.currentText())
+        form.addWidget(machine_combo)
+        form.addStretch()
+        layout.addLayout(form)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("MLC reference (mm):"), 0, 0)
+        mlc_spin = QDoubleSpinBox()
+        mlc_spin.setRange(0.0, 200.0)
+        mlc_spin.setDecimals(3)
+        mlc_spin.setSingleStep(0.1)
+        grid.addWidget(mlc_spin, 0, 1)
+
+        grid.addWidget(QLabel("Jaw reference (mm):"), 1, 0)
+        jaw_spin = QDoubleSpinBox()
+        jaw_spin.setRange(0.0, 200.0)
+        jaw_spin.setDecimals(3)
+        jaw_spin.setSingleStep(0.1)
+        grid.addWidget(jaw_spin, 1, 1)
+        layout.addLayout(grid)
+
+        def _load_for_machine():
+            refs = self._get_field_refs(machine_combo.currentText())
+            mlc_spin.setValue(refs["mlc"])
+            jaw_spin.setValue(refs["jaw"])
+
+        _load_for_machine()
+        machine_combo.currentIndexChanged.connect(_load_for_machine)
+
+        save_btn = QPushButton("Save Reference")
+
+        def _save():
+            machine = machine_combo.currentText()
+            existing = self._config.get("field_refs", {}).get(machine, {})
+            new_ref = dict(existing)
+            new_ref["mlc"] = mlc_spin.value()
+            new_ref["jaw"] = jaw_spin.value()
+            new_ref.setdefault("leaf", mlc_spin.value())
+            if "field_refs" not in self._config:
+                self._config["field_refs"] = {}
+            self._config["field_refs"][machine] = new_ref
+            _save_config(self._config)
+            self._update_field_ref_labels()
+            self._refresh_field_size_display()
+            QMessageBox.information(
+                tab, "Reference Saved",
+                f"Field size reference for {machine} updated:\n"
+                f"MLC={new_ref['mlc']:.3f} mm,  Jaw={new_ref['jaw']:.3f} mm"
+            )
+
+        save_btn.clicked.connect(_save)
+        layout.addWidget(save_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch()
+        return tab
+
+    # ── Trend analysis (machine → test picker) ──────────────────────────────
+
+    _TREND_TESTS = [
+        ("walk", "Walk Circle Radius (WL)"),
+        ("mlc",  "Field Size — MLC"),
+        ("jaw",  "Field Size — Jaw"),
+    ]
+
+    def _trend_machines_with_data(self) -> list:
+        """Distinct machine names present in the trend DB, preferring configured order."""
         try:
             conn = sqlite3.connect(DB_PATH)
-            cur  = conn.cursor()
-            cur.execute(
-                "SELECT date, machine_name, walk_circle_r, pass_fail "
-                "FROM wl_records ORDER BY date ASC"
-            )
-            rows = cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT machine_name FROM wl_records")
+            db_machines = {r[0] for r in cur.fetchall()}
             conn.close()
-        except Exception as exc:
-            lbl = QLabel(f"Database error: {exc}")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            dlg_layout.addWidget(lbl)
-            dlg.exec()
-            return
+        except Exception:
+            db_machines = set()
+        ordered = [m for m in self._machines if m in db_machines]
+        ordered += sorted(db_machines - set(ordered))
+        return ordered
 
-        if not rows:
+    def _show_trends(self):
+        """Open the trend dialog: pick a machine, then an individual test to plot."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} — Trend Analysis")
+        dlg.resize(1050, 720)
+        dlg_layout = QVBoxLayout(dlg)
+
+        machines = self._trend_machines_with_data()
+        if not machines:
             lbl = QLabel(
                 "No records in database yet.\n"
                 "Generate a report to save the first record."
@@ -2763,75 +2960,126 @@ class WLApp(QMainWindow):
             dlg.exec()
             return
 
-        from collections import defaultdict
-        machine_data: dict = defaultdict(list)
-        for date_str, mname, walk_r, pf in rows:
-            machine_data[mname].append((date_str, walk_r, bool(pf)))
+        stack = QStackedWidget()
+        dlg_layout.addWidget(stack, stretch=1)
 
-        machine_colors = ["#64b5f6", "#81c784", "#ffb74d", "#f06292", "#ce93d8"]
+        state = {"machine": None, "test": None}
 
-        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#111111")
-        ax.set_facecolor("#1e1e1e")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#555555")
-        ax.set_xlabel("Date", color="white", fontsize=11)
-        ax.set_ylabel("Walk Circle Radius (mm)", color="white", fontsize=11)
-        ax.set_title(
-            "Winston-Lutz Walk Circle Radius — Trend by Machine",
-            color="white", fontsize=13, fontweight="bold",
+        machine_page = self._build_trend_machine_page(machines, stack, state)
+        stack.addWidget(machine_page)
+        stack.setCurrentWidget(machine_page)
+
+        dlg.exec()
+
+    def _build_trend_machine_page(self, machines: list, stack: QStackedWidget, state: dict) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        title = QLabel("Select a machine")
+        title.setStyleSheet("font-size: 17px; font-weight: bold;")
+        layout.addWidget(title)
+
+        list_widget = QListWidget()
+        list_widget.addItems(machines)
+        layout.addWidget(list_widget, stretch=1)
+
+        next_btn = QPushButton("Next  →")
+        next_btn.setEnabled(False)
+        layout.addWidget(next_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        list_widget.currentRowChanged.connect(lambda r: next_btn.setEnabled(r >= 0))
+        list_widget.itemDoubleClicked.connect(
+            lambda item: self._trend_go_to_test_page(item.text(), stack, state)
         )
+        next_btn.clicked.connect(
+            lambda: self._trend_go_to_test_page(list_widget.currentItem().text(), stack, state)
+        )
+        return page
 
-        ax.axhline(TOLERANCE_MM, color="#ef5350", linewidth=1.5, linestyle="--",
-                   label=f"Tolerance ≤ {TOLERANCE_MM:.1f} mm")
-        ax.axhline(0.5, color="#ffa726", linewidth=1.0, linestyle=":",
-                   label="0.5 mm advisory")
+    def _trend_go_to_test_page(self, machine: str, stack: QStackedWidget, state: dict):
+        state["machine"] = machine
+        old = state.get("test_page")
+        page = self._build_trend_test_page(machine, stack, state)
+        stack.addWidget(page)
+        stack.setCurrentWidget(page)
+        state["test_page"] = page
+        if old is not None:
+            stack.removeWidget(old)
+            old.deleteLater()
 
-        for idx, (mname, pts) in enumerate(sorted(machine_data.items())):
-            col    = machine_colors[idx % len(machine_colors)]
-            dates  = [p[0] for p in pts]
-            vals   = [p[1] for p in pts]
-            passes = [p[2] for p in pts]
-            ax.plot(dates, vals, color=col, linewidth=1.5, marker="o",
-                    markersize=6, label=mname)
-            for x, y, ok in zip(dates, vals, passes):
-                ax.scatter([x], [y], color="#66bb6a" if ok else "#ef5350",
-                           s=55, zorder=5, edgecolors=col, linewidths=1)
+    def _build_trend_test_page(self, machine: str, stack: QStackedWidget, state: dict) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
 
-        ax.legend(facecolor="#2b2b2b", edgecolor="#555555", labelcolor="white",
-                  fontsize=9, loc="upper left")
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8,
-                 color="white")
-        fig.tight_layout()
+        header = QHBoxLayout()
+        back_btn = QPushButton("←  Change Machine")
+        back_btn.clicked.connect(lambda: stack.setCurrentIndex(0))
+        header.addWidget(back_btn)
+        header.addStretch()
+        title = QLabel(f"{machine} — select a test")
+        title.setStyleSheet("font-size: 17px; font-weight: bold;")
+        header.addWidget(title)
+        header.addStretch()
+        layout.addLayout(header)
 
-        import io
-        buf = io.BytesIO()
-        fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight",
-                    facecolor="#111111")
-        plt.close(fig)
-        buf.seek(0)
+        list_widget = QListWidget()
+        list_widget.addItems([label for _, label in self._TREND_TESTS])
+        layout.addWidget(list_widget, stretch=1)
 
-        pixmap = QPixmap()
-        pixmap.loadFromData(buf.read())
+        next_btn = QPushButton("View Trend  →")
+        next_btn.setEnabled(False)
+        layout.addWidget(next_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        def _go(row: int):
+            if row < 0:
+                return
+            key = self._TREND_TESTS[row][0]
+            state["test"] = key
+            old = state.get("chart_page")
+            chart_page = self._build_trend_chart_page(machine, key, stack, state)
+            stack.addWidget(chart_page)
+            stack.setCurrentWidget(chart_page)
+            state["chart_page"] = chart_page
+            if old is not None:
+                stack.removeWidget(old)
+                old.deleteLater()
+
+        list_widget.currentRowChanged.connect(lambda r: next_btn.setEnabled(r >= 0))
+        list_widget.itemDoubleClicked.connect(lambda item: _go(list_widget.currentRow()))
+        next_btn.clicked.connect(lambda: _go(list_widget.currentRow()))
+        return page
+
+    def _build_trend_chart_page(self, machine: str, test_key: str, stack: QStackedWidget, state: dict) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        header = QHBoxLayout()
+        back_btn = QPushButton("←  Change Test")
+        back_btn.clicked.connect(lambda: stack.setCurrentWidget(state["test_page"]))
+        header.addWidget(back_btn)
+        change_machine_btn = QPushButton("Change Machine")
+        change_machine_btn.clicked.connect(lambda: stack.setCurrentIndex(0))
+        header.addWidget(change_machine_btn)
+        header.addStretch()
+        layout.addLayout(header)
+
+        test_label = dict(self._TREND_TESTS)[test_key]
+        rows, table_rows = self._fetch_trend_rows(machine, test_key)
+
+        if not rows:
+            lbl = QLabel(f"No '{test_label}' records yet for {machine}.")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size: 14px; color: #aaaaaa;")
+            layout.addWidget(lbl, stretch=1)
+            return page
+
+        pixmap = self._render_trend_chart(machine, test_key, test_label, rows)
         chart_label = QLabel()
         chart_label.setPixmap(pixmap)
         chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dlg_layout.addWidget(chart_label, stretch=1)
+        layout.addWidget(chart_label, stretch=1)
 
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur  = conn.cursor()
-            cur.execute(
-                "SELECT date, machine_name, physicist_name, walk_circle_r, pass_fail "
-                "FROM wl_records ORDER BY date DESC"
-            )
-            all_rows = cur.fetchall()
-            conn.close()
-        except Exception:
-            all_rows = []
-
-        hdrs = ["Date", "Machine", "Physicist", "Walk r (mm)", "Result"]
-        table = QTableWidget(len(all_rows), len(hdrs))
+        hdrs = table_rows[0]
+        table = QTableWidget(len(table_rows) - 1, len(hdrs))
         table.setHorizontalHeaderLabels(hdrs)
         table.setMaximumHeight(200)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -2839,21 +3087,125 @@ class WLApp(QMainWindow):
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.verticalHeader().setVisible(False)
 
-        for ri, row in enumerate(all_rows):
-            date_s, mname, phys, walk_r, pf = row
-            vals_disp = [date_s, mname, phys, f"{walk_r:.3f}",
-                         "PASS" if pf else "FAIL"]
-            for c, val in enumerate(vals_disp):
-                item = QTableWidgetItem(val)
+        for ri, row in enumerate(table_rows[1:]):
+            for ci, val in enumerate(row[:-1]):
+                item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c == 4:
-                    item.setForeground(
-                        QBrush(QColor("#66bb6a" if pf else "#ef5350"))
-                    )
-                table.setItem(ri, c, item)
+                if ci == len(row) - 2:
+                    item.setForeground(QBrush(QColor(row[-1])))
+                table.setItem(ri, ci, item)
 
-        dlg_layout.addWidget(table)
-        dlg.exec()
+        layout.addWidget(table)
+        return page
+
+    def _fetch_trend_rows(self, machine: str, test_key: str):
+        """Return (plot_rows, table_rows) for the given machine/test.
+
+        plot_rows: list of (date_str, value, level) where level is 0/1/2 (pass/warn/fail).
+        table_rows: [header, *rows] where each row's last element is a display colour hex.
+        """
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            if test_key == "walk":
+                cur.execute(
+                    "SELECT date, physicist_name, walk_circle_r, pass_fail FROM wl_records "
+                    "WHERE machine_name=? ORDER BY date ASC", (machine,)
+                )
+                raw = cur.fetchall()
+            else:
+                col = "avg_mlc_mm" if test_key == "mlc" else "avg_jaw_mm"
+                cur.execute(
+                    f"SELECT date, physicist_name, {col} FROM wl_records "
+                    f"WHERE machine_name=? AND {col} IS NOT NULL ORDER BY date ASC", (machine,)
+                )
+                raw = cur.fetchall()
+            conn.close()
+        except Exception:
+            raw = []
+
+        plot_rows, table_rows = [], []
+        _GRN, _AMB, _RED = "#66bb6a", "#ffa726", "#ef5350"
+
+        if test_key == "walk":
+            table_rows.append(["Date", "Physicist", "Walk r (mm)", "Result"])
+            for date_s, phys, walk_r, pf in raw:
+                level = 0 if pf else 2
+                plot_rows.append((date_s, walk_r, level))
+                table_rows.append([date_s, phys, f"{walk_r:.3f}",
+                                    "PASS" if pf else "FAIL", _GRN if pf else _RED])
+        else:
+            refs = self._get_field_refs(machine)
+            ref = refs["mlc"] if test_key == "mlc" else refs["jaw"]
+            warn, fail = (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM) if test_key == "mlc" \
+                else (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
+            label = "MLC" if test_key == "mlc" else "Jaw"
+            table_rows.append(["Date", "Physicist", f"{label} (mm)", f"Δ {label} (mm)", "Result"])
+            for date_s, phys, val in raw:
+                dev = val - ref
+                a = abs(dev)
+                level = 0 if a <= warn else (1 if a <= fail else 2)
+                result = ["PASS", "WARNING", "FAIL"][level]
+                color = [_GRN, _AMB, _RED][level]
+                plot_rows.append((date_s, dev, level))
+                table_rows.append([date_s, phys, f"{val:.3f}", f"{dev:+.3f}", result, color])
+
+        return plot_rows, table_rows
+
+    def _render_trend_chart(self, machine: str, test_key: str, test_label: str, rows: list) -> QPixmap:
+        _GRN, _AMB, _RED = "#66bb6a", "#ffa726", "#ef5350"
+        level_color = [_GRN, _AMB, _RED]
+
+        fig, ax = plt.subplots(figsize=(11, 5.5), facecolor="#111111")
+        ax.set_facecolor("#1e1e1e")
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555555")
+        ax.set_xlabel("Date", color="white", fontsize=11)
+
+        dates = [r[0] for r in rows]
+        vals  = [r[1] for r in rows]
+        colors_pts = [level_color[r[2]] for r in rows]
+
+        if test_key == "walk":
+            ax.set_ylabel("Walk Circle Radius (mm)", color="white", fontsize=11)
+            ax.axhline(TOLERANCE_MM, color=_RED, linewidth=1.5, linestyle="--",
+                       label=f"Tolerance ≤ {TOLERANCE_MM:.1f} mm")
+            ax.plot(dates, vals, color="#64b5f6", linewidth=1.5, marker="o",
+                    markersize=6, zorder=3)
+        else:
+            label = "MLC" if test_key == "mlc" else "Jaw"
+            warn, fail = (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM) if test_key == "mlc" \
+                else (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
+            ax.set_ylabel(f"Δ {label} from Reference (mm)", color="white", fontsize=11)
+            ax.axhline(0, color="#888888", linewidth=1.0, linestyle="-", zorder=1)
+            ax.axhline(-warn, color=_AMB, linewidth=1.2, linestyle="--", zorder=1)
+            ax.axhline(-fail, color=_RED, linewidth=1.2, linestyle="--", zorder=1)
+            ax.axhline(warn, color=_AMB, linewidth=1.2, linestyle="--", zorder=1,
+                       label=f"Warn |Δ| > {warn:.1f} mm")
+            ax.axhline(fail, color=_RED, linewidth=1.2, linestyle="--", zorder=1,
+                       label=f"Fail |Δ| > {fail:.1f} mm")
+            ax.plot(dates, vals, color="#64b5f6", linewidth=1.5, marker="o",
+                    markersize=6, zorder=3)
+
+        ax.scatter(dates, vals, color=colors_pts, s=60, zorder=5,
+                   edgecolors="#64b5f6", linewidths=1)
+        ax.set_title(f"{test_label} — Trend for {machine}",
+                     color="white", fontsize=13, fontweight="bold")
+        ax.legend(facecolor="#2b2b2b", edgecolor="#555555", labelcolor="white",
+                  fontsize=9, loc="upper left")
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8, color="white")
+        fig.tight_layout()
+
+        import io
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight", facecolor="#111111")
+        plt.close(fig)
+        buf.seek(0)
+
+        pixmap = QPixmap()
+        pixmap.loadFromData(buf.read())
+        return pixmap
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -3028,7 +3380,7 @@ def generate_pdf_report(
     story = []
 
     # ── Header ────────────────────────────────────────────────────────────────
-    story.append(Paragraph("Daily Winston-Lutz QA Report", title_style))
+    story.append(Paragraph(f"{APP_NAME} Report", title_style))
     story.append(Paragraph(f"{machine_name}  —  {PHANTOM_NAME}", sub_style))
     story.append(HRFlowable(width="100%", thickness=1, color=_BORDER, spaceAfter=8))
 
@@ -3083,10 +3435,12 @@ def generate_pdf_report(
     _ref_jaw_b  = _frefs_b.get("jaw",  FIELD_SIZE_REF_MM)
     _fs_calibrated = bool(_frefs_b)
 
-    def _fs_lvl(dev):
+    def _fs_lvl(dev, kind="mlc"):
         a = abs(dev)
-        if a <= FIELD_SIZE_WARN_MM: return 0
-        if a <= FIELD_SIZE_FAIL_MM: return 1
+        warn, fail = (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM) if kind == "jaw" \
+            else (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
+        if a <= warn: return 0
+        if a <= fail: return 1
         return 2
 
     _mlc_devs_b, _jaw_devs_b = [], []
@@ -3101,8 +3455,10 @@ def generate_pdf_report(
     _max_jaw_dev = max(_jaw_devs_b, key=abs) if _jaw_devs_b else None
     _fs_worst = 0
     if _fs_calibrated:
-        for _d in _mlc_devs_b + _jaw_devs_b:
-            _fs_worst = max(_fs_worst, _fs_lvl(_d))
+        for _d in _mlc_devs_b:
+            _fs_worst = max(_fs_worst, _fs_lvl(_d, "mlc"))
+        for _d in _jaw_devs_b:
+            _fs_worst = max(_fs_worst, _fs_lvl(_d, "jaw"))
 
     def _dsign(v): return f"{v:+.3f}" if v is not None else "—"
 
@@ -3278,8 +3634,10 @@ def generate_pdf_report(
     story.append(Paragraph(
         f"Baselines (post Jun 19 2026):  MLC = {ref_mlc:.3f} mm  ·  "
         f"Jaw = {ref_jaw:.3f} mm  ·  Leaf span = {ref_leaf:.3f} mm.  "
-        f"Action levels:  warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm  ·  "
+        f"Action levels — MLC:  warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm  ·  "
         f"call service |Δ| > {FIELD_SIZE_FAIL_MM:.1f} mm.  "
+        f"Jaw:  warn |Δ| > {FIELD_SIZE_JAW_WARN_MM:.1f} mm  ·  "
+        f"call service |Δ| > {FIELD_SIZE_JAW_FAIL_MM:.1f} mm.  "
         "Edges detected at 50%-penumbra crossing of column/row-averaged profiles (SAD/SID = 0.625).",
         _ref_note_style,
     ))
@@ -3288,10 +3646,12 @@ def generate_pdf_report(
     _RED2 = colors.HexColor("#b71c1c")
     _GRN2 = colors.HexColor("#2e7d32")
 
-    def _fcc(v, ref):
+    def _fcc(v, ref, kind="mlc"):
         if v is None: return colors.HexColor("#888888")
         d = abs(v - ref)
-        return _GRN2 if d <= FIELD_SIZE_WARN_MM else (_YEL2 if d <= FIELD_SIZE_FAIL_MM else _RED2)
+        warn, fail = (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM) if kind == "jaw" \
+            else (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
+        return _GRN2 if d <= warn else (_YEL2 if d <= fail else _RED2)
 
     def _ffmt(v):       return f"{v:.3f}" if v is not None else "—"
     def _fdfmt(v, ref): return f"{v - ref:+.3f}" if v is not None else "—"
@@ -3338,9 +3698,9 @@ def generate_pdf_report(
         fe_row  = image_results.get(ang, {}).get("field_edges", {}) if ang is not None else {}
         mlcv    = fe_row.get("mlc_total_mm") if fe_row else mean_mlc
         jawv    = fe_row.get("jaw_total_mm") if fe_row else mean_jaw
-        for ci, v, ref in [(1, mlcv, ref_mlc), (2, mlcv, ref_mlc),
-                           (3, jawv, ref_jaw),  (4, jawv, ref_jaw)]:
-            fs_cmds.append(("TEXTCOLOR", (ci, row_idx), (ci, row_idx), _fcc(v, ref)))
+        for ci, v, ref, kind in [(1, mlcv, ref_mlc, "mlc"), (2, mlcv, ref_mlc, "mlc"),
+                                 (3, jawv, ref_jaw, "jaw"),  (4, jawv, ref_jaw, "jaw")]:
+            fs_cmds.append(("TEXTCOLOR", (ci, row_idx), (ci, row_idx), _fcc(v, ref, kind)))
     fs_tbl.setStyle(TableStyle(fs_cmds))
 
     # Leaf span table (G000°), 3.0 in wide
@@ -3412,8 +3772,10 @@ def generate_pdf_report(
         "Total field size = separation between opposing edges at isocenter (SAD/SID = 0.625).  "
         f"Individual MLC leaf spans measured on G000° using {MLC_LEAVES_PER_BANK} leaf pairs "
         f"× {MLC_LEAF_WIDTH_MM:.0f} mm SI pitch.  "
-        f"Action levels: warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm; "
-        f"call service |Δ| > {FIELD_SIZE_FAIL_MM:.1f} mm (institutional protocol).  "
+        f"Action levels — MLC: warn |Δ| > {FIELD_SIZE_WARN_MM:.1f} mm, "
+        f"call service |Δ| > {FIELD_SIZE_FAIL_MM:.1f} mm.  "
+        f"Physical jaw: warn |Δ| > {FIELD_SIZE_JAW_WARN_MM:.1f} mm, "
+        f"call service |Δ| > {FIELD_SIZE_JAW_FAIL_MM:.1f} mm (institutional protocol).  "
         "Results recorded to SQLite trend database.",
         note_style,
     ))
@@ -3596,7 +3958,7 @@ def generate_pdf_report(
     story.append(sig_tbl)
     story.append(Spacer(1, 0.06 * inch))
     story.append(Paragraph(
-        "This report was generated electronically by the Winston-Lutz QA Tool.  "
+        f"This report was generated electronically by the {APP_NAME} Tool.  "
         f"The physicist named above ({physicist_name}) reviewed and approved the results "
         f"for the study performed on {study_dt.strftime('%B %d, %Y at %H:%M:%S')}.  "
         "This electronic signature is consistent with 21 CFR Part 11 intent for "
@@ -3609,7 +3971,7 @@ def generate_pdf_report(
     story.append(Spacer(1, 0.12 * inch))
     story.append(HRFlowable(width="100%", thickness=0.5, color=_BORDER, spaceAfter=4))
     story.append(Paragraph(
-        f"Winston-Lutz QA Tool v1.0  —  "
+        f"{APP_NAME} v1.0  —  "
         f"Study Date {study_dt.strftime('%Y-%m-%d %H:%M:%S')}  —  "
         f"{machine_name}  /  {PHANTOM_NAME}",
         footer_style,
