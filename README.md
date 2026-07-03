@@ -24,7 +24,7 @@ algorithm, and generates a signed PDF QA report — in seconds.
 | **Machine detection** | Auto-selects machine from DICOM `PatientID` tag |
 | **Settings** | In-app dialog to add/remove machines and physicists, and manually enter field-size references |
 | **Report date** | Always uses DICOM `StudyDate`/`StudyTime` — never today's date |
-| **Picket Fence QA** | MLC leaf position accuracy — auto-detected or manually loaded |
+| **Picket Fence QA** | MLC leaf position accuracy — auto-detected from the same DICOM import as WL/field size |
 | **Output** | 3–4 page PDF report + SQLite trend database |
 | **Batch processing** | `batch_generate_reports.py` — all sessions, all machines |
 | **Platforms** | Linux · Windows · macOS |
@@ -137,7 +137,9 @@ DICOM tag — no manual selection needed for the three configured Versa HD units
   dark circle rather than being lost against the field's overall brightness.
 
 ### 4. Generate report
-Click **Generate Daily Report (PDF)**.
+Click **Generate Daily Report (PDF)**. The save dialog remembers the last
+folder you saved to — separately per machine, so switching between machines
+doesn't lose each one's preferred save location.
 
 The report is a consistent **3-page layout**:
 
@@ -164,14 +166,18 @@ Each report generation automatically saves a record to `wl_qa_history.db`.
 
 ### 5. Picket Fence QA (optional — performed weekly or as scheduled)
 
-If a PF DICOM is present in the same directory as the WL images, it is
-auto-detected and analysed automatically.  To load PF data from a separate
-folder, click **Load Picket Fence**.
+There is no separate load step. Just drop the PF DICOM in the **same daily
+folder** as the four WL images and click **Load DICOM Directory** as usual —
+the app scans every file in that folder (recursively, so it doesn't matter
+whether iViewGT nested it in its own subfolder like the WL images), detects
+the PF image by its DICOM header, and analyses it automatically.
 
 The **Picket Fence** tab shows:
 - A portal image with a per-leaf measurement overlay
 - A horizontal bar chart of per-leaf centre deviations (green / orange / red)
-- Summary stats: N leaves, Max |Δ|, RMS, average measured width
+- Summary stats: N leaves, Max |Δ|, RMS, average measured width (averaged
+  over the central ±5 cm of the picket only, to avoid the wider end-of-field
+  penumbra skewing the number)
 
 A third PASS/FAIL banner (green/red/amber) appears alongside the WL and Field
 Size banners only on days when PF data is loaded.
@@ -184,10 +190,8 @@ Size banners only on days when PF data is loaded.
 | Warning | 0.4 – 0.5 mm | Amber |
 | Fail | ≥ ±0.5 mm | Red |
 
-When the Picket Fence DICOM is placed in the **same directory** as the four WL
-images it is automatically excluded from the WL and field-size analysis (the
-`GantryAngle = 0°` of the PF image would otherwise displace the real G0 WL
-image).
+The PF image is automatically excluded from the WL and field-size analysis
+(its `GantryAngle ≈ 0°` would otherwise displace the real G0 WL image).
 
 When the PDF report is generated on a PF day, it includes an extra page with
 the PF results between the Field Size and Portal Images pages (4 pages total),

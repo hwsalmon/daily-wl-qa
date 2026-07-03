@@ -8,6 +8,34 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## 2026-07-03 — Single-import Picket Fence loading, per-machine report paths, PF avg_width fix
+
+### Changed
+- **Single DICOM import for WL, field size, and Picket Fence**: removed the
+  separate **Load Picket Fence** button and its `_load_pf_directory` handler.
+  `Load DICOM Directory` is now the only import path — drop the PF DICOM in
+  the same daily folder as the 4 WL images and it's picked up automatically.
+  Fixed the underlying bug that made this unreliable: the PF auto-detect scan
+  only checked the top level of the selected folder (`Path.iterdir()`), while
+  real iViewGT exports nest every RTIMAGE (including a co-located PF image)
+  in its own UID-named subfolder. Both the main auto-detect loop and the
+  (now-removed) manual loader's scan now recurse (`Path.rglob("*")`),
+  matching how `load_dicom_images()` already scanned for the WL images.
+- **PDF save location remembered per machine**: the "Save Daily QA Report"
+  dialog now opens to `config["last_report_dir_by_machine"][machine]` instead
+  of one shared `last_report_dir`, so different machines' reports can live in
+  different folders without each save overwriting the other's default
+  location. Falls back to the previous shared path (then home) for a machine
+  with no saved history yet.
+- **Picket Fence `avg_width` restricted to central ±5 cm**: the average
+  measured leaf width shown in the PF stats card and PDF report (new
+  `pf_avg_width_central_mm()` helper, `PF_AVG_WIDTH_HALF_RANGE_MM = 50.0`)
+  now excludes leaves near the ends of the 200 mm picket, where MV beam
+  penumbra widens the 50%-threshold width measurement and previously skewed
+  the reported average.
+
+---
+
 ## 2026-07-01 — Remove phantom ring detection; improve void visibility
 
 ### Removed
