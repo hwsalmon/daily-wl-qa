@@ -177,10 +177,13 @@ Phantom: 1 cm MLC gap at G0°, EPID at SID = 1600 mm, central 80 Agility leaves
 
 ### PF detection & loading
 
-- **Auto-detected**: on `Load DICOM Directory`, every file in the folder is tested
-  with `identify_pf_dicom()`. The first PF file found is analysed automatically.
-- **Manual load**: `Load Picket Fence` button opens a separate directory picker
-  (for clinics that store PF images in a different folder).
+There is a single import path: `Load DICOM Directory`. Every file under the
+selected directory is scanned recursively (`rglob`, not just the top level —
+iViewGT exports nest each RTIMAGE in its own UID-named subfolder) and tested
+with `identify_pf_dicom()`. The first PF file found is analysed automatically
+and excluded from the WL/field-size gantry-angle matching. There is no
+separate "Load Picket Fence" button — drop the PF DICOM in the same daily
+folder as the 4 WL images and it is picked up in the same load.
 
 ### PF analysis algorithm
 
@@ -324,6 +327,7 @@ The GUI renders it via `QPixmap.loadFromData()` (PySide6).
 | `PF_WARN_MM` | 0.4 | PF WARNING threshold per leaf (mm) |
 | `PF_LEAF_WIDTH_MM` | 5.0 | Agility inner leaf width at isocenter (mm) |
 | `PF_LEAVES_TOTAL` | 80 | Total leaves tested (40 per bank) |
+| `PF_AVG_WIDTH_HALF_RANGE_MM` | 50.0 | `avg_width` stat: only leaves within ± this range of field centre |
 
 ## File layout
 
@@ -358,8 +362,9 @@ PicketFence/               — PF sample DICOM (not committed — clinical data)
 - SQLite trend database with a machine-picker → test-picker → chart flow
   (Walk Circle, Field Size MLC, Field Size Jaw)
 - Batch report generator (`batch_generate_reports.py`)
-- Picket Fence QA tab: auto-detect or manual load, per-leaf deviation analysis,
-  portal image + deviation chart figure, PASS/FAIL/warning banner
+- Picket Fence QA tab: auto-detected from the single `Load DICOM Directory`
+  import (no separate load button), per-leaf deviation analysis, portal
+  image + deviation chart figure, PASS/FAIL/warning banner
 - PF page in PDF (inserted between Field Size and Portal Images pages)
 - PF result row in electronic signature block
 - PF DICOM excluded from WL/field-size analysis when co-located in same folder
@@ -378,9 +383,14 @@ PicketFence/               — PF sample DICOM (not committed — clinical data)
 - Bending magnet thermal drift on 153991 produced elevated Lat walk on Jun 22/23/29;
   these are real physics failures (beam steering), not phantom setup errors.
   The phantom is CBCT-corrected before acquisition and cannot move between shots.
-- `avg_width` reported in the PF stats card is the measured 50%-penumbra radiation
-  width (~12 mm), which is wider than the 10 mm nominal geometric gap due to MV
-  beam penumbra; this is expected and does not affect the deviation metric.
+- `avg_width` reported in the PF stats card (`pf_avg_width_central_mm()`) is the
+  measured 50%-penumbra radiation width (~12 mm), averaged only over leaves
+  within `PF_AVG_WIDTH_HALF_RANGE_MM` (±50 mm) of field centre — leaves near
+  the ends of the 200 mm picket sit closer to the longitudinal field edge,
+  where penumbra widens the measurement, so they're excluded to keep the stat
+  representative of the central, unconfounded picket body. It is wider than
+  the 10 mm nominal geometric gap due to MV beam penumbra; this is expected
+  and does not affect the deviation metric.
 
 ### Pending / future ideas
 - PF trend database (store per-day max deviation and RMS per machine)

@@ -142,6 +142,7 @@ PF_TOLERANCE_MM  = 0.5   # Per-leaf centre deviation FAIL threshold (mm)
 PF_WARN_MM       = 0.4   # Per-leaf centre deviation WARNING threshold (mm)
 PF_LEAF_WIDTH_MM = 5.0   # Agility inner MLC leaf width at isocenter (mm)
 PF_LEAVES_TOTAL  = 80    # Central leaves tested: 40 per bank
+PF_AVG_WIDTH_HALF_RANGE_MM = 50.0  # avg_width stat: central +/- range only (excludes end penumbra)
 
 DB_PATH     = Path(__file__).parent / "wl_qa_history.db"
 CONFIG_PATH = Path(__file__).parent / "wl_qa_config.json"
@@ -1167,6 +1168,25 @@ def analyze_picket_fence(ds) -> dict:
     }
 
 
+def pf_avg_width_central_mm(pf_results: dict,
+                             half_range_mm: float = PF_AVG_WIDTH_HALF_RANGE_MM) -> float:
+    """
+    Mean measured leaf width over leaves within +/- half_range_mm of field
+    centre only. Leaves near the ends of the 200 mm picket sit closer to the
+    longitudinal field edge, where MV penumbra widens the 50%-threshold
+    measurement — excluding them keeps avg_width representative of the
+    central, unconfounded picket body.
+    """
+    widths = pf_results["leaf_widths_mm"]
+    y      = pf_results["leaf_y_mm"]
+    if len(widths) == 0:
+        return 0.0
+    mask = np.abs(y) <= half_range_mm
+    if not mask.any():
+        mask = np.ones_like(widths, dtype=bool)
+    return float(np.mean(widths[mask]))
+
+
 def generate_pf_figure(pf_results: dict) -> str | None:
     """Two-panel diagnostic figure: portal image (left) + leaf deviation chart (right)."""
     try:
@@ -1436,11 +1456,6 @@ class WLApp(QMainWindow):
         self._load_btn.setMinimumWidth(210)
         self._load_btn.clicked.connect(self._load_directory)
         top_layout.addWidget(self._load_btn)
-
-        self._pf_load_btn = QPushButton("Load Picket Fence")
-        self._pf_load_btn.setMinimumWidth(170)
-        self._pf_load_btn.clicked.connect(self._load_pf_directory)
-        top_layout.addWidget(self._pf_load_btn)
 
         main_layout.addWidget(top_bar)
 
@@ -2349,51 +2364,6 @@ class WLApp(QMainWindow):
                 "font-size: 25px; font-weight: bold; color: #f44336; background: transparent;"
             )
 
-    def _load_pf_directory(self):
-        """Load a picket fence DICOM from a directory or single file."""
-        path = QFileDialog.getExistingDirectory(
-            self,
-            "Select Picket Fence DICOM Directory",
-            self._config.get("last_dicom_dir", str(Path.home())),
-        )
-        if not path:
-            return
-        try:
-            found = False
-            for candidate in sorted(Path(path).rglob("*")):
-                if not candidate.is_file():
-                    continue
-                try:
-                    ds_pf = pydicom.dcmread(str(candidate), force=True)
-                    if identify_pf_dicom(ds_pf):
-                        self._pf_results  = analyze_picket_fence(ds_pf)
-                        self._pf_fig_path = generate_pf_figure(self._pf_results)
-                        found = True
-                        break
-                except Exception:
-                    pass
-            if not found:
-                # Try loading every file as a PF image regardless of label
-                for candidate in sorted(Path(path).rglob("*")):
-                    if not candidate.is_file():
-                        continue
-                    try:
-                        ds_pf = pydicom.dcmread(str(candidate), force=True)
-                        if getattr(ds_pf, "Modality", "") == "RTIMAGE":
-                            self._pf_results  = analyze_picket_fence(ds_pf)
-                            self._pf_fig_path = generate_pf_figure(self._pf_results)
-                            found = True
-                            break
-                    except Exception:
-                        pass
-            if not found:
-                QMessageBox.warning(self, "Picket Fence",
-                                    "No RTIMAGE DICOM found in that directory.")
-                return
-            self._refresh_pf_display()
-        except Exception as exc:
-            QMessageBox.critical(self, "Picket Fence Error", str(exc))
-
     def _refresh_pf_display(self):
         """Update PF banner, stats card, and figure tab from self._pf_results."""
         if self._pf_results is None:
@@ -2411,7 +2381,7 @@ class WLApp(QMainWindow):
         maxd  = pf["max_deviation_mm"]
         rms   = pf["rms_deviation_mm"]
         n     = pf["n_leaves"]
-        avg_w = float(np.mean(pf["leaf_widths_mm"])) if len(pf["leaf_widths_mm"]) else 0.0
+        avg_w = pf_avg_width_central_mm(pf)
 
         # Banner
         self._pf_frame_picket.setVisible(True)
@@ -3660,8 +3630,7 @@ def generate_pdf_report(
         pf_maxd = pf_results["max_deviation_mm"]
         pf_rms  = pf_results["rms_deviation_mm"]
         pf_n    = pf_results["n_leaves"]
-        pf_avgw = float(np.mean(pf_results["leaf_widths_mm"])) \
-                  if len(pf_results["leaf_widths_mm"]) else 0.0
+        pf_avgw = pf_avg_width_central_mm(pf_results)
         pf_col  = "#1a3d1e" if pf_ok else "#3d1a1a"
         pf_tcol = colors.HexColor("#66bb6a" if pf_ok else "#ef5350")
 
