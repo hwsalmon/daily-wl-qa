@@ -2321,10 +2321,12 @@ class WLApp(QMainWindow):
             self._diag_fig_path = generate_diagnostic_figure(image_results, wl_results)
             self._walk_fig_path = generate_walk_circle_figure(wl_results)
 
-            # Auto-detect picket fence image in the same directory
+            # Auto-detect picket fence image anywhere under the directory (iViewGT
+            # exports nest each RTIMAGE in its own UID-named subfolder, so a
+            # top-level-only scan would miss a co-located PF image)
             self._pf_results  = None
             self._pf_fig_path = None
-            for _pf_path in sorted(Path(directory).iterdir()):
+            for _pf_path in sorted(Path(directory).rglob("*")):
                 if not _pf_path.is_file():
                     continue
                 try:
@@ -2358,7 +2360,7 @@ class WLApp(QMainWindow):
             return
         try:
             found = False
-            for candidate in sorted(Path(path).iterdir()):
+            for candidate in sorted(Path(path).rglob("*")):
                 if not candidate.is_file():
                     continue
                 try:
@@ -2372,7 +2374,7 @@ class WLApp(QMainWindow):
                     pass
             if not found:
                 # Try loading every file as a PF image regardless of label
-                for candidate in sorted(Path(path).iterdir()):
+                for candidate in sorted(Path(path).rglob("*")):
                     if not candidate.is_file():
                         continue
                     try:
@@ -2581,9 +2583,9 @@ class WLApp(QMainWindow):
 
         _fn_date = self._dicom_date.strftime("%Y%m%d") if self._dicom_date else "UNKNOWN"
         default_name = f"WL_QA_{machine.replace(' ', '_')}_{_fn_date}.pdf"
-        initial_path = str(
-            Path(self._config.get("last_report_dir", str(Path.home()))) / default_name
-        )
+        last_dirs = self._config.setdefault("last_report_dir_by_machine", {})
+        last_dir = last_dirs.get(machine, self._config.get("last_report_dir", str(Path.home())))
+        initial_path = str(Path(last_dir) / default_name)
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Daily QA Report",
@@ -2592,6 +2594,7 @@ class WLApp(QMainWindow):
         )
         if not save_path:
             return
+        last_dirs[machine] = str(Path(save_path).parent)
         self._config["last_report_dir"] = str(Path(save_path).parent)
         _save_config(self._config)
 
