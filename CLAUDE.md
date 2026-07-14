@@ -163,13 +163,17 @@ seeded at the old pair-mean values, so it is mathematically guaranteed to
 match or reduce (never inflate) the reported walk versus the old method — the
 same rationale as the minimax BB-position fit in the sibling WL analyzer app
 (`wl_correction.py`), adapted here for Elekta iViewGT's no-gantry-flip portal
-convention. Validated against 53 real clinical WL sessions in
+convention. Validated against 62 real clinical WL sessions in
 `WL Test Data/` and `Test Data/`: minimax matched or improved every session
-(never worse, as guaranteed), with the old pair-mean already within 0.0004 mm
-of optimal in every case and zero PASS/FAIL flips — this app's fixed
+(never worse, as guaranteed) and zero PASS/FAIL flips. Most sessions are
+well within 0.0004 mm of the old pair-mean's result — this app's fixed
 4-cardinal/no-couch-rotation geometry rarely produces a configuration where
 the pair means diverge much from the joint optimum, unlike the sibling app's
-more general multi-view/couch-rotation case.
+more general multi-view/couch-rotation case — but one grossly out-of-tolerance
+session (~7.6 mm raw walk, itself a hardware/setup problem, not representative
+of normal daily QA) showed a real 0.11 mm reduction (7.66 mm → 7.55 mm),
+confirming the pair-mean is not always optimal when the underlying data is
+less symmetric.
 
 **PASS: walk circle radius ≤ 1.0 mm** (`TOLERANCE_MM` constant).
 

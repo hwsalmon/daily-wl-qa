@@ -13,10 +13,13 @@ All notable changes to the Daily WL QA Tool are documented here.
   Minimum Enclosing Circle radius, seeded at the old pair-mean values, so it
   is guaranteed to match or reduce (never inflate) the reported walk circle
   radius. SI baseline remains a plain mean (proven translation-invariant to
-  the MEC radius). Validated against 53 real clinical WL sessions: minimax
-  matched or improved every session, with the old method already within
-  0.0004 mm of optimal in each case and zero PASS/FAIL flips. See CLAUDE.md
-  "Walk circle metric" section for the full rationale.
+  the MEC radius). Validated against 62 real clinical WL sessions: minimax
+  matched or improved every session with zero PASS/FAIL flips; most sessions
+  were within 0.0004 mm of the old method, and one grossly out-of-tolerance
+  session (~7.6 mm raw walk, a hardware/setup problem, not normal daily QA
+  data) showed a real 0.11 mm reduction, confirming the pair-mean is not
+  always optimal. See CLAUDE.md "Walk circle metric" section for the full
+  rationale.
 
 ---
 
