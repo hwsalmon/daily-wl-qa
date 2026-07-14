@@ -137,17 +137,39 @@ Portal Y is always SI because the gantry rotation axis is the patient's SI axis.
 ## Walk circle metric (PASS/FAIL)
 
 The residual CBCT setup error is decomposed into 3D patient coordinates using all
-four gantry angles:
+four gantry angles. SI is a plain mean (it shifts all four points identically, so
+it cannot change the walk radius — see below). Lateral and AP are found via a
+**minimax (Chebyshev) fit**, `_fit_minimax_setup()`, not a plain mean:
 
 ```
-Lateral  = (ΔX_G0  + ΔX_G180) / 2
-SI       = (ΔY_G0  + ΔY_G90 + ΔY_G180 + ΔY_G270) / 4
-AP       = (ΔX_G90 + ΔX_G270) / 2
+SI       = (ΔY_G0 + ΔY_G90 + ΔY_G180 + ΔY_G270) / 4
+Lateral, AP  = argmin over (setup_x, setup_z) of the resulting MEC radius,
+               seeded at the pair means (ΔX_G0+ΔX_G180)/2 and (ΔX_G90+ΔX_G270)/2
 ```
 
 Subtracting the angle-appropriate component from each raw displacement yields
 per-angle mechanical walk residuals. The **Minimum Enclosing Circle (MEC)** of
 the four corrected walk vectors gives the walk circle metric.
+
+**Why minimax instead of the pair mean:** SI's simple mean is provably optimal
+(translation-invariant to MEC radius, proven in `_fit_minimax_setup()`
+docstring), but Lateral/AP each only shift one pair of points (G0/G180 or
+G90/G270), so independently symmetrizing each pair — the old per-axis mean —
+is one feasible baseline choice, not necessarily the one that minimizes the
+final MEC radius, since the binding pair/triple of the enclosing circle can
+cross between the two axis pairs. `_fit_minimax_setup()` runs a 2-parameter
+Nelder-Mead (`scipy.optimize.minimize`) directly against the exact MEC radius,
+seeded at the old pair-mean values, so it is mathematically guaranteed to
+match or reduce (never inflate) the reported walk versus the old method — the
+same rationale as the minimax BB-position fit in the sibling WL analyzer app
+(`wl_correction.py`), adapted here for Elekta iViewGT's no-gantry-flip portal
+convention. Validated against 53 real clinical WL sessions in
+`WL Test Data/` and `Test Data/`: minimax matched or improved every session
+(never worse, as guaranteed), with the old pair-mean already within 0.0004 mm
+of optimal in every case and zero PASS/FAIL flips — this app's fixed
+4-cardinal/no-couch-rotation geometry rarely produces a configuration where
+the pair means diverge much from the joint optimum, unlike the sibling app's
+more general multi-view/couch-rotation case.
 
 **PASS: walk circle radius ≤ 1.0 mm** (`TOLERANCE_MM` constant).
 

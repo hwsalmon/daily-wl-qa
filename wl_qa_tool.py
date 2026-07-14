@@ -48,6 +48,7 @@ except ImportError:
 
 try:
     from scipy.ndimage import gaussian_filter, gaussian_filter1d, label as scipy_label, sum as ndimage_sum
+    from scipy.optimize import minimize as _scipy_minimize
 except ImportError:
     _missing.append("scipy")
 
@@ -663,6 +664,60 @@ def _minimum_enclosing_circle(points):
     return best
 
 
+def _fit_minimax_setup(dx: dict, dy: dict) -> tuple[float, float, float]:
+    """
+    Minimax (Chebyshev) fit for the lateral/AP setup baseline (setup_x, setup_z)
+    that minimizes the worst-case walk-circle radius across all four cardinal
+    views, instead of computing each axis pair's simple mean independently.
+
+    setup_y (SI) is left as the plain mean: it shifts all four residual points
+    by the same amount, and the Minimum Enclosing Circle radius is translation
+    invariant, so no choice of setup_y can change the reported walk radius —
+    the mean remains the best physically-meaningful centroid estimate for it.
+
+    setup_x and setup_z are different: each only shifts its own pair of points
+    (G0/G180 or G90/G270), so independently symmetrizing each pair (the old
+    per-axis mean) is *one* feasible choice of baseline but not necessarily the
+    one that minimizes the final MEC radius, since the binding pair/triple of
+    the enclosing circle can cross between the two axis pairs. Jointly
+    optimizing (setup_x, setup_z) against the exact MEC radius can only match
+    or reduce the reported walk — never inflate it — because the old pair-mean
+    values are used as the optimizer's starting point. This mirrors the
+    minimax BB-position fit validated in the sibling WL analyzer application
+    (see wl_correction.py): least-squares-style averaging can increase the
+    worst-case residual even while improving the average, which is the wrong
+    objective for a max-based metric like isocenter walk.
+    """
+    def corrected_pts(setup_x, setup_z, setup_y):
+        return [
+            (dx[0]   - setup_x, dy[0]   - setup_y),
+            (dx[90]  - setup_z, dy[90]  - setup_y),
+            (dx[180] - setup_x, dy[180] - setup_y),
+            (dx[270] - setup_z, dy[270] - setup_y),
+        ]
+
+    setup_y = (dy[0] + dy[90] + dy[180] + dy[270]) / 4
+
+    def objective(params):
+        setup_x, setup_z = params
+        _, _, r = _minimum_enclosing_circle(corrected_pts(setup_x, setup_z, setup_y))
+        return r
+
+    x0 = np.array([(dx[0] + dx[180]) / 2, (dx[90] + dx[270]) / 2])
+    result = _scipy_minimize(
+        objective, x0, method="Nelder-Mead",
+        options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 2000},
+    )
+    setup_x, setup_z = result.x
+
+    # Guard against a rare Nelder-Mead non-improvement: never do worse than
+    # the pair-mean starting point.
+    if objective((setup_x, setup_z)) > objective(tuple(x0)) + 1e-9:
+        setup_x, setup_z = x0
+
+    return float(setup_x), float(setup_y), float(setup_z)
+
+
 def compute_wl_results(
     image_results: dict,
     dx_key: str = "dx_mm",
@@ -678,10 +733,10 @@ def compute_wl_results(
         G90° / G270°  portal-X = patient AP (A/P)
         All angles    portal-Y = patient SI (S/I)
 
-    3D CBCT residual setup error is therefore:
-        Lateral = mean(ΔX_G0, ΔX_G180)
-        SI      = mean(ΔY_G0, ΔY_G90, ΔY_G180, ΔY_G270)
-        AP      = mean(ΔX_G90, ΔX_G270)
+    The lateral/AP setup baseline (setup_x, setup_z) is found via a minimax
+    fit that directly minimizes the resulting walk-circle (MEC) radius —
+    see `_fit_minimax_setup()` — rather than the independent per-axis mean.
+    SI (setup_y) remains the plain mean since it cannot affect the MEC radius.
 
     Subtracting the angle-appropriate component from each raw displacement yields
     pure mechanical walk residuals.  The Minimum Enclosing Circle of the four
@@ -693,9 +748,7 @@ def compute_wl_results(
     dx = {a: image_results[a][dx_key] for a in GANTRY_ANGLES}
     dy = {a: image_results[a][dy_key] for a in GANTRY_ANGLES}
 
-    setup_x = (dx[0]  + dx[180]) / 2                               # patient lateral (mm)
-    setup_y = (dy[0]  + dy[90] + dy[180] + dy[270]) / 4            # patient SI (mm)
-    setup_z = (dx[90] + dx[270]) / 2                               # patient AP (mm)
+    setup_x, setup_y, setup_z = _fit_minimax_setup(dx, dy)
 
     per_angle = {}
     for angle in GANTRY_ANGLES:

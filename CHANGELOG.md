@@ -6,6 +6,18 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Walk circle Lateral/AP baseline now uses a minimax (Chebyshev) fit**
+  instead of an independent per-axis-pair mean. `_fit_minimax_setup()` runs a
+  2-parameter Nelder-Mead (`scipy.optimize`) directly against the exact
+  Minimum Enclosing Circle radius, seeded at the old pair-mean values, so it
+  is guaranteed to match or reduce (never inflate) the reported walk circle
+  radius. SI baseline remains a plain mean (proven translation-invariant to
+  the MEC radius). Validated against 53 real clinical WL sessions: minimax
+  matched or improved every session, with the old method already within
+  0.0004 mm of optimal in each case and zero PASS/FAIL flips. See CLAUDE.md
+  "Walk circle metric" section for the full rationale.
+
 ---
 
 ## 2026-07-03 — Single-import Picket Fence loading, per-machine report paths, PF avg_width fix
