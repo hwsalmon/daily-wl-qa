@@ -17,7 +17,7 @@ jobs:
         with: { python-version: "3.12" }
       - name: Qt runtime libraries (offscreen)
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libglib2.0-0
-      - run: pip install -c deploy/constraints.txt -r requirements.txt pytest
+      - run: pip install -c deploy/constraints.txt -r requirements.txt pytest pymupdf
       - run: QT_QPA_PLATFORM=offscreen python -m pytest tests -q
 
   portable:

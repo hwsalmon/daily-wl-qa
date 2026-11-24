@@ -211,7 +211,8 @@ def test_periods_and_records(tmp_path):
 
 @pytest.mark.parametrize("kind", ["day", "week", "month"])
 def test_reports_build_as_pdf_draft_and_signed(tmp_path, kind):
-    import daily_reports as dr, fitz
+    fitz = pytest.importorskip("fitz")
+    import daily_reports as dr
     _history_db(tmp_path / "h.db")
     a, b = dr.period(kind, dt.date(2026, 6, 10))
     recs = dr.records_between(tmp_path / "h.db", "M", a, b)
