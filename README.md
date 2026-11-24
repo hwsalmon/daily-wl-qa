@@ -12,15 +12,14 @@ for Elekta Versa HD LINACs** using the Standard Imaging MIMI Phantom
 
 Loads four Elekta iViewGT portal DICOM images (G0 / G90 / G180 / G270),
 automatically detects the MIMI phantom air void in each image, computes the
-**radiation/mechanical walk circle** via the Minimum Enclosing Circle (MEC)
-algorithm, and generates a signed PDF QA report — in seconds.
+**isocenter walk** (the smallest sphere touching the four beam axes; its radius is the maximum displacement of any beam from the isocenter), and generates a signed PDF QA report — in seconds.
 
 | Feature | Detail |
 |---------|--------|
 | **Input** | Elekta iViewGT RTIMAGE DICOM files (4 cardinal angles) |
 | **Phantom** | Standard Imaging MIMI — 6.4 mm air void |
-| **Algorithm** | MEC of all 4 corrected walk residuals |
-| **Pass/Fail** | Walk circle radius ≤ 1.0 mm; MLC field size ±0.4/0.6 mm warn/fail; jaw field size ±0.6/0.8 mm warn/fail |
+| **Algorithm** | Exact smallest-sphere fit of the 4 gantry views (panel fixed to the gantry; offset flips sign at opposite angles) |
+| **Pass/Fail** | Maximum displacement from the isocenter ≤ 1.0 mm (TG-198 / MPPG, SRS); MLC field size ±0.4/0.6 mm warn/fail; jaw field size ±0.6/0.8 mm warn/fail |
 | **Machine detection** | Auto-selects machine from DICOM `PatientID` tag |
 | **Settings** | In-app dialog to add/remove machines and physicists, and manually enter field-size references |
 | **Report date** | Always uses DICOM `StudyDate`/`StudyTime` — never today's date |
@@ -114,6 +113,11 @@ python  wl_qa_tool.py          # Windows (if Python is on your PATH)
 
 ### 1. Select machine and physicist
 Use the dropdowns at the top of the window before loading data.
+
+### 1b. Optional: read straight from the EPID folder
+Settings > **Data Folders**: set each machine's EPID image folder (and, optionally, its machine-log folder). Then **Check EPID Folder** searches it for Daily WL
+sessions that have not been processed yet and opens them; **Load DICOM Directory** still works for manual imports. With a log folder the field centres are
+corrected for the aperture the machine log reports (checkbox *Use machine log*); without logs nothing changes.
 
 ### 2. Load DICOM directory
 Click **Load DICOM Directory** and select the folder containing the four
@@ -297,7 +301,7 @@ four residual vectors is the walk circle metric.
 
 ### Pass/Fail criteria
 
-- **Walk circle radius** ≤ **1.0 mm** (`TOLERANCE_MM`).
+- **Maximum displacement of any beam from the isocenter** (the walk circle radius after the static phantom offset is removed) ≤ **1.0 mm** (`TOLERANCE_MM`, the TG-198 / MPPG limit for SRS; all three linacs are used for SRS). The sphere diameter is not graded.
 - **Field size — MLC**: warn > 0.4 mm, fail > 0.6 mm deviation from reference
   (`FIELD_SIZE_WARN_MM` / `FIELD_SIZE_FAIL_MM`).
 - **Field size — physical jaw**: warn > 0.6 mm, fail > 0.8 mm deviation from
@@ -355,3 +359,17 @@ site-specific QA records.
 
 For clinical and research use at Franciscan Health Indianapolis.  
 Contact: Howard W. Salmon, PhD, DABR — howard.w.salmon@gmail.com
+
+
+## Native iView exports
+Besides DICOM RTIMAGE, the app reads the native Elekta iView export (`img_<uid>` folders with a lossless JPEG and `_Frame.xml`). The images have no patient id,
+label or pixel spacing: the machine is taken from the machine-log file names (or the machine selected), the WL and picket-fence images are recognised from their
+shape, and the panel pitch is 0.4 mm at SID 1600 mm (0.25 mm at isocenter). Put the `.rllf` logs in the same folder, or set the machine's log folder, to use the
+log correction.
+
+
+## Importing many sessions and trend analysis
+*Check EPID Folder > Import all new sessions* analyses every new complete session on the machine's EPID folder (for example the whole network share since June 2026) and saves its records without
+opening each one. It can be cancelled and resumed, never analyses a session twice, reports sessions it cannot trust (no phantom, void not found, images missing) instead of saving them, and works
+with or without machine logs. *Trends* then shows, per machine: the isocenter radius and its drift, jaw size, MLC size, and the picket fence (maximum, RMS, worst leaf, tilt, and whether the same leaf is
+repeatedly the worst), with step changes marked.

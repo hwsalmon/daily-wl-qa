@@ -114,68 +114,70 @@ the picket appears as a bright stripe on a dark background.
 
 ## Void detection algorithm (WL)
 
-1. Gaussian pre-filter (σ = void\_radius\_px × 0.30) — suppresses MV portal noise.
-2. Locate the global minimum pixel within the central 50% of the field (10 mm radius).
-3. Sub-pixel centroid using inverse-intensity-squared weighting in a local window.
+1. Coarse start: Gaussian pre-filter, global minimum in the central 50 % of the field (`_find_void_minimum`). On its own this is pulled toward the
+   beam-profile centre (the 'bowl'), by roughly 20 % of the offset in a known-offset test, so it is only the start.
+2. `fit_void`: least squares over a ±16 mm window of `pixel = polynomial background (order 4) − depth × profile(|x − centre|)`. The radial profile
+   (`_VOID_PROFILE`) is the empirical shadow measured on 280 real images (wider than 6.4 mm: scatter and blur). Order 4 gave the lowest day-to-day scatter
+   (0.149 mm vs 0.205 for the old method; orders 5-6 overfit).
+3. Quality: the fit is trusted only when depth is 600-4000 counts, depth/residual ≥ 1 and it moved ≤ 6 mm from the start; otherwise the coarse minimum is
+   used and the GUI shows "void not found reliably at G…" (`void_fit` in `analyze_image`).
+
+## Field edge algorithm (WL and field size)
+
+Strips 9-16 mm either side of the field centre (clear of the void), each edge thresholded at 50 % between its own outside level (7-12 mm out) and the
+plateau just inside (4-9 mm). The old threshold used the middle of the whole-image profile - a dip - and read the 40 mm field as ~43 mm. Now 40.6-40.7 mm
+at the header pixel spacing. The header spacing (0.405 mm) looks about 1.2 % high: the leaf pitch comes out 5.06 mm instead of 5.0, and 0.400 mm
+(the panel's real pitch) would make the field 40.1-40.2 mm. Not applied; decide per machine before changing it (it scales PF and field-size results).
 
 SAD/SID magnification correction: `spacing_iso = spacing_det × (SAD / SID)`.
 For the Elekta Versa HD: SAD = 1000 mm, SID = 1600 mm → scale factor = 0.625.
 
 ## Portal coordinate system (critical)
 
-Elekta iViewGT stores portal images with **consistent patient orientation** at all
-gantry angles (no image flip at opposing angles). The portal-plane axes map to
-patient space as follows:
+The Elekta iViewGT panel is **fixed to the gantry**, so a static phantom offset b = (X lateral, Y SI, Z AP) appears in the portal image as
+`u = X cos G + Z sin G`, `v = Y`:
 
-| Gantry | Portal X | Portal Y |
-|--------|----------|----------|
-| G0° / G180° | Patient **Lateral** (L/R) | Patient **SI** (S/I) |
-| G90° / G270° | Patient **AP** (A/P) | Patient **SI** (S/I) |
+| Gantry | Portal X (u) | Portal Y (v) |
+|--------|--------------|--------------|
+| G0°    | +X (lateral) | Y (SI) |
+| G90°   | +Z (AP)      | Y (SI) |
+| G180°  | **−X** (lateral) | Y (SI) |
+| G270°  | **−Z** (AP)  | Y (SI) |
 
-Portal Y is always SI because the gantry rotation axis is the patient's SI axis.
+The offset therefore has **opposite signs at opposite gantry angles**. (An earlier version assumed "consistent patient orientation, no flip" and
+subtracted the same lateral/AP offset at G0/G180 and at G90/G270; that leaves the set-up error in the result. On 66 stored sessions the G0 and G180
+x-offsets are negatively correlated, r = −0.65, and a static offset under this model leaves 0.30 mm rms against 0.57 mm for the old assumption. A
+controlled phantom-shift check is still worth doing.)
 
-## Walk circle metric (PASS/FAIL)
+## Walk metric (PASS/FAIL) — isocenter DIAMETER
 
-The residual CBCT setup error is decomposed into 3D patient coordinates using all
-four gantry angles. SI is a plain mean (it shifts all four points identically, so
-it cannot change the walk radius — see below). Lateral and AP are found via a
-**minimax (Chebyshev) fit**, `_fit_minimax_setup()`, not a plain mean:
+`_fit_minimax_setup()` finds the static offset (X, Y, Z) that minimises the largest remaining residual over the four gantry angles: the centre of the
+smallest **sphere** touching the four beam axes (pylinac's "gantry 3D isocenter" definition). It is solved exactly (SLSQP on the epigraph form from
+several starts; among equal minimisers the smallest offset, so the result is reproducible). The largest residual is the walk **radius**
+(`walk_circle_r`, stored in the database). Since 2026-11-24 the reported walk is that radius: `max_2d_walk_mm = walk_circle_r` = the maximum displacement of any beam
+from the isocenter; `walk_diameter_mm = 2 × radius` is information only.
 
-```
-SI       = (ΔY_G0 + ΔY_G90 + ΔY_G180 + ΔY_G270) / 4
-Lateral, AP  = argmin over (setup_x, setup_z) of the resulting MEC radius,
-               seeded at the pair means (ΔX_G0+ΔX_G180)/2 and (ΔX_G90+ΔX_G270)/2
-```
+**PASS: maximum displacement ≤ 1.0 mm** (`TOLERANCE_MM`; TG-198 / MPPG, SRS; the drawn tolerance ring has radius `TOLERANCE_MM`). Per-angle residuals are coloured
+against `TOLERANCE_MM / 2` and `TOLERANCE_MM`. (Before 2026-11-24 the graded value was the diameter against 1.0 mm, which failed almost every session.)
 
-Subtracting the angle-appropriate component from each raw displacement yields
-per-angle mechanical walk residuals. The **Minimum Enclosing Circle (MEC)** of
-the four corrected walk vectors gives the walk circle metric.
+**Known data feature:** on all 66 stored sessions (three machines) the SI offset at G0 is about +0.56 mm and at G180 about −0.61 mm (difference 1.17 mm,
+std 0.18 mm; all three field-centre methods agree). No static offset can remove it, so it sets the sphere diameter (median 1.27 mm), i.e. a displacement of about 0.6 mm. The monthly
+Winston-Lutz analysis of the same machines gives 1.1–1.6 mm diameters.
 
-**Why minimax instead of the pair mean:** SI's simple mean is provably optimal
-(translation-invariant to MEC radius, proven in `_fit_minimax_setup()`
-docstring), but Lateral/AP each only shift one pair of points (G0/G180 or
-G90/G270), so independently symmetrizing each pair — the old per-axis mean —
-is one feasible baseline choice, not necessarily the one that minimizes the
-final MEC radius, since the binding pair/triple of the enclosing circle can
-cross between the two axis pairs. `_fit_minimax_setup()` runs a 2-parameter
-Nelder-Mead (`scipy.optimize.minimize`) directly against the exact MEC radius,
-seeded at the old pair-mean values, so it is mathematically guaranteed to
-match or reduce (never inflate) the reported walk versus the old method — the
-same rationale as the minimax BB-position fit in the sibling WL analyzer app
-(`wl_correction.py`), adapted here for Elekta iViewGT's no-gantry-flip portal
-convention. Validated against 62 real clinical WL sessions in
-`WL Test Data/` and `Test Data/`: minimax matched or improved every session
-(never worse, as guaranteed) and zero PASS/FAIL flips. Most sessions are
-well within 0.0004 mm of the old pair-mean's result — this app's fixed
-4-cardinal/no-couch-rotation geometry rarely produces a configuration where
-the pair means diverge much from the joint optimum, unlike the sibling app's
-more general multi-view/couch-rotation case — but one grossly out-of-tolerance
-session (~7.6 mm raw walk, itself a hardware/setup problem, not representative
-of normal daily QA) showed a real 0.11 mm reduction (7.66 mm → 7.55 mm),
-confirming the pair-mean is not always optimal when the underlying data is
-less symmetric.
+## EPID folder and machine logs (optional)
 
-**PASS: walk circle radius ≤ 1.0 mm** (`TOLERANCE_MM` constant).
+**Settings > Data Folders** holds, per machine, the EPID image folder and an optional machine-log folder (`config["machine_folders"][machine]`).
+**Check EPID Folder** (top bar) searches the selected machine's folder recursively (`wl_sources.scan_epid_folder`): it reads DICOM headers only (cached in
+`epid_scan_cache.json`), takes the images whose `RTImageLabel` is `WL<n>` (Picket Fence images are excluded), groups them into sessions per `PatientID`
+(machine) with no gap of 45 min or more, keeps the latest image per cardinal gantry angle, and attaches that day's PF image. Sessions whose images are all
+in the `epid_processed` table (SOPInstanceUIDs, written when a report is saved, or when you press *Set aside*) are not offered again. One new complete
+session opens directly; several open a list with a quick result for each. An opened session is copied to a temporary folder and goes through the same
+path as **Load DICOM Directory** (which is unchanged), so the PDF / history save works as before. A manual import of the same images also marks them processed.
+
+**Machine log** (`wl_sources.py`, `rllf_parser.py`): `.rllf` delivery logs in the log folder are paired with each image by gantry angle and time (the imager
+clock is normally a few minutes ahead; learned from the pairs). The log gives the aperture the collimator actually had; the field centre is moved by
+(actual − set centre of the MLC / jaws) before the walk is computed. The *Use machine log* checkbox switches it off. Without a log folder, with no
+matching log, or with a log that cannot be read, the analysis uses the images as measured and says so ("machine log: ...").
 
 ## Field Size QA thresholds
 
@@ -341,7 +343,7 @@ The GUI renders it via `QPixmap.loadFromData()` (PySide6).
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `APP_NAME` | "Daily QA - WL - DLG - Picket Fence" | App branding — window title, header, dialogs, PDF |
-| `TOLERANCE_MM` | 1.0 | WL PASS/FAIL threshold (mm) |
+| `TOLERANCE_MM` | 1.0 | WL PASS/FAIL threshold: maximum displacement from the isocenter (mm) |
 | `VOID_DIAMETER_MM` | 6.4 | MIMI air void diameter (mm) |
 | `FIELD_SIZE_MM` | 40.0 | Nominal WL field size (mm) |
 | `VOID_SEARCH_HALF_FIELD_FRACTION` | 0.50 | Search radius = 50% of field half-width |
@@ -422,3 +424,11 @@ PicketFence/               — PF sample DICOM (not committed — clinical data)
 - PF trend database (store per-day max deviation and RMS per machine)
 - PF trend chart in the View Trends window
 - Multi-picket fence support (if the department acquires multi-picket images)
+
+
+## Native iView export (`iview_native.py`)
+`NativeDS` imitates the pydicom dataset the analysis reads (GantryAngle, RTImageLabel, PatientID, dates, SOPInstanceUID, pixel_array, 0.4 mm / SAD 1000 / SID 1600), so
+`analyze_image` / `analyze_picket_fence` are unchanged. `measure()` classifies an image: `wl` = 36-46 mm square field with a dip (the monthly BB field is 30 mm), `pf` = a
+strip >= 170 mm long and <= 30 mm wide (collimator slits are 11-14 cm long), else `other`. `wl_qa_tool.read_image(path)` returns a NativeDS for a folder. The decoder is a
+copy of RadCalc's `ljpeg.py` (about 1 s per image); classifications are cached in `native_scan_cache.json`.
+`LogIndex.match` picks the clock offset (either sign) that lines up the most images with a log of the same gantry angle.

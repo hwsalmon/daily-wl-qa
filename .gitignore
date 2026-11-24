@@ -7,3 +7,8 @@ python_runtime/
 Test Data/
 WL Test Data/
 PicketFence/
+epid_scan_cache.json
+epid_log_cache.json
+native_scan_cache.json
+Wl V2 June 2026/
+*.db.bak-*

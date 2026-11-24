@@ -4,6 +4,69 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## v2.0.0 - 2026-11-24
+
+### Added - bulk import and new trend analysis (2026-11-24)
+- **Import all new sessions** (Check EPID Folder > list): analyses and saves every new complete session (Winston-Lutz record, field sizes, picket fence) without opening each one. One session at
+  a time and each in its own try/except, so a bad session is reported and the run goes on; cancelable; resumable (saved sessions are registered and never analysed twice); image arrays are dropped as
+  soon as a session is analysed; the log folder is read once per run. A session is saved only when it is complete and the void was found reliably at every angle; the others are listed with the reason
+  (also written to `daily_import.log`) and left for review. Works with no logs, an empty or unreadable log folder, or logs that do not match: the session is then analysed without a log.
+- **Trend analysis** (`daily_trends.py`) for each machine: (1) radiation isocenter radius and its drift (straight-line slope in mm / 30 days with its p-value, recent-vs-baseline median, raw SI
+  offset at each gantry angle); (2) jaw size and (3) MLC size against the reference with the same statistics; (4) picket fence maximum and RMS leaf error, the worst leaf of every session, the
+  end-to-end tilt of the leaf errors, and whether the SAME leaf is repeatedly the worst (binomial test corrected for picking the commonest of 40 leaves; per-leaf mean error in standard errors).
+  Step changes (a calibration, a repair) are found and marked on the plots; lines are not drawn across gaps of more than 21 days. A drift is called only when it is statistically firm AND larger
+  than 0.10 mm (isocenter), 0.15 mm (field size) or 0.05 mm (picket fence) per 90 days.
+- Picket-fence results are now stored (`pf_records`, with every leaf's deviation) when a report is generated or a session is imported; `rebuild_history.py` fills them from the images (23 records on
+  2026-11-24). The old trend dialog (dates as text on the x axis) is replaced.
+- What the real data showed (2026-06 to 2026-11, 71 sessions): no isocenter drift on any machine (slopes within +/-0.012 mm / 30 days, all p > 0.1); on 2026-06-17/18 the MLC size (and on
+  VersaTwo the jaw size) of all three machines stepped by +1.1 to +1.8 mm together (a common cause, most likely the test field, not the machines); the picket-fence leaf errors tilt by 0.2-0.3 mm along the
+  picket on every machine (so an END leaf is always 'worst'); with the tilt removed no leaf repeats.
+
+### Changed - grading basis (2026-11-24)
+- **PASS/FAIL is the maximum displacement of any beam from the isocenter (the walk radius) against 1.0 mm** (TG-198 / MPPG: < 1 mm for SRS; all three linacs are used for SRS),
+  not the sphere diameter. The diameter test failed 66 of the 71 stored sessions (1.0-1.6 mm diameters are the normal gantry sag of these machines); on the displacement basis
+  all 71 pass (largest 0.82 mm). `max_2d_walk_mm` is now the radius (`walk_diameter_mm` stays as information), the tolerance ring is drawn at radius 1.0 mm, the per-angle
+  colours use 0.5 / 1.0 mm, the trend plots the displacement, and the stored `pass_fail` of every record was re-derived from `walk_circle_r`
+  (old file kept as `wl_qa_history.db.bak-before-displacement-20261124`). Change `TOLERANCE_MM` to change the limit (1.5 for SBRT, 2.0 general).
+
+### Fixed (review 2026-11-24)
+- A folder that failed to load (empty, wrong files) left the PREVIOUS session's results on screen under the new folder's name with the report button enabled, so they could be
+  reported or saved as the new session. The results are now cleared and the button disabled.
+- With two images at one gantry angle in a folder (a repeated delivery), the one analysed depended on the order the files were listed in; it is now the later by acquisition time
+  (as the native-export path already did). The folder listing was also quadratic in the number of files.
+- A folder holding several sessions (the `Daily WL V2 07012026` test folder has six: three machines, two days) was analysed as a mixture of whichever images were listed last. Images are now grouped into sessions
+  (a different patient id or a pause of 30 minutes) and the newest session with all four angles is analysed; the folder label says so ("newest of 6 sessions in the folder").
+- Generating the report twice for one session saved two records (two trend points); a record for the same machine and time is now replaced.
+
+### Added
+- **Native Elekta iView export** (`img_<uid>` folders with a lossless JPEG and `_Frame.xml`, no DICOM): read by `iview_native.py` for both *Load DICOM Directory* and
+  *Check EPID Folder*. The images carry no patient id (taken from the log file names when logs are in the folder), no label (the WL and picket-fence images are
+  recognised from their shape: 40 x 40 mm field with the void, one 20 cm picket) and no pixel spacing (0.4 mm at the panel = 0.25 mm at isocenter, which reads the
+  40 mm field as 40.0 mm). Logs delivered in the imported folder are used when the machine has no log folder or nothing matches there.
+- Log matching accepts the imager clock behind the machine's as well as ahead (it was +4.5 min one day, -7.7 min another).
+- **Check EPID Folder**: per-machine EPID image folder (Settings > Data Folders). The button searches it for Daily WL sessions not processed yet and opens them
+  (several: a list with a quick result for each; *Set aside* hides one). Manual "Load DICOM Directory" is unchanged.
+- **Optional machine logs**: per-machine log folder; `.rllf` logs are paired with the images and the field centres corrected for the aperture the collimator
+  actually had. Works without logs; *Use machine log* checkbox. The result and PDF state whether a log was used.
+
+### Fixed
+- **A saved record carried the time it was SAVED, not the time the images were acquired**, so trend dates moved whenever a session was saved later (30 of the 45 old records
+  were stamped by a batch run). `_save_to_db` now takes the acquisition time (the PDF already did).
+- **`rebuild_history.py`** rebuilds the history database from the images (every complete session under `WL Test Data` / `Test Data`, current methods, logs when present,
+  acquisition date and time). Run on 2026-11-23: 71 sessions replaced the 45 old records (old file kept as `wl_qa_history.db.bak-before-rebuild-20261123`).
+- **Field-edge detection**: edges come from strips clear of the void, thresholded against the local plateau; the 40 mm field now reads 40.6-40.7 mm (was ~43).
+- **Void detection**: least-squares fit of the void shadow on a polynomial background replaces the minimum/centroid estimate, which was pulled toward the
+  beam centre. A weak or missing void is flagged in the GUI instead of being measured silently.
+- **Walk calculation used the wrong sign convention.** The panel turns with the gantry, so a static phantom offset has opposite signs at G0/G180 and
+  at G90/G270; the old code subtracted the same offset at both angles and left the set-up error in the walk. The set-up offset is now fitted with
+  `u = X cos G + Z sin G`, `v = Y`. On 66 stored sessions the largest radius falls from 1.54 mm to 0.86 mm.
+- **The walk is now the exact smallest sphere** touching the four beam axes (replaces the 2D minimum enclosing circle with a free centre, which is not a
+  physical quantity). Reproducible: equal minimisers resolve to the smallest offset.
+
+### Changed
+- **PASS/FAIL is on the isocenter diameter (twice the walk radius), limit 1.0 mm**, was radius. The figure, GUI, PDF, trend plot and report text show the
+  diameter; the radius is kept in the database (`walk_circle_r`). Records saved before this change hold the old method's radius.
+
 ## [Unreleased]
 
 ### Changed

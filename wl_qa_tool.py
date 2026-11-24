@@ -15,10 +15,13 @@ subtracted from all cardinal-angle displacements to isolate true isocenter walk.
 
 import os
 import sys
+import shutil
 import sqlite3
 import datetime
 import numpy as np
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 _missing = []
@@ -29,7 +32,7 @@ try:
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
         QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDoubleSpinBox, QListWidget, QListWidgetItem,
-        QLineEdit, QInputDialog, QStackedWidget,
+        QLineEdit, QInputDialog, QStackedWidget, QCheckBox, QProgressDialog, QFormLayout, QGroupBox,
     )
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush
@@ -83,7 +86,7 @@ if _missing:
     sys.exit(1)
 
 # ── Clinical constants ────────────────────────────────────────────────────────
-TOLERANCE_MM        = 1.0    # Maximum 2D isocenter walk (PASS/FAIL threshold)
+TOLERANCE_MM        = 1.0    # Maximum DISPLACEMENT of any beam from the isocenter (PASS/FAIL): TG-198 / MPPG, < 1 mm for SRS (all three linacs are used for SRS)
 VOID_DIAMETER_MM    = 6.4    # MIMI phantom air void diameter
 FIELD_SIZE_MM       = 40.0   # Nominal field size (40×40 mm)
 GANTRY_ANGLES       = [0, 90, 180, 270]
@@ -118,6 +121,7 @@ MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
 
 APP_NAME = "Daily QA - WL - DLG - Picket Fence"
+APP_VERSION = "2.0.0"
 
 MACHINES = [
     "Elekta VersaHD 153991",
@@ -146,6 +150,7 @@ PF_LEAVES_TOTAL  = 80    # Central leaves tested: 40 per bank
 PF_AVG_WIDTH_HALF_RANGE_MM = 50.0  # avg_width stat: central +/- range only (excludes end penumbra)
 
 DB_PATH     = Path(__file__).parent / "wl_qa_history.db"
+APP_DIR     = Path(__file__).parent
 CONFIG_PATH = Path(__file__).parent / "wl_qa_config.json"
 
 
@@ -167,6 +172,54 @@ def _save_config(data: dict) -> None:
 
 # ── DICOM loading ─────────────────────────────────────────────────────────────
 
+def read_image(path):
+    """One EPID image: a pydicom dataset, or - for an iView `img_<uid>` folder (native export: lossless JPEG + _Frame.xml) - the adapter that looks like one."""
+    if Path(path).is_dir():
+        import iview_native
+        return iview_native.NativeDS(Path(path))
+    return pydicom.dcmread(str(path), stop_before_pixels=False, force=True)
+
+
+def _native_patient(root: Path) -> str:
+    """The patient id from the machine logs delivered with a native export (QA_Daily_V1_26_...rllf), '' when there are none: the images carry no patient id."""
+    try:
+        import wl_sources
+        for p in sorted(Path(root).rglob("*.rllf")):
+            m = wl_sources.NAME_RE.match(p.name)
+            if m and m["patient"] in PATIENT_ID_MACHINE_MAP:
+                return m["patient"]
+    except Exception:
+        pass
+    return ""
+
+
+def _load_native_images(root: Path) -> dict:
+    """{cardinal angle: NativeDS} for a native iView export (latest image at each angle), or {} when the folder holds none."""
+    try:
+        import iview_native
+    except Exception:
+        return {}
+    if not iview_native.is_native_folder(root):
+        return {}
+    wl = [d for d in iview_native.scan_native(root, APP_DIR) if d.kind == "wl"]
+    if not wl:
+        return {}
+    pid = _native_patient(root)
+    images = {}
+    for ds in wl:                                                   # oldest first: a repeated delivery replaces the earlier one
+        g = float(ds.GantryAngle)
+        cardinal = min(GANTRY_ANGLES, key=lambda a: min(abs(a - g), abs(360 + a - g), abs(a - g - 360)))
+        if min(abs(cardinal - g), abs(360 + cardinal - g), abs(cardinal - g - 360)) > CARDINAL_TOLERANCE:
+            continue
+        ds.PatientID = pid
+        ds.RTImageLabel = f"WL{len(images) + 1}"
+        images[cardinal] = ds
+    missing = [a for a in GANTRY_ANGLES if a not in images]
+    if missing:
+        raise ValueError(f"Missing images for gantry angles: {missing}\nFound angles for: {sorted(images.keys())}")
+    return images
+
+
 def load_dicom_images(directory: str) -> dict:
     """
     Scan directory (recursively) for DICOM files, map each to the nearest cardinal
@@ -177,24 +230,18 @@ def load_dicom_images(directory: str) -> dict:
     File Meta Information header (common on older Elekta iViewGT exports).
     """
     root = Path(directory)
-    # Collect every file in the tree — named *.dcm / *.DCM / or bare UID files
-    dcm_files = (
-        list(root.rglob("*.dcm"))
-        + list(root.rglob("*.DCM"))
-        + list(root.rglob("*.dicom"))
-        + [f for f in root.rglob("*") if f.is_file()
-           and f.suffix == "" and f not in
-           (list(root.rglob("*.dcm")) + list(root.rglob("*.DCM")))]
-    )
-    # Deduplicate while preserving order
-    seen = set()
-    dcm_files = [f for f in dcm_files if not (f in seen or seen.add(f))]
+    native = _load_native_images(root)
+    if native:
+        return native
+    # Every file in the tree named *.dcm / *.DCM / *.dicom, or a bare UID file (one pass over the tree)
+    dcm_files = [f for f in sorted(root.rglob("*")) if f.is_file() and f.suffix.lower() in (".dcm", ".dicom", "")]
 
     if not dcm_files:
         raise ValueError(f"No files found in:\n{directory}")
 
     images = {}
     skipped = []
+    found = []                                  # (acquisition time, cardinal angle, dataset): a repeated delivery at an angle is decided by TIME, not by the order files are listed in
     for f in dcm_files:
         try:
             ds = pydicom.dcmread(str(f), stop_before_pixels=False, force=True)
@@ -222,9 +269,34 @@ def load_dicom_images(directory: str) -> dict:
             if diff > CARDINAL_TOLERANCE:
                 skipped.append(f"{f.name} (G={gantry:.1f}°)")
                 continue
-            images[cardinal] = ds
+            when = ""
+            for dtag, ttag in (("ContentDate", "ContentTime"), ("AcquisitionDate", "AcquisitionTime"), ("StudyDate", "StudyTime")):
+                d_, t_ = str(getattr(ds, dtag, "") or ""), str(getattr(ds, ttag, "") or "")
+                if len(d_) == 8:
+                    when = d_ + t_.split(".")[0].zfill(6)[:6]
+                    break
+            found.append((when, cardinal, ds, str(getattr(ds, "PatientID", "") or "")))
         except Exception as e:
             skipped.append(f"{f.name} ({e})")
+    # A folder can hold several sessions (other machines, other days): group the images into sessions (a new patient id or a pause of 30 min) and analyse the NEWEST session that has all
+    # four angles, so images of different machines or days are never mixed. Within a session the later of two images at one angle wins.
+    found.sort(key=lambda x: x[0])
+    sessions = []
+    for item in found:
+        last = sessions[-1][-1] if sessions else None
+        gap = None
+        if last is not None and last[0] and item[0]:
+            gap = (datetime.datetime.strptime(item[0], "%Y%m%d%H%M%S") - datetime.datetime.strptime(last[0], "%Y%m%d%H%M%S")).total_seconds() / 60.0
+        if last is None or (gap is not None and gap > 30.0) or (last[3] and item[3] and last[3] != item[3]):
+            sessions.append([])
+        sessions[-1].append(item)
+    load_dicom_images.note = ""
+    pick = next((ss for ss in reversed(sessions) if {c for _w, c, _d, _p in ss} >= set(GANTRY_ANGLES)), None)
+    chosen = pick if pick is not None else found
+    if pick is not None and len(sessions) > 1:
+        load_dicom_images.note = f"newest of {len(sessions)} sessions in the folder ({pick[0][0][:4]}-{pick[0][0][4:6]}-{pick[0][0][6:8]} {pick[0][0][8:10]}:{pick[0][0][10:12]})"
+    for _when, cardinal, ds, _pid in chosen:
+        images[cardinal] = ds
 
     if skipped:
         print(f"Skipped {len(skipped)} file(s): {', '.join(skipped)}")
@@ -341,7 +413,7 @@ def find_field_center(arr: np.ndarray, spacing_mm: float) -> tuple:
     return (bbox_col, bbox_row), (cent_col, cent_row)
 
 
-def find_void_center(
+def _find_void_minimum(
     arr: np.ndarray,
     spacing_mm: float,
     field_center_px: tuple,
@@ -421,9 +493,77 @@ def find_void_center(
     return c0 + void_col_crop, r0 + void_row_crop
 
 
+# Empirical radial profile of the void shadow (fraction of its depth) every 0.253 mm from the centre, measured on 280 real MIMI images.
+# It is wider than the 6.4 mm void itself because of scatter and detector blur; fitting it removes the sloping beam profile from the estimate.
+_VOID_PROFILE = np.array([1.031, 1.03, 1.027, 1.022, 1.016, 1.006, 0.994, 0.978, 0.959, 0.932, 0.9, 0.867, 0.831, 0.792, 0.747, 0.7, 0.643, 0.577, 0.506, 0.433, 0.357, 0.268, 0.166, 0.068, 0.0])
+_VOID_PROFILE_STEP_MM = 0.253
+VOID_FIT_HALF_MM = 16.0        # fit window half-size
+VOID_BG_ORDER = 4              # polynomial order of the background under the void
+VOID_BG_RADIUS_MM = 9.0        # pixels beyond this radius define the first background estimate
+VOID_DEPTH_RANGE = (600.0, 4000.0)   # plausible dip depth in counts (real images: 1100-1600); outside this the fit is not a void
+VOID_MIN_SNR = 1.0             # dip depth / residual rms (the residual includes phantom structure the profile does not model)
+VOID_MAX_SHIFT_MM = 6.0        # fit may not move further than this from the coarse start
+
+
+def fit_void(arr: np.ndarray, spacing_mm: float, field_center_px: tuple) -> dict:
+    """
+    Void centre by least squares.  The coarse start is the minimum of the smoothed image (_find_void_minimum).  The refinement fits
+        pixel = quadratic background(x, y)  -  depth * profile(|x - centre|)
+    over a +/-16 mm window, so the slope of the beam profile (the 'bowl') no longer drags the estimate toward the beam centre
+    (the old minimum / centroid estimate was pulled ~20 % of the offset toward the field centre in a test with a known void position).
+
+    Returns {"col", "row", "depth", "noise", "snr", "ok", "method"}.  ok is False (and the coarse minimum is returned) when the fit cannot be
+    trusted: an implausible or weak dip (depth outside VOID_DEPTH_RANGE or depth/residual < VOID_MIN_SNR, e.g. no phantom or no void in the image), the window leaves the image, or the fit wanders.
+    """
+    from scipy.optimize import least_squares
+
+    c0 = _find_void_minimum(arr, spacing_mm, field_center_px)
+    out = {"col": float(c0[0]), "row": float(c0[1]), "depth": 0.0, "noise": 0.0, "snr": 0.0, "ok": False, "method": "minimum"}
+    h = int(round(VOID_FIT_HALF_MM / spacing_mm))
+    x0, y0 = int(round(c0[0])), int(round(c0[1]))
+    if y0 - h < 0 or x0 - h < 0 or y0 + h + 1 > arr.shape[0] or x0 + h + 1 > arr.shape[1]:
+        return out
+    crop = arr[y0 - h:y0 + h + 1, x0 - h:x0 + h + 1].astype(np.float64)
+    yy, xx = np.mgrid[-h:h + 1, -h:h + 1].astype(np.float64)
+    X, Y = xx * spacing_mm, yy * spacing_mm
+    grid = np.arange(len(_VOID_PROFILE)) * _VOID_PROFILE_STEP_MM
+
+    terms = [(i, j) for i in range(VOID_BG_ORDER + 1) for j in range(VOID_BG_ORDER + 1 - i)]
+    A = np.stack([(X / 10.0) ** i * (Y / 10.0) ** j for i, j in terms], -1)
+
+    def model(p):
+        r = np.hypot(X - p[0], Y - p[1])
+        return A @ p[3:] - p[2] * np.interp(r, grid, _VOID_PROFILE, right=0.0)
+
+    cx, cy = (c0[0] - x0) * spacing_mm, (c0[1] - y0) * spacing_mm
+    m = np.hypot(X - cx, Y - cy) > VOID_BG_RADIUS_MM
+    coef = np.linalg.lstsq(A[m], crop[m], rcond=None)[0]
+    d0 = float((A @ coef - crop)[np.hypot(X - cx, Y - cy) < 2.0].mean())
+    p0 = np.r_[cx, cy, max(d0, 500.0), coef]
+    try:
+        r = least_squares(lambda p: (model(p) - crop).ravel(), p0,
+                          x_scale=np.r_[1, 1, 1000, np.full(len(terms), 1000.0)], max_nfev=200)
+    except Exception:
+        return out
+    depth = float(r.x[2])
+    noise = float(np.sqrt(np.mean(r.fun ** 2)))
+    snr = depth / noise if noise > 0 else 0.0
+    shift = float(np.hypot(r.x[0] - cx, r.x[1] - cy))
+    out.update(depth=depth, noise=noise, snr=snr)
+    if VOID_DEPTH_RANGE[0] <= depth <= VOID_DEPTH_RANGE[1] and snr >= VOID_MIN_SNR and shift <= VOID_MAX_SHIFT_MM:
+        out.update(col=x0 + r.x[0] / spacing_mm, row=y0 + r.x[1] / spacing_mm, ok=True, method="fit")
+    return out
+
+
+def find_void_center(arr: np.ndarray, spacing_mm: float, field_center_px: tuple) -> tuple:
+    """(col, row) of the void centre - least-squares fit when it can be trusted, otherwise the coarse minimum (see fit_void)."""
+    f = fit_void(arr, spacing_mm, field_center_px)
+    return f["col"], f["row"]
+
+
 # ── Field size measurement ────────────────────────────────────────────────────
 
-def _find_field_edge_pair(profile: np.ndarray) -> tuple:
+def _find_field_edge_pair(profile: np.ndarray, spacing_mm: float | None = None) -> tuple:
     """
     Find left and right 50%-penumbra field edges in an inverted 1D portal profile.
     Field = dark (low value), background = bright (high value).
@@ -448,7 +588,39 @@ def _find_field_edge_pair(profile: np.ndarray) -> tuple:
             frac       = (threshold - profile[i]) / (profile[i - 1] - profile[i])
             right_edge = i - frac
             break
+    if spacing_mm and left_edge is not None and right_edge is not None:
+        refined = _refine_edge_pair(profile, left_edge, right_edge, spacing_mm)
+        if refined is not None:
+            return refined
     return left_edge, right_edge
+
+
+def _refine_edge_pair(profile: np.ndarray, left: float, right: float, spacing_mm: float):
+    """
+    50 % crossings against the LOCAL levels beside each edge: the level just outside (7-12 mm) and the plateau just inside (4-9 mm), rather
+    than one level from the middle of the field.  The middle of these fields is a dip (the phantom void and the beam profile), so the old
+    threshold sat too far out and the field read about 2 mm large.  Returns (left, right) or None when a window falls outside the profile.
+    """
+    m = lambda mm: int(round(mm / spacing_mm))
+    n = len(profile)
+    li, ri = int(round(left)), int(round(right))
+    if li - m(12) < 0 or ri + m(12) >= n or li + m(9) >= n or ri - m(9) < 0 or li - m(6) < 1 or ri + m(6) > n - 2:
+        return None
+    out_l, in_l = profile[li - m(12):li - m(7)].mean(), profile[li + m(4):li + m(9)].mean()
+    out_r, in_r = profile[ri + m(7):ri + m(12)].mean(), profile[ri - m(9):ri - m(4)].mean()
+    thr_l, thr_r = (out_l + in_l) / 2.0, (out_r + in_r) / 2.0
+    new_l = new_r = None
+    for i in range(max(1, li - m(6)), min(n - 1, li + m(6))):
+        if profile[i - 1] >= thr_l > profile[i]:
+            new_l = i - 1 + (profile[i - 1] - thr_l) / (profile[i - 1] - profile[i])
+            break
+    for i in range(min(n - 2, ri + m(6)), max(1, ri - m(6)), -1):
+        if profile[i + 1] >= thr_r > profile[i]:
+            new_r = i + 1 - (profile[i + 1] - thr_r) / (profile[i + 1] - profile[i])
+            break
+    if new_l is None or new_r is None:
+        return None
+    return float(new_l), float(new_r)
 
 
 def measure_field_edges(arr: np.ndarray, spacing_mm: float) -> dict:
@@ -473,8 +645,24 @@ def measure_field_edges(arr: np.ndarray, spacing_mm: float) -> dict:
     h_profile = gaussian_filter1d(arr.mean(axis=0).astype(np.float64), sigma=sigma_px)
     v_profile = gaussian_filter1d(arr.mean(axis=1).astype(np.float64), sigma=sigma_px)
 
-    y_left_px, y_right_px = _find_field_edge_pair(h_profile)   # MLC
+    y_left_px, y_right_px = _find_field_edge_pair(h_profile)   # MLC   (coarse: whole-image averages, only to find the field)
     x_top_px,  x_bot_px   = _find_field_edge_pair(v_profile)   # Jaw
+
+    # Final edges from strips 9-16 mm either side of the field centre (clear of the void, so the dip does not set the threshold), each
+    # edge thresholded at 50 % between its own outside level and inside plateau.  Falls back to the coarse edges if a strip fails.
+    if None not in (y_left_px, y_right_px, x_top_px, x_bot_px):
+        ccx, ccy = (y_left_px + y_right_px) / 2.0, (x_top_px + x_bot_px) / 2.0
+        hh = lambda mm: int(round(mm / spacing_mm))
+        rows = np.r_[int(ccy) - hh(16):int(ccy) - hh(9), int(ccy) + hh(9):int(ccy) + hh(16)]
+        cols = np.r_[int(ccx) - hh(16):int(ccx) - hh(9), int(ccx) + hh(9):int(ccx) + hh(16)]
+        if rows.min() >= 0 and rows.max() < nrows and cols.min() >= 0 and cols.max() < ncols:
+            a64 = arr.astype(np.float64)
+            sg = max(1.0, 1.0 / spacing_mm)
+            sh = _find_field_edge_pair(gaussian_filter1d(a64[rows].mean(axis=0), sigma=sg), spacing_mm)
+            sv = _find_field_edge_pair(gaussian_filter1d(a64[:, cols].mean(axis=1), sigma=sg), spacing_mm)
+            if None not in (*sh, *sv):
+                y_left_px, y_right_px = sh
+                x_top_px, x_bot_px = sv
 
     mlc_total_mm = (y_right_px - y_left_px) * spacing_mm \
         if (y_left_px is not None and y_right_px is not None) else None
@@ -537,7 +725,7 @@ def measure_mlc_leaves(
             continue
         strip   = arr[r0i:r1i, :]
         profile = gaussian_filter1d(strip.mean(axis=0).astype(np.float64), sigma=sigma_px)
-        y_lp, y_rp = _find_field_edge_pair(profile)
+        y_lp, y_rp = _find_field_edge_pair(profile, spacing_mm)
         leaves.append({
             "leaf_idx":  i,
             "total_mm":  (y_rp - y_lp) * spacing_mm
@@ -572,7 +760,8 @@ def analyze_image(ds) -> dict:
 
     # Use edge centre for void search (falls back to bbox if edge detection failed).
     search_fc  = edge_fc if edge_fc is not None else field_center_bbox_px
-    void_center_px = find_void_center(arr, spacing, search_fc)
+    void_fit = fit_void(arr, spacing, search_fc)
+    void_center_px = (void_fit["col"], void_fit["row"])
 
     mlc_leaves = measure_mlc_leaves(arr, spacing)
 
@@ -591,13 +780,25 @@ def analyze_image(ds) -> dict:
 
     primary_fc = edge_fc if edge_fc is not None else field_center_bbox_px
 
+    _w = None
+    for _dt, _tt in (("ContentDate", "ContentTime"), ("StudyDate", "StudyTime")):
+        _d, _t = str(getattr(ds, _dt, "") or ""), str(getattr(ds, _tt, "") or "")
+        if len(_d) == 8 and _t:
+            try:
+                _w = datetime.datetime.strptime(_d + _t.split(".")[0].zfill(6)[:6], "%Y%m%d%H%M%S")
+                break
+            except ValueError:
+                pass
     return {
+        "sop_uid":              str(getattr(ds, "SOPInstanceUID", "") or ""),
+        "when":                 _w,
         "gantry":               gantry,
         "spacing_mm":           spacing,
         "field_center_px":      primary_fc,            # edge midpoint (primary)
         "field_center_bbox_px": field_center_bbox_px,  # BBox (cross-check)
         "field_center_cent_px": field_center_cent_px,  # centroid (cross-check)
         "void_center_px":       void_center_px,
+        "void_fit":             {k: void_fit[k] for k in ("depth", "noise", "snr", "ok", "method")},
         "dx_mm":                dx_px_edge * spacing,  # PRIMARY
         "dy_mm":                dy_px_edge * spacing,
         "dx_mm_bbox":           dx_px_bbox * spacing,  # cross-check
@@ -664,104 +865,103 @@ def _minimum_enclosing_circle(points):
     return best
 
 
+# Portal-plane axes versus the patient axes.  The iViewGT panel is FIXED to the gantry, so a static phantom (BB) offset
+# b = (X lateral, Y SI, Z AP) shows in the portal image as  u = X cos(G) + Z sin(G),  v = Y :
+#   G0: u = +X   G90: u = +Z   G180: u = -X   G270: u = -Z   (v = Y at every angle).
+# The offset therefore appears with OPPOSITE signs at opposite gantry angles.  (Checked on 66 stored sessions: the G0 and G180 x-offsets
+# are negatively correlated, r = -0.65, and removing a static offset with this model leaves 0.30 mm rms against 0.57 mm for the earlier
+# "same sign at every angle" assumption.)
+_GANTRY_U = {0: (1.0, 0.0), 90: (0.0, 1.0), 180: (-1.0, 0.0), 270: (0.0, -1.0)}     # (coefficient of X, coefficient of Z)
+
+
+def _wl_residual_vectors(p, dx: dict, dy: dict):
+    """(rel_dx, rel_dy) of each gantry angle after removing the static offset p = (X, Y, Z)."""
+    X, Y, Z = p
+    return {a: (dx[a] - (cx * X + cz * Z), dy[a] - Y) for a, (cx, cz) in _GANTRY_U.items()}
+
+
+def _wl_walk(p, dx: dict, dy: dict) -> float:
+    return max(float(np.hypot(*v)) for v in _wl_residual_vectors(p, dx, dy).values())
+
+
 def _fit_minimax_setup(dx: dict, dy: dict) -> tuple[float, float, float]:
     """
-    Minimax (Chebyshev) fit for the lateral/AP setup baseline (setup_x, setup_z)
-    that minimizes the worst-case walk-circle radius across all four cardinal
-    views, instead of computing each axis pair's simple mean independently.
-
-    setup_y (SI) is left as the plain mean: it shifts all four residual points
-    by the same amount, and the Minimum Enclosing Circle radius is translation
-    invariant, so no choice of setup_y can change the reported walk radius —
-    the mean remains the best physically-meaningful centroid estimate for it.
-
-    setup_x and setup_z are different: each only shifts its own pair of points
-    (G0/G180 or G90/G270), so independently symmetrizing each pair (the old
-    per-axis mean) is *one* feasible choice of baseline but not necessarily the
-    one that minimizes the final MEC radius, since the binding pair/triple of
-    the enclosing circle can cross between the two axis pairs. Jointly
-    optimizing (setup_x, setup_z) against the exact MEC radius can only match
-    or reduce the reported walk — never inflate it — because the old pair-mean
-    values are used as the optimizer's starting point. This mirrors the
-    minimax BB-position fit validated in the sibling WL analyzer application
-    (see wl_correction.py): least-squares-style averaging can increase the
-    worst-case residual even while improving the average, which is the wrong
-    objective for a max-based metric like isocenter walk.
+    The static phantom offset (X lateral, Y SI, Z AP) that minimises the worst-case residual over the four gantry angles, i.e. the centre
+    of the smallest SPHERE touching the four beam axes (pylinac's "gantry 3D isocenter" definition).  Solved exactly: SLSQP on the epigraph
+    form (min t subject to every residual <= t) from several starts, the best true worst residual wins; among equal minimisers the smallest
+    offset is returned so the answer is reproducible.  Returns (setup_x, setup_y, setup_z).
     """
-    def corrected_pts(setup_x, setup_z, setup_y):
-        return [
-            (dx[0]   - setup_x, dy[0]   - setup_y),
-            (dx[90]  - setup_z, dy[90]  - setup_y),
-            (dx[180] - setup_x, dy[180] - setup_y),
-            (dx[270] - setup_z, dy[270] - setup_y),
-        ]
+    from scipy.optimize import minimize as _min
 
-    setup_y = (dy[0] + dy[90] + dy[180] + dy[270]) / 4
-
-    def objective(params):
-        setup_x, setup_z = params
-        _, _, r = _minimum_enclosing_circle(corrected_pts(setup_x, setup_z, setup_y))
-        return r
-
-    x0 = np.array([(dx[0] + dx[180]) / 2, (dx[90] + dx[270]) / 2])
-    result = _scipy_minimize(
-        objective, x0, method="Nelder-Mead",
-        options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 2000},
-    )
-    setup_x, setup_z = result.x
-
-    # Guard against a rare Nelder-Mead non-improvement: never do worse than
-    # the pair-mean starting point.
-    if objective((setup_x, setup_z)) > objective(tuple(x0)) + 1e-9:
-        setup_x, setup_z = x0
-
-    return float(setup_x), float(setup_y), float(setup_z)
+    f = lambda p: _wl_walk(p, dx, dy)
+    cons = [{"type": "ineq", "fun": (lambda q, a=a: q[3] - float(np.hypot(*_wl_residual_vectors(q[:3], dx, dy)[a])))} for a in GANTRY_ANGLES]
+    bounds = [(-25, 25)] * 3 + [(0, 100)]
+    starts = [np.zeros(3), np.array([1.0, 1.0, 1.0]), np.array([-1.0, 1.0, -1.0]), np.array([1.0, -1.0, 1.0]), np.array([-1.0, -1.0, 1.0])]
+    starts.append(_min(f, np.zeros(3), method="Nelder-Mead", options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 3000}).x)
+    best_x, best = None, np.inf
+    for s0 in starts:
+        try:
+            r = _min(lambda q: q[3], np.r_[s0, f(s0)], method="SLSQP", constraints=cons, bounds=bounds, options={"ftol": 1e-13, "maxiter": 400})
+        except Exception:
+            continue
+        v = f(r.x[:3])
+        if np.isfinite(v) and v < best - 1e-12:
+            best_x, best = np.asarray(r.x[:3], float), v
+    if best_x is None:
+        best_x = starts[-1]
+        best = f(best_x)
+    tmax = best + 1e-6
+    try:
+        r2 = _min(lambda q: float(np.dot(q[:3], q[:3])), np.r_[best_x, tmax], method="SLSQP", bounds=bounds,
+                  constraints=cons + [{"type": "eq", "fun": lambda q: q[3] - tmax}], options={"ftol": 1e-13, "maxiter": 400})
+        if f(r2.x[:3]) <= tmax + 1e-5:
+            best_x = np.asarray(r2.x[:3], float)
+    except Exception:
+        pass
+    return float(best_x[0]), float(best_x[1]), float(best_x[2])
 
 
 def compute_wl_results(
     image_results: dict,
     dx_key: str = "dx_mm",
     dy_key: str = "dy_mm",
+    use_logs: bool = True,
 ) -> dict:
     """
-    Compute 3D CBCT setup error, corrected walk residuals, and walk circle PASS/FAIL.
+    Static phantom set-up offset, per-angle gantry-walk residuals and the isocenter walk (PASS/FAIL).
 
-    Elekta iViewGT portal images are stored with a CONSISTENT patient coordinate
-    orientation at all gantry angles (no coordinate flip at opposing angles).
-    The portal-plane axes map to patient space as follows:
-        G0°  / G180°  portal-X = patient lateral (L/R)
-        G90° / G270°  portal-X = patient AP (A/P)
-        All angles    portal-Y = patient SI (S/I)
+    Each image gives the void-minus-field-centre displacement (dx, dy) in the portal plane (see _GANTRY_U for how a static phantom offset
+    appears at each gantry angle).  The set-up offset (X, Y, Z) is the one that minimises the worst remaining residual; subtracting it from
+    each image leaves the mechanical walk residuals.  The walk RADIUS is the largest residual (the radius of the smallest sphere touching the
+    four beam axes); that largest residual is the maximum displacement of any beam from the isocenter.  PASS/FAIL uses it against TOLERANCE_MM (1.0 mm).
 
-    The lateral/AP setup baseline (setup_x, setup_z) is found via a minimax
-    fit that directly minimizes the resulting walk-circle (MEC) radius —
-    see `_fit_minimax_setup()` — rather than the independent per-axis mean.
-    SI (setup_y) remains the plain mean since it cannot affect the MEC radius.
-
-    Subtracting the angle-appropriate component from each raw displacement yields
-    pure mechanical walk residuals.  The Minimum Enclosing Circle of the four
-    corrected walk vectors gives the walk circle metric.
-
-    dx_key / dy_key select which displacement keys to read from each angle's dict,
-    allowing comparison between field-center detection methods.
+    dx_key / dy_key select which displacement keys to read from each angle's dict, allowing comparison between field-center detection methods.
     """
     dx = {a: image_results[a][dx_key] for a in GANTRY_ANGLES}
     dy = {a: image_results[a][dy_key] for a in GANTRY_ANGLES}
+    # Optional machine log: the aperture the collimator actually had moves the field centre by (actual - set centre of the MLC / jaws); the displacement
+    # is void - field centre, so the beam-axis displacement is displacement + that shift. Images without a log are used as measured.
+    log_shift, n_logs = {}, 0
+    for a in GANTRY_ANGLES:
+        ls = (image_results[a].get("log") or {}).get("shift") if use_logs else None
+        log_shift[a] = ls
+        if ls:
+            dx[a] += ls[0]; dy[a] += ls[1]; n_logs += 1
 
     setup_x, setup_y, setup_z = _fit_minimax_setup(dx, dy)
+    res = _wl_residual_vectors((setup_x, setup_y, setup_z), dx, dy)
 
     per_angle = {}
     for angle in GANTRY_ANGLES:
-        x_corr = setup_z if angle in (90, 270) else setup_x        # lateral vs AP
         per_angle[angle] = {
             "raw_dx": dx[angle],
             "raw_dy": dy[angle],
-            "rel_dx": dx[angle] - x_corr,
-            "rel_dy": dy[angle] - setup_y,
+            "rel_dx": res[angle][0],
+            "rel_dy": res[angle][1],
+            "log_shift": log_shift[angle],
         }
 
-    corrected_pts = [(per_angle[a]["rel_dx"], per_angle[a]["rel_dy"]) for a in GANTRY_ANGLES]
-    _, _, walk_r = _minimum_enclosing_circle(corrected_pts)
+    walk_r = _wl_walk((setup_x, setup_y, setup_z), dx, dy)
 
     return {
         "per_angle":      per_angle,
@@ -772,7 +972,10 @@ def compute_wl_results(
         "baseline_dy":    setup_y,
         "baseline_dz":    setup_z,
         "walk_circle_r":  walk_r,
-        "max_2d_walk_mm": walk_r,
+        "walk_diameter_mm": 2.0 * walk_r,      # information only (the diameter of the smallest sphere); not graded
+        "logs_used":      n_logs,
+        "log_shift_max":  max((float(np.hypot(*v)) for v in log_shift.values() if v), default=0.0),
+        "max_2d_walk_mm": walk_r,              # the reported value = the maximum displacement from the isocenter (compared with TOLERANCE_MM)
         "pass_fail":      walk_r <= TOLERANCE_MM,
     }
 
@@ -809,7 +1012,7 @@ def generate_diagnostic_figure(img_results: dict, wl_results: dict) -> str | Non
 
     fig.suptitle(
         f"Portal Images — Field & Void Centre Detection     "
-        f"Walk Circle Radius = {walk_r:.3f} mm   "
+        f"Max displacement = {walk_r:.3f} mm   "
         f"{'PASS ✓' if passed else 'FAIL ✗'}",
         color="white", fontsize=11, fontweight="bold",
     )
@@ -977,8 +1180,7 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
     walk_r    = wl_results["walk_circle_r"]
     passed    = wl_results["pass_fail"]
 
-    pts = [(per_angle[a]["rel_dx"], per_angle[a]["rel_dy"]) for a in GANTRY_ANGLES]
-    mec_cx, mec_cy, _ = _minimum_enclosing_circle(pts)
+    mec_cx, mec_cy = 0.0, 0.0          # the residuals are measured from the fitted isocenter (the circle centre)
 
     angle_colors = {0: "#64b5f6", 90: "#81c784", 180: "#ffb74d", 270: "#f06292"}
     angle_labels = {0: "G000° Lat", 90: "G090° AP", 180: "G180° Lat", 270: "G270° AP"}
@@ -1000,7 +1202,7 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
     ))
     ax.text(
         TOLERANCE_MM * 0.707 + 0.03, TOLERANCE_MM * 0.707 + 0.03,
-        f"Tol {TOLERANCE_MM:.1f} mm", color="#ef5350", fontsize=7.5, zorder=3,
+        f"Limit {TOLERANCE_MM:.1f} mm", color="#ef5350", fontsize=7.5, zorder=3,
     )
 
     # MEC walk circle (white)
@@ -1011,7 +1213,7 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
 
     # MEC centre cross
     ax.plot(mec_cx, mec_cy, "+", color="#90caf9", ms=14, mew=2.5, zorder=6,
-            label=f"MEC centre ({mec_cx:+.3f}, {mec_cy:+.3f}) mm")
+            label="fitted isocenter")
 
     # Spokes from MEC centre to each point
     for angle in GANTRY_ANGLES:
@@ -1041,7 +1243,7 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
 
     pf_color = "#66bb6a" if passed else "#ef5350"
     ax.set_title(
-        f"Isocenter Walk Circle   r = {walk_r:.3f} mm   "
+        f"Max displacement from isocenter   {walk_r:.3f} mm   "
         f"{'PASS ✓' if passed else 'FAIL ✗'}",
         color=pf_color, fontsize=10, fontweight="bold", pad=6,
     )
@@ -1053,7 +1255,7 @@ def generate_walk_circle_figure(wl_results: dict) -> str | None:
 
     # Walk circle radius annotation
     ax.annotate(
-        f"r = {walk_r:.3f} mm",
+        f"r = {walk_r:.3f} mm  (Ø {2 * walk_r:.3f} mm)",
         xy=(mec_cx + walk_r * 0.707, mec_cy + walk_r * 0.707),
         color="white", fontsize=8, zorder=8,
         xytext=(4, 4), textcoords="offset points",
@@ -1448,11 +1650,107 @@ def _apply_dark_theme(app: QApplication) -> None:
     """)
 
 
+class EpidSessionsDialog(QDialog):
+    """New Daily WL sessions found in the EPID folder: open one for review (it is then saved to the history with its report as usual), or set it aside."""
+
+    def __init__(self, parent, sessions, machine):
+        super().__init__(parent)
+        self._app, self._machine = parent, machine
+        self._all = sessions
+        self.setWindowTitle(f"EPID folder — {machine}")
+        self.resize(760, 460)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Daily WL sessions found in the EPID folder. Open one to analyse it (then save the report as usual), or set it aside."))
+        self._show_done = QCheckBox("Show sessions already processed or set aside")
+        self._show_done.toggled.connect(self._fill)
+        lay.addWidget(self._show_done)
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["Date / time", "Images", "Max displacement", "Machine log", "Status"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.cellDoubleClicked.connect(lambda *_: self._open())
+        lay.addWidget(self._table, 1)
+        row = QHBoxLayout()
+        b_all = QPushButton("Import all new sessions…"); b_all.clicked.connect(self._import_all)
+        b_all.setToolTip("Analyse and save every new, complete session in the list (no report PDFs): the Winston-Lutz record, field sizes and the picket fence go into the trend history. "
+                         "Can be stopped and resumed; sessions that cannot be analysed reliably are listed and left here for review.")
+        b_open = QPushButton("Open selected"); b_open.clicked.connect(self._open)
+        b_skip = QPushButton("Set aside"); b_skip.setToolTip("Do not offer this session again"); b_skip.clicked.connect(self._skip)
+        b_close = QPushButton("Close"); b_close.clicked.connect(self.reject)
+        row.addWidget(b_all); row.addWidget(b_open); row.addWidget(b_skip); row.addStretch(); row.addWidget(b_close)
+        lay.addLayout(row)
+        self._fill()
+
+    def _rows(self):
+        return [x for x in self._all if self._show_done.isChecked() or x.status == "new"]
+
+    def _fill(self, *_):
+        rows = self._rows()
+        self._table.setRowCount(len(rows))
+        for i, x in enumerate(rows):
+            imgs = "4 of 4" if x.complete else f"{4 - len(x.missing)} of 4 (missing G{', G'.join(str(a) for a in x.missing)})"
+            if x.preview:
+                res = f"{x.preview['displacement']:.2f} mm  {'PASS' if x.preview['pass'] else 'FAIL'}"
+                logs = f"{x.preview['logs']} of 4 images"
+            else:
+                res, logs = "—", "—"
+            for c, t in enumerate((f"{x.when:%Y-%m-%d  %H:%M}", imgs, res, logs, x.status)):
+                it = QTableWidgetItem(t)
+                if c == 2 and x.preview:
+                    it.setForeground(QBrush(QColor("#66bb6a" if x.preview["pass"] else "#ef5350")))
+                self._table.setItem(i, c, it)
+        if rows:
+            self._table.selectRow(0)
+
+    def _current(self):
+        r = self._table.currentRow()
+        rows = self._rows()
+        return rows[r] if 0 <= r < len(rows) else None
+
+    def _open(self):
+        x = self._current()
+        if x is None:
+            return
+        if not x.complete:
+            QMessageBox.information(self, "Incomplete session", f"This session has no image at G{', G'.join(str(a) for a in x.missing)}.")
+            return
+        self.accept()
+        self._app._open_epid_session(x)
+
+    def _import_all(self):
+        new = [x for x in self._all if x.status == "new"]
+        if not new:
+            QMessageBox.information(self, "Import", "There are no new sessions."); return
+        n_ok = sum(1 for x in new if x.complete)
+        if QMessageBox.question(self, "Import all new sessions",
+                                f"Analyse and save {n_ok} complete session(s) of {self._machine} ({len(new) - n_ok} incomplete are left alone)?\n\n"
+                                "This can take a while (a few seconds per session); you can cancel and continue later - saved sessions are not analysed again.") != QMessageBox.StandardButton.Yes:
+            return
+        self._app._import_all_sessions(new, self._machine)
+        import wl_sources
+        conn = sqlite3.connect(DB_PATH); done = wl_sources.processed_sops(conn); conn.close()
+        wl_sources.classify(self._all, done)
+        self._fill()
+
+    def _skip(self):
+        x = self._current()
+        if x is None:
+            return
+        import wl_sources
+        conn = sqlite3.connect(DB_PATH)
+        wl_sources.mark(conn, x.sops.values(), self._machine, "skipped")
+        conn.close()
+        x.status = "skipped"
+        self._fill()
+
+
 class WLApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle(f"{APP_NAME}  —  Elekta Versa HD / MIMI Phantom")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}  —  Elekta Versa HD / MIMI Phantom")
         self.resize(1160, 860)
         self.setMinimumSize(960, 720)
 
@@ -1510,6 +1808,12 @@ class WLApp(QMainWindow):
         self._load_btn.clicked.connect(self._load_directory)
         top_layout.addWidget(self._load_btn)
 
+        self._epid_btn = QPushButton("Check EPID Folder")
+        self._epid_btn.setMinimumWidth(180)
+        self._epid_btn.setToolTip("Search this machine's EPID folder (Settings > Data Folders) for Daily WL sessions not processed yet")
+        self._epid_btn.clicked.connect(self._check_epid_folder)
+        top_layout.addWidget(self._epid_btn)
+
         main_layout.addWidget(top_bar)
 
         # ── Selector bar ──────────────────────────────────────────────────────
@@ -1536,6 +1840,14 @@ class WLApp(QMainWindow):
         self._physicist_combo.addItems(self._physicists)
         self._physicist_combo.setMinimumWidth(300)
         sel_layout.addWidget(self._physicist_combo)
+        sel_layout.addSpacing(24)
+
+        self._use_logs_cb = QCheckBox("Use machine log (when present)")
+        self._use_logs_cb.setToolTip("Correct each field centre for the aperture (MLC / jaw position) the machine log reports for that image. "
+                                     "Works without logs: images with no matching log are analysed as measured.")
+        self._use_logs_cb.setChecked(bool(self._config.get("use_machine_logs", True)))
+        self._use_logs_cb.toggled.connect(self._logs_toggled)
+        sel_layout.addWidget(self._use_logs_cb)
         sel_layout.addStretch()
 
         self._settings_btn = QPushButton("Settings")
@@ -1775,7 +2087,7 @@ class WLApp(QMainWindow):
         left_vbox.setSpacing(2)
 
         self._walk_label = QLabel(
-            f"Walk Circle Radius: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
+            f"Max displacement: —   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
         )
         self._walk_label.setStyleSheet("font-size: 15px;")
         left_vbox.addWidget(self._walk_label)
@@ -2306,8 +2618,11 @@ class WLApp(QMainWindow):
             return
         self._config["last_dicom_dir"] = directory
         _save_config(self._config)
+        self._process_directory(directory)
 
-        self._dir_label.setText(Path(directory).name)
+    def _process_directory(self, directory, display_name=None):
+        """Analyse a folder of Daily WL images (the manual import, and the staged copy of an EPID-folder session)."""
+        self._dir_label.setText(display_name or Path(directory).name)
         self._pf_label.setText("Processing…")
         self._pf_label.setStyleSheet(
             "font-size: 25px; font-weight: bold; color: gray; background: transparent;"
@@ -2319,13 +2634,18 @@ class WLApp(QMainWindow):
 
         try:
             dcm_images    = load_dicom_images(directory)
+            _folder_note  = getattr(load_dicom_images, "note", "")
+            if _folder_note:
+                self._dir_label.setText(f"{display_name or Path(directory).name}  ({_folder_note})")
+            for _ds in dcm_images.values():                    # the machine first: its log folder is used below
+                _pid0 = getattr(_ds, "PatientID", None)
+                if _pid0 and str(_pid0) in PATIENT_ID_MACHINE_MAP:
+                    self._machine_combo.setCurrentText(PATIENT_ID_MACHINE_MAP[str(_pid0)])
+                    break
             image_results = {a: analyze_image(ds) for a, ds in dcm_images.items()}
-            wl_results    = compute_wl_results(image_results)
-            wl_cent = compute_wl_results(
-                image_results, dx_key="dx_mm_cent", dy_key="dy_mm_cent"
-            )
-            wl_results["walk_circle_r_cent"] = wl_cent["walk_circle_r"]
-            wl_results["pass_fail_cent"]     = wl_cent["pass_fail"]
+            self._import_dir = directory
+            self._log_note = self._attach_logs(image_results)
+            wl_results    = self._compute_results(image_results)
 
             self._dicom_date = None
             self._dicom_time = None
@@ -2394,7 +2714,16 @@ class WLApp(QMainWindow):
             # top-level-only scan would miss a co-located PF image)
             self._pf_results  = None
             self._pf_fig_path = None
-            for _pf_path in sorted(Path(directory).rglob("*")):
+            try:                                                   # native iView export: the picket-fence image is found from its shape
+                import iview_native
+                _pfs = [d for d in iview_native.scan_native(directory, APP_DIR) if d.kind == "pf"] if iview_native.is_native_folder(directory) else []
+                if _pfs:
+                    _pfs[-1].RTImageLabel = "PF"
+                    self._pf_results  = analyze_picket_fence(_pfs[-1])
+                    self._pf_fig_path = generate_pf_figure(self._pf_results)
+            except Exception:
+                self._pf_results = None
+            for _pf_path in ([] if self._pf_results else sorted(Path(directory).rglob("*"))):
                 if not _pf_path.is_file():
                     continue
                 try:
@@ -2411,11 +2740,177 @@ class WLApp(QMainWindow):
             self._report_btn.setEnabled(True)
 
         except Exception as exc:
+            self._wl_results = self._image_results = None            # never keep the previous session's numbers under the new folder's name (they could be reported or saved as it)
+            self._pf_results, self._diag_fig_path, self._walk_fig_path, self._pf_fig_path = None, None, None, None
+            self._report_btn.setEnabled(False)
             QMessageBox.critical(self, "Processing Error", str(exc))
             self._pf_label.setText("— ERROR —")
             self._pf_label.setStyleSheet(
                 "font-size: 25px; font-weight: bold; color: #f44336; background: transparent;"
             )
+
+    # ── Machine logs (optional) ───────────────────────────────────────────────
+
+    def _machine_folders(self, machine=None) -> dict:
+        return (self._config.get("machine_folders") or {}).get(machine or self._machine_combo.currentText(), {})
+
+    def _compute_results(self, image_results) -> dict:
+        use = self._use_logs_cb.isChecked()
+        wl_results = compute_wl_results(image_results, use_logs=use)
+        wl_cent = compute_wl_results(image_results, dx_key="dx_mm_cent", dy_key="dy_mm_cent", use_logs=use)
+        wl_results["walk_circle_r_cent"] = wl_cent["walk_circle_r"]
+        wl_results["pass_fail_cent"]     = wl_cent["pass_fail"]
+        return wl_results
+
+    def _attach_logs(self, image_results) -> str:
+        """Pair each image with its machine log (optional). Returns a one-line note; never raises: no folder, no logs, or no match all mean 'analyse as before'."""
+        for ir in image_results.values():
+            ir.pop("log", None)
+        folders = [f for f in (self._machine_folders().get("logs", ""), getattr(self, "_import_dir", "")) if f]
+        if not folders:
+            return "no machine-log folder set"
+        try:
+            import wl_sources
+            imgs = {a: (ir["when"], ir["gantry"]) for a, ir in image_results.items() if ir.get("when")}
+            got, seen = {}, 0
+            for folder in folders:                                   # the machine's log folder, then any logs delivered with the images
+                idx = wl_sources.LogIndex(folder, APP_DIR)
+                seen += len(idx.records)
+                got = idx.match(imgs) if idx.records else {}
+                if got:
+                    break
+            if not seen:
+                return "no log files found in the log folder"
+            n = 0
+            for a, rec in got.items():
+                info = wl_sources.aperture_shift(rec)
+                if info:
+                    image_results[a]["log"] = info
+                    n += 1
+            return f"machine log matched for {n} of {len(image_results)} images" if n else "no log matched these images"
+        except Exception as exc:                                  # a log problem must never stop the analysis
+            return f"machine logs not used ({exc})"
+
+    def _logs_toggled(self, on):
+        self._config["use_machine_logs"] = bool(on)
+        _save_config(self._config)
+        if getattr(self, "_image_results", None):
+            self._wl_results = self._compute_results(self._image_results)
+            self._diag_fig_path = generate_diagnostic_figure(self._image_results, self._wl_results)
+            self._walk_fig_path = generate_walk_circle_figure(self._wl_results)
+            self._refresh_display()
+
+    # ── EPID folder ───────────────────────────────────────────────────────────
+
+    def _check_epid_folder(self):
+        import wl_sources
+        machine = self._machine_combo.currentText()
+        folder = self._machine_folders(machine).get("epid", "")
+        if not folder:
+            if QMessageBox.question(self, "EPID folder not set",
+                                    f"No EPID image folder is set for {machine}.\n\nOpen Settings > Data Folders to set it?") == QMessageBox.StandardButton.Yes:
+                self._show_settings(tab="folders")
+            return
+        prog = QProgressDialog("Reading the EPID folder...", "Cancel", 0, 100, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        cancelled = []
+
+        def _p(i, n, text=None):
+            if text:
+                prog.setLabelText(text)
+            prog.setMaximum(max(n, 1)); prog.setValue(min(i, n))
+            QApplication.processEvents()
+            if prog.wasCanceled():
+                cancelled.append(1)
+                raise InterruptedError()
+        try:
+            sessions = wl_sources.scan_epid_folder(folder, APP_DIR, progress=lambda i, n: _p(i, n, f"Reading image headers... {i} of {n}"))
+        except InterruptedError:
+            prog.close(); return
+        except Exception as exc:
+            prog.close(); QMessageBox.warning(self, "EPID folder", str(exc)); return
+        conn = sqlite3.connect(DB_PATH)
+        wl_sources.init_registry(conn)
+        done = wl_sources.processed_sops(conn)
+        conn.close()
+        sessions = [x for x in sessions if PATIENT_ID_MACHINE_MAP.get(x.patient, machine) == machine]
+        for x in sessions:
+            x.machine = machine
+        wl_sources.classify(sessions, done)
+        new = [x for x in sessions if x.status == "new"]
+        # quick result for the newest complete new sessions, so the list shows what each one would give
+        todo = [x for x in new if x.complete][:12]
+        try:
+            for k, x in enumerate(todo):
+                _p(k, len(todo), f"Analysing new session {k + 1} of {len(todo)} ({x.when:%Y-%m-%d %H:%M})...")
+                try:
+                    ir = {a: analyze_image(read_image(path)) for a, path in x.files.items()}
+                    self._attach_logs_for(ir, machine)
+                    r = compute_wl_results(ir, use_logs=self._use_logs_cb.isChecked())
+                    x.preview = {"displacement": r["max_2d_walk_mm"], "pass": r["pass_fail"], "logs": r["logs_used"]}
+                except Exception:
+                    x.preview = None
+        except InterruptedError:
+            pass
+        prog.close()
+        if not new:
+            QMessageBox.information(self, "EPID folder",
+                                    f"No new Daily WL sessions in\n{folder}\n\n({len(sessions)} session(s) found, all already processed or set aside.)")
+            return
+        if len(new) == 1 and new[0].complete:
+            self._open_epid_session(new[0])
+            return
+        EpidSessionsDialog(self, sessions, machine).exec()
+
+    def _import_all_sessions(self, sessions, machine):
+        """Analyse and save many sessions (see daily_batch): window stays responsive, can be cancelled, one bad session never stops the run."""
+        import daily_batch
+        prog = QProgressDialog("Importing sessions...", "Cancel", 0, max(len(sessions), 1), self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal); prog.setMinimumDuration(0)
+
+        def _p(i, n, text=""):
+            prog.setMaximum(max(n, 1)); prog.setValue(min(i, n))
+            if text:
+                prog.setLabelText(text)
+            QApplication.processEvents()
+        folders = [self._machine_folders(machine).get("logs", "")]
+        try:
+            out = daily_batch.import_sessions(sys.modules[__name__], sessions, machine, self._physicist_combo.currentText(), log_folders=folders, cache_dir=APP_DIR,
+                                              use_logs=self._use_logs_cb.isChecked(), progress=_p, should_cancel=prog.wasCanceled)
+        except Exception as exc:                                    # nothing in an import may take the application down
+            prog.close(); QMessageBox.warning(self, "Import", f"The import stopped: {type(exc).__name__}: {exc}\nSessions saved so far are kept; run it again to continue."); return
+        prog.close()
+        text = daily_batch.summary_text(out)
+        try:
+            (APP_DIR / "daily_import.log").write_text(f"{datetime.datetime.now():%Y-%m-%d %H:%M}  {machine}\n{text}\n")
+        except OSError:
+            pass
+        box = QMessageBox(self); box.setWindowTitle("Import finished"); box.setText(text.split("\n", 1)[0]); box.setDetailedText(text); box.exec()
+
+    def _attach_logs_for(self, image_results, machine):
+        keep = self._machine_combo.currentText()
+        folder = self._machine_folders(machine).get("logs", "")
+        if not folder:
+            return
+        try:
+            import wl_sources
+            idx = wl_sources.LogIndex(folder, APP_DIR)
+            got = idx.match({a: (ir["when"], ir["gantry"]) for a, ir in image_results.items() if ir.get("when")})
+            for a, rec in got.items():
+                info = wl_sources.aperture_shift(rec)
+                if info:
+                    image_results[a]["log"] = info
+        except Exception:
+            pass
+
+    def _open_epid_session(self, sess):
+        import wl_sources
+        old = getattr(self, "_staged_dir", None)
+        self._staged_dir = str(wl_sources.stage_session(sess))
+        self._process_directory(self._staged_dir, f"EPID: {sess.when:%Y-%m-%d %H:%M}  ({sess.machine})")
+        if old:
+            shutil.rmtree(old, ignore_errors=True)
 
     def _refresh_pf_display(self):
         """Update PF banner, stats card, and figure tab from self._pf_results."""
@@ -2518,22 +3013,27 @@ class WLApp(QMainWindow):
         walk_cent = wl.get("walk_circle_r_cent")
         if walk_cent is not None:
             self._walk_label.setText(
-                f"Walk Circle:  Edge = {walk:.3f} mm  │  Centroid = {walk_cent:.3f} mm"
+                f"Max displacement:  Edge = {walk:.3f} mm  │  Centroid = {walk_cent:.3f} mm"
                 f"   (Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
             )
         else:
             self._walk_label.setText(
-                f"Walk Circle Radius: {walk:.3f} mm   "
+                f"Max displacement: {walk:.3f} mm   "
                 f"(Tolerance ≤ {TOLERANCE_MM:.1f} mm)"
             )
         sx = wl["setup_x"]; sy = wl["setup_y"]; sz = wl["setup_z"]
+        _logtxt = (f"   │   machine log applied to {wl['logs_used']} of 4 images (largest field-centre shift {wl['log_shift_max']:.2f} mm)"
+                   if wl.get("logs_used") else f"   │   machine log: {getattr(self, '_log_note', 'not used')}")
+        _weak = [a for a, r in (getattr(self, "_image_results", None) or {}).items() if not (r.get("void_fit") or {}).get("ok", True)]
+        _voidtxt = (f"   │   ⚠ void not found reliably at G{', G'.join(str(a) for a in sorted(_weak))} - check the phantom and the images"
+                    if _weak else "")
         self._corr_sub.setText(
-            f"CBCT setup: Lat={sx:+.3f} mm   SI={sy:+.3f} mm   AP={sz:+.3f} mm"
+            f"CBCT setup: Lat={sx:+.3f} mm   SI={sy:+.3f} mm   AP={sz:+.3f} mm" + _logtxt + _voidtxt
         )
-        self._corr_sub.setStyleSheet("font-size: 12px; color: #90caf9; background: transparent;")
+        self._corr_sub.setStyleSheet(f"font-size: 12px; color: {'#ffb74d' if _weak else '#90caf9'}; background: transparent;")
 
         def _color(v):
-            if v < 0.5:
+            if v < TOLERANCE_MM / 2:
                 return "#66bb6a"
             if v < TOLERANCE_MM:
                 return "#ffa726"
@@ -2635,15 +3135,48 @@ class WLApp(QMainWindow):
                 pf_results=self._pf_results,
                 pf_fig_path=self._pf_fig_path,
             )
-            _save_to_db(self._wl_results, self._image_results, machine, physicist)
+            _when = (datetime.datetime.combine(self._dicom_date, self._dicom_time or datetime.time(0, 0)) if self._dicom_date else None)
+            _save_to_db(self._wl_results, self._image_results, machine, physicist, when=_when, pf_results=self._pf_results)
             QMessageBox.information(self, "Report Saved", f"Report saved to:\n{save_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Report Error", str(exc))
 
     # ── Settings dialog ──────────────────────────────────────────────────────
 
-    def _show_settings(self):
-        """Open the Settings dialog: machines, physicists, manual field-size reference."""
+    def _build_settings_folders_tab(self) -> QWidget:
+        """Per machine: the EPID image folder 'Check EPID Folder' searches, and the (optional) machine-log folder."""
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.addWidget(QLabel("Where each machine's EPID images arrive (searched by 'Check EPID Folder') and, optionally, its machine log files.\n"
+                               "The log folder can stay empty: the analysis then simply uses the images as measured."))
+        for machine in self._machines:
+            box = QGroupBox(machine)
+            form = QFormLayout(box)
+            cur = self._machine_folders(machine)
+            for key, label in (("epid", "EPID image folder"), ("logs", "Machine log folder (optional)")):
+                row = QHBoxLayout()
+                edit = QLineEdit(cur.get(key, ""))
+                edit.setPlaceholderText("folder path (local or network share)")
+                btn = QPushButton("Browse...")
+
+                def _save(_=None, m=machine, k=key, e=edit):
+                    self._config.setdefault("machine_folders", {}).setdefault(m, {})[k] = e.text().strip()
+                    _save_config(self._config)
+
+                def _browse(_=False, e=edit, sv=_save):
+                    d = QFileDialog.getExistingDirectory(tab, "Choose folder", e.text() or str(Path.home()))
+                    if d:
+                        e.setText(d); sv()
+                edit.editingFinished.connect(_save)
+                btn.clicked.connect(_browse)
+                row.addWidget(edit, 1); row.addWidget(btn)
+                form.addRow(label, row)
+            outer.addWidget(box)
+        outer.addStretch()
+        return tab
+
+    def _show_settings(self, tab=None):
+        """Open the Settings dialog: machines, physicists, data folders, manual field-size reference."""
         dlg = QDialog(self)
         dlg.setWindowTitle(f"{APP_NAME} — Settings")
         dlg.resize(560, 480)
@@ -2654,7 +3187,10 @@ class WLApp(QMainWindow):
 
         tabs.addTab(self._build_settings_list_tab("machines"), "Machines")
         tabs.addTab(self._build_settings_list_tab("physicists"), "Physicists")
+        tabs.addTab(self._build_settings_folders_tab(), "Data Folders")
         tabs.addTab(self._build_settings_refs_tab(), "Field Size Reference")
+        if tab == "folders":
+            tabs.setCurrentIndex(2)
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(dlg.accept)
@@ -2817,22 +3353,13 @@ class WLApp(QMainWindow):
 
     # ── Trend analysis (machine → test picker) ──────────────────────────────
 
-    _TREND_TESTS = [
-        ("walk", "Walk Circle Radius (WL)"),
-        ("mlc",  "Field Size — MLC"),
-        ("jaw",  "Field Size — Jaw"),
-    ]
+    import daily_trends as _trends
+    _TREND_TESTS = list(_trends.KEYS)
 
     def _trend_machines_with_data(self) -> list:
-        """Distinct machine names present in the trend DB, preferring configured order."""
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT machine_name FROM wl_records")
-            db_machines = {r[0] for r in cur.fetchall()}
-            conn.close()
-        except Exception:
-            db_machines = set()
+        """Distinct machine names present in the trend DB (Winston-Lutz or picket fence), preferring configured order."""
+        import daily_trends
+        db_machines = set(daily_trends.machines_with_data(DB_PATH))
         ordered = [m for m in self._machines if m in db_machines]
         ordered += sorted(db_machines - set(ordered))
         return ordered
@@ -2959,149 +3486,46 @@ class WLApp(QMainWindow):
         layout.addLayout(header)
 
         test_label = dict(self._TREND_TESTS)[test_key]
-        rows, table_rows = self._fetch_trend_rows(machine, test_key)
+        import daily_trends
+        refs = self._get_field_refs(machine)
+        limits = {"walk": TOLERANCE_MM, "mlc": (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM), "jaw": (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM), "pf": (PF_WARN_MM, PF_TOLERANCE_MM)}
+        try:
+            res = daily_trends.build(DB_PATH, machine, test_key, refs, limits)
+        except Exception as exc:                                    # a trend problem must never take the application down
+            res = {"png": None, "summary": f"The trend could not be drawn: {type(exc).__name__}: {exc}", "headers": [], "rows": []}
 
-        if not rows:
-            lbl = QLabel(f"No '{test_label}' records yet for {machine}.")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 14px; color: #aaaaaa;")
-            layout.addWidget(lbl, stretch=1)
+        note = QLabel(res["summary"])
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size: 13px; padding: 4px;")
+        layout.addWidget(note)
+        if not res["png"]:
+            layout.addStretch(1)
             return page
 
-        pixmap = self._render_trend_chart(machine, test_key, test_label, rows)
+        pixmap = QPixmap(); pixmap.loadFromData(res["png"])
         chart_label = QLabel()
-        chart_label.setPixmap(pixmap)
+        chart_label.setPixmap(pixmap.scaledToWidth(min(pixmap.width(), 1000), Qt.TransformationMode.SmoothTransformation))
         chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(chart_label, stretch=1)
+        scroll = QScrollArea(); scroll.setWidget(chart_label); scroll.setWidgetResizable(True); scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        layout.addWidget(scroll, stretch=1)
 
-        hdrs = table_rows[0]
-        table = QTableWidget(len(table_rows) - 1, len(hdrs))
+        hdrs = res["headers"]
+        table = QTableWidget(len(res["rows"]), len(hdrs))
         table.setHorizontalHeaderLabels(hdrs)
-        table.setMaximumHeight(200)
+        table.setMaximumHeight(190)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.verticalHeader().setVisible(False)
-
-        for ri, row in enumerate(table_rows[1:]):
+        for ri, row in enumerate(reversed(res["rows"])):                 # newest first
             for ci, val in enumerate(row[:-1]):
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if ci == len(row) - 2:
                     item.setForeground(QBrush(QColor(row[-1])))
                 table.setItem(ri, ci, item)
-
         layout.addWidget(table)
         return page
-
-    def _fetch_trend_rows(self, machine: str, test_key: str):
-        """Return (plot_rows, table_rows) for the given machine/test.
-
-        plot_rows: list of (date_str, value, level) where level is 0/1/2 (pass/warn/fail).
-        table_rows: [header, *rows] where each row's last element is a display colour hex.
-        """
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            if test_key == "walk":
-                cur.execute(
-                    "SELECT date, physicist_name, walk_circle_r, pass_fail FROM wl_records "
-                    "WHERE machine_name=? ORDER BY date ASC", (machine,)
-                )
-                raw = cur.fetchall()
-            else:
-                col = "avg_mlc_mm" if test_key == "mlc" else "avg_jaw_mm"
-                cur.execute(
-                    f"SELECT date, physicist_name, {col} FROM wl_records "
-                    f"WHERE machine_name=? AND {col} IS NOT NULL ORDER BY date ASC", (machine,)
-                )
-                raw = cur.fetchall()
-            conn.close()
-        except Exception:
-            raw = []
-
-        plot_rows, table_rows = [], []
-        _GRN, _AMB, _RED = "#66bb6a", "#ffa726", "#ef5350"
-
-        if test_key == "walk":
-            table_rows.append(["Date", "Physicist", "Walk r (mm)", "Result"])
-            for date_s, phys, walk_r, pf in raw:
-                level = 0 if pf else 2
-                plot_rows.append((date_s, walk_r, level))
-                table_rows.append([date_s, phys, f"{walk_r:.3f}",
-                                    "PASS" if pf else "FAIL", _GRN if pf else _RED])
-        else:
-            refs = self._get_field_refs(machine)
-            ref = refs["mlc"] if test_key == "mlc" else refs["jaw"]
-            warn, fail = (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM) if test_key == "mlc" \
-                else (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
-            label = "MLC" if test_key == "mlc" else "Jaw"
-            table_rows.append(["Date", "Physicist", f"{label} (mm)", f"Δ {label} (mm)", "Result"])
-            for date_s, phys, val in raw:
-                dev = val - ref
-                a = abs(dev)
-                level = 0 if a <= warn else (1 if a <= fail else 2)
-                result = ["PASS", "WARNING", "FAIL"][level]
-                color = [_GRN, _AMB, _RED][level]
-                plot_rows.append((date_s, dev, level))
-                table_rows.append([date_s, phys, f"{val:.3f}", f"{dev:+.3f}", result, color])
-
-        return plot_rows, table_rows
-
-    def _render_trend_chart(self, machine: str, test_key: str, test_label: str, rows: list) -> QPixmap:
-        _GRN, _AMB, _RED = "#66bb6a", "#ffa726", "#ef5350"
-        level_color = [_GRN, _AMB, _RED]
-
-        fig, ax = plt.subplots(figsize=(11, 5.5), facecolor="#111111")
-        ax.set_facecolor("#1e1e1e")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#555555")
-        ax.set_xlabel("Date", color="white", fontsize=11)
-
-        dates = [r[0] for r in rows]
-        vals  = [r[1] for r in rows]
-        colors_pts = [level_color[r[2]] for r in rows]
-
-        if test_key == "walk":
-            ax.set_ylabel("Walk Circle Radius (mm)", color="white", fontsize=11)
-            ax.axhline(TOLERANCE_MM, color=_RED, linewidth=1.5, linestyle="--",
-                       label=f"Tolerance ≤ {TOLERANCE_MM:.1f} mm")
-            ax.plot(dates, vals, color="#64b5f6", linewidth=1.5, marker="o",
-                    markersize=6, zorder=3)
-        else:
-            label = "MLC" if test_key == "mlc" else "Jaw"
-            warn, fail = (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM) if test_key == "mlc" \
-                else (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
-            ax.set_ylabel(f"Δ {label} from Reference (mm)", color="white", fontsize=11)
-            ax.axhline(0, color="#888888", linewidth=1.0, linestyle="-", zorder=1)
-            ax.axhline(-warn, color=_AMB, linewidth=1.2, linestyle="--", zorder=1)
-            ax.axhline(-fail, color=_RED, linewidth=1.2, linestyle="--", zorder=1)
-            ax.axhline(warn, color=_AMB, linewidth=1.2, linestyle="--", zorder=1,
-                       label=f"Warn |Δ| > {warn:.1f} mm")
-            ax.axhline(fail, color=_RED, linewidth=1.2, linestyle="--", zorder=1,
-                       label=f"Fail |Δ| > {fail:.1f} mm")
-            ax.plot(dates, vals, color="#64b5f6", linewidth=1.5, marker="o",
-                    markersize=6, zorder=3)
-
-        ax.scatter(dates, vals, color=colors_pts, s=60, zorder=5,
-                   edgecolors="#64b5f6", linewidths=1)
-        ax.set_title(f"{test_label} — Trend for {machine}",
-                     color="white", fontsize=13, fontweight="bold")
-        ax.legend(facecolor="#2b2b2b", edgecolor="#555555", labelcolor="white",
-                  fontsize=9, loc="upper left")
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8, color="white")
-        fig.tight_layout()
-
-        import io
-        buf = io.BytesIO()
-        fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight", facecolor="#111111")
-        plt.close(fig)
-        buf.seek(0)
-
-        pixmap = QPixmap()
-        pixmap.loadFromData(buf.read())
-        return pixmap
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -3132,18 +3556,66 @@ def _init_db():
         "ALTER TABLE wl_records ADD COLUMN baseline_dz REAL",
         "ALTER TABLE wl_records ADD COLUMN avg_mlc_mm REAL",
         "ALTER TABLE wl_records ADD COLUMN avg_jaw_mm REAL",
+        "ALTER TABLE wl_records ADD COLUMN logs_used INTEGER",
     ]:
         try:
             conn.execute(col_def)
         except sqlite3.OperationalError:
             pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pf_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            TEXT NOT NULL,
+            time            TEXT NOT NULL,
+            machine_name    TEXT NOT NULL,
+            physicist_name  TEXT,
+            max_dev_mm      REAL NOT NULL,       -- largest |leaf deviation|
+            rms_dev_mm      REAL NOT NULL,
+            n_leaves        INTEGER,
+            worst_leaf      INTEGER,             -- index (0 = most negative y) of the leaf with the largest |deviation|
+            worst_dev_mm    REAL,                -- its signed deviation
+            avg_width_mm    REAL,
+            pass_fail       INTEGER,
+            leaf_y_json     TEXT,                -- leaf positions along y (mm)
+            leaf_dev_json   TEXT                 -- the signed deviation of every leaf (mm)
+        )
+    """)
+    import wl_sources
+    wl_sources.init_registry(conn)
     conn.commit()
     conn.close()
 
 
-def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: str):
-    """Insert one QA session record into the database."""
-    now = datetime.datetime.now()
+def _save_pf(conn, pf_results: dict, machine: str, physicist: str, when: "datetime.datetime | None" = None) -> None:
+    """One picket-fence record (the per-leaf deviations are kept, so the trend can show whether the same leaf is repeatedly the worst). A record for the same machine and time is replaced."""
+    import json
+    d = np.asarray(pf_results["leaf_deviations_mm"], float)
+    if not d.size:
+        return
+    sd, st_ = pf_results.get("study_date"), pf_results.get("study_time")
+    if sd is not None:
+        t0 = st_ if isinstance(st_, datetime.time) else datetime.time(0, 0)
+        now = datetime.datetime.combine(sd, t0)
+    else:
+        now = when or datetime.datetime.now()
+    k = int(np.argmax(np.abs(d)))
+    try:
+        avg_w = float(pf_avg_width_central_mm(pf_results))
+    except Exception:
+        avg_w = None
+    conn.execute("DELETE FROM pf_records WHERE machine_name=? AND date=? AND time=?", (machine, now.strftime("%Y-%m-%d"), now.strftime("%H:%M")))
+    conn.execute(
+        "INSERT INTO pf_records (date, time, machine_name, physicist_name, max_dev_mm, rms_dev_mm, n_leaves, worst_leaf, worst_dev_mm, avg_width_mm, pass_fail, leaf_y_json, leaf_dev_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (now.strftime("%Y-%m-%d"), now.strftime("%H:%M"), machine, physicist, float(np.max(np.abs(d))), float(np.sqrt(np.mean(d ** 2))), int(d.size), k, float(d[k]), avg_w,
+         1 if pf_results.get("pass_fail") else 0, json.dumps([round(float(v), 2) for v in np.asarray(pf_results.get("leaf_y_mm", []), float)]),
+         json.dumps([round(float(v), 4) for v in d])))
+
+
+def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: str, when: "datetime.datetime | None" = None, pf_results: "dict | None" = None):
+    """Insert one QA session record into the database. `when` = when the images were ACQUIRED (the record's date and time, so trends follow the measurement date,
+    not the day the session happened to be saved); the time of saving is used only when it is unknown."""
+    now = when or datetime.datetime.now()
     pa  = wl_results["per_angle"]
 
     # Compute mean field sizes across all 4 angles
@@ -3160,6 +3632,8 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
     avg_jaw = float(np.mean(jaw_vals)) if jaw_vals else None
 
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM wl_records WHERE machine_name=? AND date=? AND time=?",           # saving the same session again replaces its record instead of adding a second trend point
+                 (machine, now.strftime("%Y-%m-%d"), now.strftime("%H:%M")))
     conn.execute(
         """INSERT INTO wl_records (
             date, time, machine_name, physicist_name,
@@ -3169,8 +3643,8 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
             raw_dx_G90, raw_dy_G90,
             raw_dx_G180,raw_dy_G180,
             raw_dx_G270,raw_dy_G270,
-            avg_mlc_mm, avg_jaw_mm
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            avg_mlc_mm, avg_jaw_mm, logs_used
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             now.strftime("%Y-%m-%d"),
             now.strftime("%H:%M"),
@@ -3184,10 +3658,21 @@ def _save_to_db(wl_results: dict, image_results: dict, machine: str, physicist: 
             pa[90]["raw_dx"],  pa[90]["raw_dy"],
             pa[180]["raw_dx"], pa[180]["raw_dy"],
             pa[270]["raw_dx"], pa[270]["raw_dy"],
-            avg_mlc, avg_jaw,
+            avg_mlc, avg_jaw, wl_results.get("logs_used", 0),
         ),
     )
+    if pf_results:
+        try:
+            _save_pf(conn, pf_results, machine, physicist, when)
+        except Exception:
+            pass                                                   # a picket-fence record problem must never lose the Winston-Lutz record
     conn.commit()
+    try:                      # the four images are now a saved session: "Check EPID folder" no longer offers them as new
+        import wl_sources
+        wl_sources.init_registry(conn)
+        wl_sources.mark(conn, [ir.get("sop_uid") for ir in image_results.values()], machine, "processed")
+    except Exception:
+        pass
     conn.close()
 
 
@@ -3205,7 +3690,7 @@ _BORDER     = colors.HexColor("#bdbdbd")
 
 def _val_color(v_mm: float):
     """ReportLab color for a displacement magnitude."""
-    if v_mm < 0.5:
+    if v_mm < TOLERANCE_MM / 2:
         return colors.HexColor("#2e7d32")
     if v_mm < TOLERANCE_MM:
         return colors.HexColor("#e65100")
@@ -3304,7 +3789,9 @@ def generate_pdf_report(
         ["Machine:", machine_name,     "Phantom:",     PHANTOM_NAME],
         ["Physicist:", physicist_name, "Field Size:",  f"{FIELD_SIZE_MM:.0f}×{FIELD_SIZE_MM:.0f} mm"],
         ["Void Diameter:", f"{VOID_DIAMETER_MM:.1f} mm (air)",
-         "Tolerance:", f"≤ {TOLERANCE_MM:.1f} mm"],
+         "Tolerance (max displacement):", f"≤ {TOLERANCE_MM:.1f} mm"],
+        ["Machine log:", (f"applied to {wl_results['logs_used']} of 4 images (largest shift {wl_results['log_shift_max']:.2f} mm)"
+                          if wl_results.get("logs_used") else "not used (no log for these images)"), "", ""],
         ["CBCT Setup Error (3D):",
          f"{setup_3d:.3f} mm  (Lat={setup_lat:+.3f},  SI={setup_si:+.3f},  AP={setup_ap:+.3f})",
          "", ""],
@@ -3314,7 +3801,8 @@ def generate_pdf_report(
         ("FONTSIZE",   (0, 0), (-1, -1), 9),
         ("FONTNAME",   (0, 0), (0, -1),  "Helvetica-Bold"),
         ("FONTNAME",   (2, 0), (2, -1),  "Helvetica-Bold"),
-        ("SPAN",       (1, 4), (3, 4)),   # MEC value spans last 3 cols
+        ("SPAN",       (1, 4), (3, 4)),   # machine-log line spans the last 3 cols
+        ("SPAN",       (1, 5), (3, 5)),   # set-up error spans the last 3 cols
         ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, _STRIPE]),
         ("GRID",       (0, 0), (-1, -1), 0.3, _BORDER),
         ("TOPPADDING", (0, 0), (-1, -1), 4),
@@ -3377,7 +3865,7 @@ def generate_pdf_report(
     # ── WL PASS / FAIL banner (full width) ───────────────────────────────────
     status_text = "PASS" if passed else "FAIL"
     wl_bg       = _GREEN if passed else _RED
-    wl_text     = f"WL  {status_text}    Walk Circle Radius = {max_walk:.3f} mm"
+    wl_text     = f"WL  {status_text}    Isocenter Diameter = {max_walk:.3f} mm"
 
     banner_tbl = Table([[wl_text]], colWidths=[7.1 * inch])
     banner_tbl.setStyle(TableStyle([
@@ -3406,7 +3894,7 @@ def generate_pdf_report(
             f"{r['rel_dy']:+.3f}",
             f"{dr:.3f}",
         ])
-    corr_data.append(["Walk Circle r", "", "", f"{max_walk:.3f}"])
+    corr_data.append(["Max displacement", "", "", f"{max_walk:.3f}"])
 
     corr_tbl = Table(corr_data, colWidths=[1.20*inch, 1.00*inch, 0.95*inch, 0.95*inch])
     corr_tbl.setStyle(TableStyle([
@@ -3485,13 +3973,11 @@ def generate_pdf_report(
     story.append(Spacer(1, 0.04 * inch))
     story.append(Paragraph(
         "<b>3D Decomposition &amp; Walk Circle:</b>  "
-        "Portal axes: G0°/G180° X = Lateral; G90°/G270° X = AP; all Y = SI.  "
-        "CBCT residual:  Lat = (ΔX_G0 + ΔX_G180)/2,  SI = mean(ΔY all angles),  "
-        "AP = (ΔX_G90 + ΔX_G270)/2.  "
-        "Subtracting the angle-appropriate component gives per-angle mechanical isocenter "
-        "walk residuals.  The <b>Minimum Enclosing Circle (MEC)</b> radius of the four "
-        f"residual vectors is the walk circle metric  "
-        f"(PASS: ≤ {TOLERANCE_MM:.1f} mm, per AAPM TG-142 SRS/SBRT monthly tolerance).",
+        "The imager turns with the gantry, so a static phantom offset (X lateral, Y SI, Z AP) appears in the portal image as "
+        "u = X cosG + Z sinG, v = Y (opposite signs at opposite gantry angles).  The offset that minimises the worst remaining "
+        "residual over the four angles is removed; this is the centre of the smallest sphere touching the four beam axes.  The largest "
+        "residual is the maximum displacement of any beam from the isocenter (TG-198 / MPPG)  "
+        f"(PASS: ≤ {TOLERANCE_MM:.1f} mm, the SRS limit).",
         note_style,
     ))
     story.append(Spacer(1, 0.07 * inch))
@@ -3774,8 +4260,8 @@ def generate_pdf_report(
             "Yellow arrow = raw displacement (field centre → void centre).  "
             "White bar = 5 mm scale at isocenter.  "
             "Panel 5 (displacement map): coloured dots = raw void positions per angle; "
-            "red dashed ring = 1.0 mm tolerance; white circle = MEC walk circle; "
-            "blue cross = MEC centre.",
+            "red dashed ring = 1.0 mm limit; white circle = smallest circle holding "
+            "the four residuals (its radius = maximum displacement); blue cross = fitted isocenter.",
             _cap_style,
         ))
         from PIL import Image as PILImage
@@ -3794,7 +4280,7 @@ def generate_pdf_report(
         ["Machine:", machine_name,    "Study Date:", today_str],
         ["Physicist:", physicist_name, "Study Time:", time_str],
         ["WL Result:", ("PASS" if passed else "FAIL") +
-         f"   —   Walk Circle = {max_walk:.3f} mm",
+         f"   —   Max displacement = {max_walk:.3f} mm",
          "Phantom:", PHANTOM_NAME],
         ["Field Result:", _fs_text, "", ""],
     ]
