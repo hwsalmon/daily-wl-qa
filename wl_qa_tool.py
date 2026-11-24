@@ -32,10 +32,10 @@ try:
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
         QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDoubleSpinBox, QListWidget, QListWidgetItem,
-        QLineEdit, QInputDialog, QStackedWidget, QCheckBox, QProgressDialog, QFormLayout, QGroupBox,
+        QLineEdit, QInputDialog, QStackedWidget, QCheckBox, QProgressDialog, QFormLayout, QGroupBox, QDateEdit, QTextEdit,
     )
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush
+    from PySide6.QtCore import Qt, QDate, QUrl
+    from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush, QDesktopServices
 except ImportError:
     _missing.append("PySide6")
 
@@ -121,7 +121,7 @@ MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
 
 APP_NAME = "Daily QA - WL - DLG - Picket Fence"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 MACHINES = [
     "Elekta VersaHD 153991",
@@ -1664,8 +1664,8 @@ class EpidSessionsDialog(QDialog):
         self._show_done = QCheckBox("Show sessions already processed or set aside")
         self._show_done.toggled.connect(self._fill)
         lay.addWidget(self._show_done)
-        self._table = QTableWidget(0, 5)
-        self._table.setHorizontalHeaderLabels(["Date / time", "Images", "Max displacement", "Machine log", "Status"])
+        self._table = QTableWidget(0, 8)
+        self._table.setHorizontalHeaderLabels(["Date / time", "Images", "Max displacement", "MLC size (Δ ref)", "Jaw size (Δ ref)", "Picket fence max", "Machine log", "Status"])
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1691,15 +1691,29 @@ class EpidSessionsDialog(QDialog):
         self._table.setRowCount(len(rows))
         for i, x in enumerate(rows):
             imgs = "4 of 4" if x.complete else f"{4 - len(x.missing)} of 4 (missing G{', G'.join(str(a) for a in x.missing)})"
+            refs = self._app._get_field_refs(self._machine)
+            lvl = lambda dev, warn, fail: "#66bb6a" if abs(dev) <= warn else "#ffa726" if abs(dev) <= fail else "#ef5350"
+            colors_ = {}
             if x.preview:
-                res = f"{x.preview['displacement']:.2f} mm  {'PASS' if x.preview['pass'] else 'FAIL'}"
-                logs = f"{x.preview['logs']} of 4 images"
+                p_ = x.preview
+                res = f"{p_['displacement']:.2f} mm  {'PASS' if p_['pass'] else 'FAIL'}"
+                logs = f"{p_['logs']} of 4 images"
+                mlc = "—" if p_.get("mlc") is None else f"{p_['mlc']:.2f} ({p_['mlc'] - refs['mlc']:+.2f})"
+                jaw = "—" if p_.get("jaw") is None else f"{p_['jaw']:.2f} ({p_['jaw'] - refs['jaw']:+.2f})"
+                pfm = "—" if p_.get("pf_max") is None else f"{p_['pf_max']:.2f} mm"
+                colors_ = {2: "#66bb6a" if p_["pass"] else "#ef5350"}
+                if p_.get("mlc") is not None:
+                    colors_[3] = lvl(p_["mlc"] - refs["mlc"], FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
+                if p_.get("jaw") is not None:
+                    colors_[4] = lvl(p_["jaw"] - refs["jaw"], FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
+                if p_.get("pf_max") is not None:
+                    colors_[5] = "#66bb6a" if p_["pf_max"] < PF_WARN_MM else "#ffa726" if p_["pf_max"] < PF_TOLERANCE_MM else "#ef5350"
             else:
-                res, logs = "—", "—"
-            for c, t in enumerate((f"{x.when:%Y-%m-%d  %H:%M}", imgs, res, logs, x.status)):
+                res = logs = mlc = jaw = pfm = "—"
+            for c, t in enumerate((f"{x.when:%Y-%m-%d  %H:%M}", imgs, res, mlc, jaw, pfm, logs, x.status)):
                 it = QTableWidgetItem(t)
-                if c == 2 and x.preview:
-                    it.setForeground(QBrush(QColor("#66bb6a" if x.preview["pass"] else "#ef5350")))
+                if c in colors_:
+                    it.setForeground(QBrush(QColor(colors_[c])))
                 self._table.setItem(i, c, it)
         if rows:
             self._table.selectRow(0)
@@ -1744,6 +1758,202 @@ class EpidSessionsDialog(QDialog):
         conn.close()
         x.status = "skipped"
         self._fill()
+
+
+class HistoryDialog(QDialog):
+    """Review the stored results of any day, week or month, and print the report for it: a draft, or - after the physicist's review - an electronically signed report with the trend lines."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        import daily_reports
+        self._app = parent
+        self._dr = daily_reports
+        self.setWindowTitle(f"{APP_NAME} — History and reports")
+        self.resize(1100, 760)
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self._machine = QComboBox(); self._machine.addItems(parent._trend_machines_with_data() or list(parent._machines))
+        self._kind = QComboBox(); self._kind.addItem("Day", "day"); self._kind.addItem("Week (Mon-Sun)", "week"); self._kind.addItem("Month", "month")
+        self._date = QDateEdit(); self._date.setCalendarPopup(True); self._date.setDisplayFormat("yyyy-MM-dd")
+        self._prev = QPushButton("◀"); self._next = QPushButton("▶"); self._latest = QPushButton("Latest")
+        for wdg in (QLabel("Machine:"), self._machine, QLabel("Report:"), self._kind, QLabel("Date in the period:"), self._date, self._prev, self._next, self._latest):
+            top.addWidget(wdg)
+        top.addStretch()
+        lay.addLayout(top)
+        self._title = QLabel(""); self._title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        lay.addWidget(self._title)
+        self._table = QTableWidget(0, 8)
+        self._table.setHorizontalHeaderLabels(["Date / time", "Max displacement", "WL", "MLC size (Δ ref)", "Jaw size (Δ ref)", "Picket fence max / RMS", "Worst leaf", "Machine log"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows); self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        lay.addWidget(self._table, 2)
+        self._detail = QTextEdit(); self._detail.setReadOnly(True); self._detail.setMaximumHeight(170)
+        lay.addWidget(self._detail)
+        lay.addWidget(QLabel("Signed reports for this machine (double-click to print again):"))
+        self._signed = QTableWidget(0, 6)
+        self._signed.setHorizontalHeaderLabels(["No.", "Report", "Physicist", "Signed", "Sessions", "Data unchanged since signing"])
+        self._signed.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._signed.setSelectionBehavior(QTableWidget.SelectRows); self._signed.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._signed.setMaximumHeight(150)
+        lay.addWidget(self._signed)
+        row = QHBoxLayout()
+        b_draft = QPushButton("Draft report (PDF)…"); b_sign = QPushButton("Review and sign report (PDF)…"); b_close = QPushButton("Close")
+        b_draft.setToolTip("An unsigned report for the period shown, saved as a PDF and opened for printing.")
+        b_sign.setToolTip("The physicist confirms having reviewed the period; the PDF carries the signature, the date and time and a digest of the data, and the sign-off is recorded.")
+        b_draft.clicked.connect(lambda: self._make(sign=False)); b_sign.clicked.connect(lambda: self._make(sign=True)); b_close.clicked.connect(self.reject)
+        row.addWidget(b_draft); row.addWidget(b_sign); row.addStretch(); row.addWidget(b_close)
+        lay.addLayout(row)
+        self._machine.currentTextChanged.connect(self._go_latest)
+        self._kind.currentIndexChanged.connect(self._refresh); self._date.dateChanged.connect(self._refresh)
+        self._prev.clicked.connect(lambda: self._shift(-1)); self._next.clicked.connect(lambda: self._shift(1)); self._latest.clicked.connect(self._go_latest)
+        self._table.itemSelectionChanged.connect(self._show_detail)
+        self._signed.cellDoubleClicked.connect(self._reprint)
+        self._recs = []
+        self._go_latest()
+
+    # -- helpers
+    def _limits(self):
+        return {"walk": TOLERANCE_MM, "mlc": (FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM), "jaw": (FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM), "pf": (PF_WARN_MM, PF_TOLERANCE_MM)}
+
+    def _period(self):
+        d = self._date.date().toPython()
+        return self._dr.period(self._kind.currentData(), d)
+
+    def _go_latest(self, *_):
+        days = self._dr.days_with_data(DB_PATH, self._machine.currentText())
+        self._date.blockSignals(True)
+        d = days[-1] if days else datetime.date.today()
+        self._date.setDate(QDate(d.year, d.month, d.day))
+        self._date.blockSignals(False)
+        self._refresh()
+
+    def _shift(self, n):
+        a, b = self._period()
+        d = (b + datetime.timedelta(days=1)) if n > 0 else (a - datetime.timedelta(days=1))
+        if self._kind.currentData() == "day":
+            days = self._dr.days_with_data(DB_PATH, self._machine.currentText())
+            cand = [x for x in days if (x > a if n > 0 else x < a)]
+            if cand:
+                d = min(cand) if n > 0 else max(cand)
+        self._date.setDate(QDate(d.year, d.month, d.day))
+
+    def _refresh(self, *_):
+        machine = self._machine.currentText(); kind = self._kind.currentData(); a, b = self._period()
+        self._title.setText(f"{machine} — {self._dr.label(kind, a, b)}")
+        self._recs = self._dr.records_between(DB_PATH, machine, a, b)
+        refs = self._app._get_field_refs(machine)
+        t = self._table; t.setRowCount(len(self._recs))
+        lim = self._limits()
+        for i, r in enumerate(self._recs):
+            w_, pf = r.get("walk_circle_r"), r.get("pf")
+            dm = None if r.get("avg_mlc_mm") is None else r["avg_mlc_mm"] - refs["mlc"]
+            dj = None if r.get("avg_jaw_mm") is None else r["avg_jaw_mm"] - refs["jaw"]
+            cells = [f"{r['when']:%Y-%m-%d %H:%M}", "—" if w_ is None else f"{w_:.3f} mm", "—" if w_ is None else "PASS" if w_ <= TOLERANCE_MM else "FAIL",
+                     "—" if r.get("avg_mlc_mm") is None else f"{r['avg_mlc_mm']:.2f} ({dm:+.2f})", "—" if r.get("avg_jaw_mm") is None else f"{r['avg_jaw_mm']:.2f} ({dj:+.2f})",
+                     "—" if not pf else f"{pf['max_dev_mm']:.2f} / {pf['rms_dev_mm']:.2f} mm", "—" if not pf else f"{pf['worst_leaf']} ({pf['worst_dev_mm']:+.2f})",
+                     "—" if not r.get("logs_used") else f"{r['logs_used']} of 4"]
+            cols = {2: None if w_ is None else ("#66bb6a" if w_ <= TOLERANCE_MM else "#ef5350"),
+                    3: None if dm is None else ("#66bb6a" if abs(dm) <= FIELD_SIZE_WARN_MM else "#ffa726" if abs(dm) <= FIELD_SIZE_FAIL_MM else "#ef5350"),
+                    4: None if dj is None else ("#66bb6a" if abs(dj) <= FIELD_SIZE_JAW_WARN_MM else "#ffa726" if abs(dj) <= FIELD_SIZE_JAW_FAIL_MM else "#ef5350"),
+                    5: None if not pf else ("#66bb6a" if pf["max_dev_mm"] < PF_WARN_MM else "#ffa726" if pf["max_dev_mm"] < PF_TOLERANCE_MM else "#ef5350")}
+            for c, txt in enumerate(cells):
+                it = QTableWidgetItem(txt); it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if cols.get(c):
+                    it.setForeground(QBrush(QColor(cols[c])))
+                t.setItem(i, c, it)
+        if self._recs:
+            t.selectRow(len(self._recs) - 1)
+        else:
+            self._detail.setPlainText("No results were recorded in this period.")
+        self._fill_signed()
+
+    def _show_detail(self):
+        r = self._table.currentRow()
+        if not (0 <= r < len(self._recs)):
+            return
+        rec = self._recs[r]
+        ir = {a: {"dx_mm": rec.get(f"raw_dx_G{a}"), "dy_mm": rec.get(f"raw_dy_G{a}")} for a in GANTRY_ANGLES}
+        lines = [f"Session {rec['when']:%Y-%m-%d %H:%M}   physicist: {rec.get('physicist_name') or '—'}"]
+        if all(v["dx_mm"] is not None and v["dy_mm"] is not None for v in ir.values()):
+            res = compute_wl_results(ir, use_logs=False)
+            lines.append(f"Static phantom offset removed: lateral {res['setup_x']:+.3f}, SI {res['setup_y']:+.3f}, AP {res['setup_z']:+.3f} mm.   "
+                         f"Maximum displacement from the isocenter {res['max_2d_walk_mm']:.3f} mm ({'PASS' if res['pass_fail'] else 'FAIL'}, limit {TOLERANCE_MM:.1f} mm)")
+            lines.append("Gantry    raw lateral   raw SI    after offset: lateral   SI    displacement")
+            for a in GANTRY_ANGLES:
+                p = res["per_angle"][a]
+                lines.append(f"G{a:<3}     {p['raw_dx']:+8.3f}  {p['raw_dy']:+8.3f}      {p['rel_dx']:+8.3f}  {p['rel_dy']:+8.3f}    {np.hypot(p['rel_dx'], p['rel_dy']):.3f} mm")
+        pf = rec.get("pf")
+        if pf:
+            lines.append(f"Picket fence: max {pf['max_dev_mm']:.3f} mm, RMS {pf['rms_dev_mm']:.3f} mm, worst leaf {pf['worst_leaf']} ({pf['worst_dev_mm']:+.3f} mm), tilt along the picket "
+                         + ("—" if pf.get("tilt") is None else f"{pf['tilt']:+.2f} mm"))
+        self._detail.setPlainText("\n".join(lines))
+
+    def _fill_signed(self):
+        rows = self._dr.signoffs(DB_PATH, self._machine.currentText())
+        self._signed_rows = rows
+        self._signed.setRowCount(len(rows))
+        for i, so in enumerate(rows):
+            a, b = datetime.date.fromisoformat(so["start_date"]), datetime.date.fromisoformat(so["end_date"])
+            ok = self._dr.still_matches(DB_PATH, so)
+            for c, txt in enumerate((str(so["id"]), f"{so['kind']}: {self._dr.label(so['kind'], a, b)}", so["physicist"], so["signed_at"].replace("T", " "), str(so["n_sessions"]),
+                                     "yes" if ok else "NO - records changed")):
+                it = QTableWidgetItem(txt)
+                if c == 5:
+                    it.setForeground(QBrush(QColor("#66bb6a" if ok else "#ef5350")))
+                self._signed.setItem(i, c, it)
+
+    # -- reports
+    def _write(self, path, kind, a, b, machine, signoff=None):
+        self._dr.build_report(DB_PATH, machine, kind, a, b, t=sys.modules[__name__], refs=self._app._get_field_refs(machine), limits=self._limits(), version=APP_VERSION, signoff=signoff, out_path=path)
+
+    def _ask_path(self, name):
+        last = self._app._config.get("last_report_dir", str(Path.home()))
+        path, _ = QFileDialog.getSaveFileName(self, "Save report", str(Path(last) / name), "PDF files (*.pdf)")
+        if path:
+            self._app._config["last_report_dir"] = str(Path(path).parent); _save_config(self._app._config)
+        return path
+
+    def _make(self, sign: bool):
+        machine = self._machine.currentText(); kind = self._kind.currentData(); a, b = self._period()
+        if not self._recs:
+            QMessageBox.information(self, "Report", "There are no results in this period."); return
+        stem = f"DailyQA_{machine.replace(' ', '_')}_{kind}_{a:%Y%m%d}" + ("" if kind == "day" else f"-{b:%Y%m%d}")
+        physicist = self._app._physicist_combo.currentText()
+        comment = ""
+        if sign:
+            if QMessageBox.question(self, "Sign the report",
+                                    f"{physicist}\n\nconfirms having reviewed the {len(self._recs)} session(s) of {self._dr.label(kind, a, b)} on {machine}, and signs this report electronically?\n\n"
+                                    "(The physicist is the one chosen in the main window.)") != QMessageBox.StandardButton.Yes:
+                return
+            comment, ok = QInputDialog.getText(self, "Comment", "Comment for the report (optional):")
+            if not ok:
+                return
+        path = self._ask_path(stem + ("_signed.pdf" if sign else "_draft.pdf"))
+        if not path:
+            return
+        try:
+            so = self._dr.add_signoff(DB_PATH, machine, kind, a, b, physicist, comment, self._recs, Path(path).name) if sign else None
+            self._write(path, kind, a, b, machine, so)
+        except Exception as exc:
+            QMessageBox.critical(self, "Report error", f"{type(exc).__name__}: {exc}"); return
+        self._fill_signed()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))              # opens in the PDF viewer, from where it is printed
+
+    def _reprint(self, row, _col):
+        if not (0 <= row < len(self._signed_rows)):
+            return
+        so = self._signed_rows[row]
+        a, b = datetime.date.fromisoformat(so["start_date"]), datetime.date.fromisoformat(so["end_date"])
+        if not self._dr.still_matches(DB_PATH, so):
+            if QMessageBox.question(self, "Data changed", "The records of this period have changed since the report was signed, so the report printed now would not match what was signed.\n\n"
+                                    "Print it anyway (it will show the signed digest, which will no longer match)?") != QMessageBox.StandardButton.Yes:
+                return
+        path = self._ask_path(f"DailyQA_{so['machine_name'].replace(' ', '_')}_{so['kind']}_{a:%Y%m%d}_signed_{so['id']}.pdf")
+        if not path:
+            return
+        meta = {"id": so["id"], "physicist": so["physicist"], "signed_at": so["signed_at"], "comment": so["comment"], "n": so["n_sessions"], "digest": so["digest"]}
+        self._write(path, so["kind"], a, b, so["machine_name"], meta)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
 
 class WLApp(QMainWindow):
@@ -2103,6 +2313,12 @@ class WLApp(QMainWindow):
         self._trends_btn.setMinimumWidth(150)
         self._trends_btn.clicked.connect(self._show_trends)
         bottom_layout.addWidget(self._trends_btn)
+
+        self._history_btn = QPushButton("History / Reports")
+        self._history_btn.setMinimumWidth(150)
+        self._history_btn.setToolTip("Review the results of any day, week or month and print the report (draft, or signed by the physicist).")
+        self._history_btn.clicked.connect(lambda: HistoryDialog(self).exec())
+        bottom_layout.addWidget(self._history_btn)
 
         self._report_btn = QPushButton("Generate Daily Report (PDF)")
         self._report_btn.setMinimumWidth(230)
@@ -2848,7 +3064,18 @@ class WLApp(QMainWindow):
                     ir = {a: analyze_image(read_image(path)) for a, path in x.files.items()}
                     self._attach_logs_for(ir, machine)
                     r = compute_wl_results(ir, use_logs=self._use_logs_cb.isChecked())
-                    x.preview = {"displacement": r["max_2d_walk_mm"], "pass": r["pass_fail"], "logs": r["logs_used"]}
+                    mlc = [v["field_edges"].get("mlc_total_mm") for v in ir.values() if v.get("field_edges", {}).get("mlc_total_mm") is not None]
+                    jaw = [v["field_edges"].get("jaw_total_mm") for v in ir.values() if v.get("field_edges", {}).get("jaw_total_mm") is not None]
+                    pfm = None
+                    if x.pf:
+                        try:
+                            pfm = float(analyze_picket_fence(read_image(x.pf))["max_deviation_mm"])
+                        except Exception:
+                            pfm = None
+                    x.preview = {"displacement": r["max_2d_walk_mm"], "pass": r["pass_fail"], "logs": r["logs_used"],
+                                 "mlc": float(np.mean(mlc)) if mlc else None, "jaw": float(np.mean(jaw)) if jaw else None, "pf_max": pfm}
+                    for v in ir.values():
+                        v.pop("pixel_array", None)
                 except Exception:
                     x.preview = None
         except InterruptedError:

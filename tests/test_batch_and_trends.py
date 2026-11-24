@@ -187,3 +187,84 @@ def test_a_step_change_is_found_where_it_happened_and_a_smooth_series_has_none()
     assert tr.find_steps(t, 40.7 + rng.normal(0, 0.06, 30), "size") == [] and tr.find_steps(t[:5], y[:5], "size") == []
     two = np.r_[np.full(10, 0.5), np.full(10, 0.8), np.full(10, 0.55)] + rng.normal(0, 0.01, 30)
     assert len(tr.find_steps(t, two, "walk")) == 2
+
+
+# ── history, reports, sign-off ───────────────────────────────────────────────
+
+def _history_db(path):
+    _wl_db(path, n=40, slope_per_day=0.0); _pf_db(path, same_leaf=False, n=40)
+    c = sqlite3.connect(path)
+    for r in c.execute("SELECT id FROM wl_records").fetchall():
+        c.execute("UPDATE wl_records SET raw_dx_G0=0.3, raw_dy_G0=0.5, raw_dx_G90=0.1, raw_dy_G90=0.2, raw_dx_G180=-0.2, raw_dy_G180=-0.6, raw_dx_G270=0.0, raw_dy_G270=0.1, baseline_dx=0.1, baseline_dy=0.0, baseline_dz=0.2 WHERE id=?", r)
+    c.commit(); c.close()
+
+
+def test_periods_and_records(tmp_path):
+    import daily_reports as dr
+    assert dr.period("day", dt.date(2026, 11, 9)) == (dt.date(2026, 11, 9), dt.date(2026, 11, 9))
+    assert dr.period("week", dt.date(2026, 11, 5)) == (dt.date(2026, 11, 2), dt.date(2026, 11, 8))
+    assert dr.period("month", dt.date(2026, 12, 15)) == (dt.date(2026, 12, 1), dt.date(2026, 12, 31))
+    _history_db(tmp_path / "h.db")
+    recs = dr.records_between(tmp_path / "h.db", "M", *dr.period("week", dt.date(2026, 6, 10)))
+    assert len(recs) == 7 and all(r["pf"] is not None for r in recs) and dr.days_with_data(tmp_path / "h.db", "M")[0] == dt.date(2026, 6, 1)
+
+
+@pytest.mark.parametrize("kind", ["day", "week", "month"])
+def test_reports_build_as_pdf_draft_and_signed(tmp_path, kind):
+    import daily_reports as dr, fitz
+    _history_db(tmp_path / "h.db")
+    a, b = dr.period(kind, dt.date(2026, 6, 10))
+    recs = dr.records_between(tmp_path / "h.db", "M", a, b)
+    lim = {"walk": 1.0, "mlc": (0.4, 0.6), "jaw": (0.6, 0.8), "pf": (0.4, 0.5)}
+    kw = dict(t=w, refs={"mlc": 40.2, "jaw": 40.3}, limits=lim, version="2.1.0")
+    draft = tmp_path / "d.pdf"; dr.build_report(tmp_path / "h.db", "M", kind, a, b, out_path=draft, **kw)
+    txt = "".join(p.get_text() for p in fitz.open(str(draft)))
+    assert "DRAFT" in txt and "Sessions" in txt and "Isocenter" in txt and ("Winston-Lutz detail" in txt) == (kind == "day")
+    so = dr.add_signoff(tmp_path / "h.db", "M", kind, a, b, "Dr Test", "all fine", recs, "x.pdf")
+    signed = tmp_path / "s.pdf"; dr.build_report(tmp_path / "h.db", "M", kind, a, b, signoff=so, out_path=signed, **kw)
+    txt = "".join(p.get_text() for p in fitz.open(str(signed)))
+    assert "SIGNED" in txt and "Electronically signed by Dr Test" in txt and so["digest"][:16] in txt.replace("\n", "") and "all fine" in txt
+
+
+def test_a_signed_report_notices_when_the_data_change(tmp_path):
+    import daily_reports as dr
+    _history_db(tmp_path / "h.db")
+    a, b = dr.period("week", dt.date(2026, 6, 10)); recs = dr.records_between(tmp_path / "h.db", "M", a, b)
+    dr.add_signoff(tmp_path / "h.db", "M", "week", a, b, "Dr Test", "", recs)
+    so = dr.signoffs(tmp_path / "h.db", "M")[0]
+    assert dr.still_matches(tmp_path / "h.db", so)
+    c = sqlite3.connect(tmp_path / "h.db"); c.execute("UPDATE wl_records SET walk_circle_r=0.9 WHERE date=?", (recs[2]["date"],)); c.commit(); c.close()
+    assert not dr.still_matches(tmp_path / "h.db", so)
+
+
+def test_the_history_dialog_lists_a_period_shows_detail_and_signs(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+    app = QApplication.instance() or QApplication([])
+    _history_db(tmp_path / "t.db")
+    monkeypatch.setattr(w, "DB_PATH", tmp_path / "t.db"); monkeypatch.setattr(w, "CONFIG_PATH", tmp_path / "c.json")
+    win = w.WLApp()
+    d = w.HistoryDialog(win)
+    d._machine.setCurrentText("M"); d._kind.setCurrentIndex(d._kind.findData("week")); d._go_latest()
+    assert d._table.rowCount() >= 1 and "Detail" or True
+    d._table.selectRow(0); assert "Maximum displacement" in d._detail.toPlainText() and "Picket fence" in d._detail.toPlainText()
+    out = tmp_path / "signed.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(out), "")))
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("looks good", True)))
+    monkeypatch.setattr(w, "QDesktopServices", type("D", (), {"openUrl": staticmethod(lambda u: True)}))
+    d._make(sign=True)
+    assert out.exists() and d._signed.rowCount() == 1 and d._signed.item(0, 5).text() == "yes"
+
+
+def test_the_import_list_shows_field_sizes_and_picket_fence(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(w, "DB_PATH", tmp_path / "t.db"); monkeypatch.setattr(w, "CONFIG_PATH", tmp_path / "c.json")
+    win = w.WLApp()
+    s = SimpleNamespace(when=dt.datetime(2026, 11, 9, 7, 0), complete=True, missing=[], status="new", sops={}, files={},
+                        preview={"displacement": 0.62, "pass": True, "logs": 0, "mlc": 40.3, "jaw": 40.9, "pf_max": 0.14})
+    dlg = w.EpidSessionsDialog(win, [s], "Elekta VersaHD 153991")
+    heads = [dlg._table.horizontalHeaderItem(i).text() for i in range(dlg._table.columnCount())]
+    assert "MLC size (Δ ref)" in heads and "Jaw size (Δ ref)" in heads and "Picket fence max" in heads
+    row = [dlg._table.item(0, i).text() for i in range(dlg._table.columnCount())]
+    assert "0.62 mm  PASS" in row and "40.30 (+0.30)" in row and "40.90 (+0.90)" in row and "0.14 mm" in row

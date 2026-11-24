@@ -4,6 +4,17 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ---
 
+## v2.1.0 - 2026-11-24
+
+### Added
+- **History / Reports** (button in the main window): pick a machine and any day, week (Mon-Sun) or month; the sessions of that period are listed with their Winston-Lutz result, MLC and jaw size, picket fence and
+  machine-log use, and a selected session shows the per-angle residuals. **Draft report (PDF)** and **Review and sign report (PDF)** write a landscape report - summary, the trend lines (whole history up to the
+  end of the period, the period shaded, drifts and step changes marked), every session, and for a single day the per-angle detail and the picket-fence leaf errors - and open it for printing.
+  A signed report carries the physicist, the date and time, a comment and a SHA-256 digest of the data it covers; the sign-off is recorded in the history database (`report_signoffs`), listed in the dialog
+  with a check that the records are unchanged since signing (double-click prints it again).
+- The **Import all new sessions / EPID folder list** now shows the MLC size, jaw size (each with its difference from the reference) and the picket-fence maximum as well as the isocenter displacement
+  (the application always measured the field sizes and saved them for the trends; the list only displayed the isocenter result).
+
 ## v2.0.0 - 2026-11-24
 
 ### Packaging

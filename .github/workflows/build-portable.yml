@@ -36,7 +36,7 @@ jobs:
           Expand-Archive embed.zip -DestinationPath "$root\python"
           Set-Content "$root\python\python312._pth" @("python312.zip", ".", "..\site-packages", "..\app", "import site")
           python -m pip install --no-compile -c deploy/constraints.txt --target "$root\site-packages" -r requirements.txt
-          foreach ($f in "wl_qa_tool.py","wl_sources.py","iview_native.py","rllf_parser.py","daily_batch.py","daily_trends.py","rebuild_history.py","batch_generate_reports.py","icon.ico","icon.png","icon_512.png","README.md","CHANGELOG.md") { Copy-Item $f "$root\app\" }
+          foreach ($f in "wl_qa_tool.py","wl_sources.py","iview_native.py","rllf_parser.py","daily_batch.py","daily_trends.py","daily_reports.py","rebuild_history.py","batch_generate_reports.py","icon.ico","icon.png","icon_512.png","README.md","CHANGELOG.md") { Copy-Item $f "$root\app\" }
           Copy-Item deploy\portable\* $root\
           Get-ChildItem $root -Recurse -Directory -Include tests, __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
       - name: Smoke test (start the application window headless with the bundled Python)
@@ -47,7 +47,7 @@ jobs:
           $env:PYTHONNOUSERSITE = "1"
           $env:MPLBACKEND = "Agg"
           Push-Location "$root\app"
-          & "..\python\python.exe" -W ignore -c "import wl_qa_tool as w, daily_batch, daily_trends, wl_sources, iview_native; from PySide6.QtWidgets import QApplication; a = QApplication([]); win = w.WLApp(); print('window ok', w.APP_VERSION)"
+          & "..\python\python.exe" -W ignore -c "import wl_qa_tool as w, daily_batch, daily_trends, daily_reports, wl_sources, iview_native; from PySide6.QtWidgets import QApplication; a = QApplication([]); win = w.WLApp(); print('window ok', w.APP_VERSION)"
           if ($LASTEXITCODE -ne 0) { throw "the application did not start" }
           Pop-Location
           Remove-Item "$root\app\wl_qa_history.db", "$root\app\wl_qa_config.json" -ErrorAction SilentlyContinue
@@ -64,4 +64,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: DailyQA-portable.zip
-          name: Daily QA v2.0.0 (portable)
+          name: Daily QA ${{ github.ref_name }} (portable)

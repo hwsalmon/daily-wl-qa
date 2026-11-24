@@ -232,6 +232,20 @@ def leaf_text(c: dict) -> str:
 
 # ── figures ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+_CTX = {"shade": None, "compact": False}      # set by build(): shade the period reported, draw shorter figures (for the PDF reports)
+
+
+def _h(h: float) -> float:
+    return h * 0.62 if _CTX["compact"] else h
+
+
+def _shade(axes):
+    if _CTX["shade"]:
+        a, b = _CTX["shade"]
+        for ax in np.atleast_1d(axes):
+            ax.axvspan(dt.datetime.combine(a, dt.time(0)), dt.datetime.combine(b, dt.time(23, 59)), color="#fff176", alpha=0.18, zorder=0)
+
+
 def _style(fig, ax):
     fig.patch.set_facecolor("#111111")
     for a in np.atleast_1d(ax):
@@ -243,6 +257,14 @@ def _style(fig, ax):
 
 
 def _png(fig) -> bytes:
+    if _CTX["compact"]:                                        # smaller type and wrapped y labels for the PDF reports
+        import textwrap
+        for ax in fig.axes:
+            lab = ax.get_ylabel()
+            if lab:
+                ax.set_ylabel(textwrap.fill(lab, 26), fontsize=7)
+            ax.title.set_fontsize(8)
+            ax.xaxis.label.set_fontsize(7)
     buf = io.BytesIO()
     fig.savefig(buf, format="PNG", dpi=110, bbox_inches="tight", facecolor="#111111")
     import matplotlib.pyplot as plt
@@ -285,7 +307,7 @@ def md_num(x):
 
 def fig_walk(wl, tol):
     import matplotlib.pyplot as plt
-    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True, gridspec_kw={"height_ratios": [1.15, 1]})
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, _h(7.4)), sharex=True, gridspec_kw={"height_ratios": [1.15, 1]})
     _style(fig, [a1, a2])
     t = [r["when"] for r in wl]; y = [r["walk_circle_r"] for r in wl]
     d = drift(t, y, "walk")
@@ -307,7 +329,7 @@ def fig_walk(wl, tol):
     a2.set_ylabel("Raw SI offset: void minus field centre (mm)"); a2.axhline(0, color="#777", lw=0.8)
     a2.set_title("Where the offset sits at each gantry angle (a step or slope in one angle = a shift of that part of the machine, or of the phantom)", fontsize=9)
     _legend(a2, loc="upper left", ncol=4)
-    _dates(a2, fig); fig.tight_layout()
+    _shade([a1, a2]); _dates(a2, fig); fig.tight_layout()
     return _png(fig), d
 
 
@@ -316,7 +338,7 @@ def fig_size(wl, kind, ref, warn, fail, label):
     col = "avg_mlc_mm" if kind == "mlc" else "avg_jaw_mm"
     rows = [r for r in wl if r.get(col) is not None]
     t = [r["when"] for r in rows]; y = [r[col] - ref for r in rows]
-    fig, ax = plt.subplots(figsize=(11, 5.2)); _style(fig, ax)
+    fig, ax = plt.subplots(figsize=(11, _h(5.2))); _style(fig, ax)
     d = drift(t, y, "size") if rows else drift([dt.datetime.now()], [])
     ax.axhline(0, color="#999", lw=1)
     for lv, c, nm in ((warn, AMB, "warn"), (fail, RED, "fail")):
@@ -331,13 +353,13 @@ def fig_size(wl, kind, ref, warn, fail, label):
         sd = float(np.std(y, ddof=1)) if len(y) > 1 else 0.0
         ax.text(0.99, 0.03, f"mean {np.mean(y):+.3f} mm   scatter (SD) {sd:.3f} mm   range {min(y):+.2f} to {max(y):+.2f}", transform=ax.transAxes, ha="right", color="white", fontsize=9)
     ax.set_ylabel(f"{label} size minus reference (mm)"); ax.set_title(f"{label} field size: variation from the reference ({ref:.2f} mm)", fontsize=11, fontweight="bold")
-    _legend(ax, loc="upper left"); _dates(ax, fig); fig.tight_layout()
+    _legend(ax, loc="upper left"); _shade(ax); _dates(ax, fig); fig.tight_layout()
     return _png(fig), d
 
 
 def fig_pf(pf, warn, tol):
     import matplotlib.pyplot as plt
-    fig, (a1, a2, a3) = plt.subplots(3, 1, figsize=(11, 9.4), sharex=True, gridspec_kw={"height_ratios": [1.1, 0.8, 1]}); _style(fig, [a1, a2, a3])
+    fig, (a1, a2, a3) = plt.subplots(3, 1, figsize=(11, _h(9.4)), sharex=True, gridspec_kw={"height_ratios": [1.1, 0.8, 1]}); _style(fig, [a1, a2, a3])
     t = [r["when"] for r in pf]; mx = [r["max_dev_mm"] for r in pf]; rms = [r["rms_dev_mm"] for r in pf]
     tl = [np.nan if r["tilt"] is None else r["tilt"] for r in pf]
     d = drift(t, mx, "pf")
@@ -354,7 +376,7 @@ def fig_pf(pf, warn, tol):
     sc = a2.scatter(t, ys, c=dev, cmap="coolwarm", vmin=-max(0.3, np.nanmax(np.abs(dev))), vmax=max(0.3, np.nanmax(np.abs(dev))), s=46, edgecolors="white", linewidths=0.5)
     cb = fig.colorbar(sc, ax=a2, pad=0.01); cb.set_label("worst leaf's signed error (mm)", color="white", fontsize=8); cb.ax.tick_params(colors="white", labelsize=7)
     a2.set_ylabel("Worst leaf (index along y)"); a2.set_title("Which leaf was the worst, each day, before taking the tilt out (a horizontal line of dots = the same leaf every time)", fontsize=9)
-    _dates(a2, fig); fig.tight_layout()
+    _shade([a1, a2, a3]); _dates(a2, fig); fig.tight_layout()
     return _png(fig), d
 
 
@@ -380,10 +402,13 @@ def fig_leaf(c):
 
 # ── entry point ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def build(db_path, machine: str, key: str, refs: dict, limits: dict) -> dict:
+def build(db_path, machine: str, key: str, refs: dict, limits: dict, until=None, shade=None, compact: bool = False) -> dict:
     """{'png': bytes | None, 'summary': str, 'headers': [...], 'rows': [[..., colour]]}. `refs` = {'mlc': mm, 'jaw': mm}; `limits` = {'walk': tol, 'mlc': (warn, fail), 'jaw': (warn, fail), 'pf': (warn, fail)}."""
     data = load(db_path, machine)
     wl, pf = data["wl"], data["pf"]
+    if until is not None:                                      # the history up to the end of a reported period
+        wl = [r for r in wl if r["when"].date() <= until]; pf = [r for r in pf if r["when"].date() <= until]
+    _CTX["shade"], _CTX["compact"] = shade, compact
     out = {"png": None, "summary": "", "headers": [], "rows": []}
     if key == "walk":
         if not wl:
