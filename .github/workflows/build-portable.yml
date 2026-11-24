@@ -1,0 +1,67 @@
+name: Build Windows portable package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Qt runtime libraries (offscreen)
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libglib2.0-0
+      - run: pip install -c deploy/constraints.txt -r requirements.txt pytest
+      - run: QT_QPA_PLATFORM=offscreen python -m pytest tests -q
+
+  portable:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Assemble the portable package (embedded Python + libraries + application)
+        shell: pwsh
+        run: |
+          $root = "DailyQA-portable"
+          New-Item -ItemType Directory -Force -Path "$root\python", "$root\site-packages", "$root\app" | Out-Null
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip" -OutFile embed.zip
+          Expand-Archive embed.zip -DestinationPath "$root\python"
+          Set-Content "$root\python\python312._pth" @("python312.zip", ".", "..\site-packages", "..\app", "import site")
+          python -m pip install --no-compile -c deploy/constraints.txt --target "$root\site-packages" -r requirements.txt
+          foreach ($f in "wl_qa_tool.py","wl_sources.py","iview_native.py","rllf_parser.py","daily_batch.py","daily_trends.py","rebuild_history.py","batch_generate_reports.py","icon.ico","icon.png","icon_512.png","README.md","CHANGELOG.md") { Copy-Item $f "$root\app\" }
+          Copy-Item deploy\portable\* $root\
+          Get-ChildItem $root -Recurse -Directory -Include tests, __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Smoke test (start the application window headless with the bundled Python)
+        shell: pwsh
+        run: |
+          $root = "DailyQA-portable"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:PYTHONNOUSERSITE = "1"
+          $env:MPLBACKEND = "Agg"
+          Push-Location "$root\app"
+          & "..\python\python.exe" -W ignore -c "import wl_qa_tool as w, daily_batch, daily_trends, wl_sources, iview_native; from PySide6.QtWidgets import QApplication; a = QApplication([]); win = w.WLApp(); print('window ok', w.APP_VERSION)"
+          if ($LASTEXITCODE -ne 0) { throw "the application did not start" }
+          Pop-Location
+          Remove-Item "$root\app\wl_qa_history.db", "$root\app\wl_qa_config.json" -ErrorAction SilentlyContinue
+          Remove-Item "$root\app\*cache.json" -ErrorAction SilentlyContinue
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path DailyQA-portable -DestinationPath DailyQA-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DailyQA-portable
+          path: DailyQA-portable.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DailyQA-portable.zip
+          name: Daily QA v2.0.0 (portable)

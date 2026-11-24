@@ -6,6 +6,9 @@ All notable changes to the Daily WL QA Tool are documented here.
 
 ## v2.0.0 - 2026-11-24
 
+### Packaging
+- **Self-contained Windows release** (`DailyQA-portable.zip`, built by GitHub Actions on every `v*` tag): embedded Python and every library, no installation or internet; `start-daily-qa.bat`, `backup-data.bat`, `README-portable.txt`. The build runs the tests, then starts the application window headless with the bundled Python before it zips.
+
 ### Added - bulk import and new trend analysis (2026-11-24)
 - **Import all new sessions** (Check EPID Folder > list): analyses and saves every new complete session (Winston-Lutz record, field sizes, picket fence) without opening each one. One session at
   a time and each in its own try/except, so a bad session is reported and the run goes on; cancelable; resumable (saved sessions are registered and never analysed twice); image arrays are dropped as
