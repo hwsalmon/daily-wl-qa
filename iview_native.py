@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -268,10 +269,42 @@ def is_native_folder(folder) -> bool:
         return False
 
 
-def scan_native(folder, cache_dir=None, progress=None) -> list[NativeDS]:
-    """Every img_ folder under `folder`, oldest first, each labelled 'WL' / 'PF' / '' from the image (cached when cache_dir is given)."""
+def walk_tree(folder, since=None):
+    """(files, dirs, newest): every entry under `folder` as (path, mtime, size). With `since`, only folders changed at or after it are entered (adding a file or folder
+    changes its parent's time, so unchanged folders hold nothing new) and only files at or after it are listed. `newest` is the latest time seen. Uses scandir: one
+    directory read per folder, no per-file round trip on a network share."""
+    files, dirs, newest, stack = [], [], 0.0, [str(folder)]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    st = e.stat()
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                newest = max(newest, st.st_mtime)
+                if is_dir:
+                    dirs.append((Path(e.path), st.st_mtime, 0))
+                    if since is None or st.st_mtime >= since:
+                        stack.append(e.path)
+                elif since is None or st.st_mtime >= since:
+                    files.append((Path(e.path), st.st_mtime, st.st_size))
+    return files, dirs, newest
+
+
+def scan_native(folder, cache_dir=None, progress=None, since=None, tree=None) -> list[NativeDS]:
+    """Every img_ folder under `folder`, oldest first, each labelled 'WL' / 'PF' / '' from the image (cached when cache_dir is given). With `since`, only folders
+    changed since then are looked at; `tree` is a walk_tree result already made by the caller (saves a second walk)."""
     folder = Path(folder)
-    dirs = sorted(p for p in ([folder] if folder.name.lower().startswith("img_") else folder.rglob("*")) if p.is_dir() and p.name.lower().startswith("img_"))
+    if folder.name.lower().startswith("img_"):
+        dirs = [folder]
+    else:
+        dirs = sorted(p for p, m, _ in (tree[1] if tree else walk_tree(folder, since)[1]) if p.name.lower().startswith("img_") and (since is None or m >= since))
     cache_file = Path(cache_dir) / CACHE_NAME if cache_dir else None
     try:
         cache = json.loads(cache_file.read_text()) if cache_file else {}
@@ -302,7 +335,8 @@ def scan_native(folder, cache_dir=None, progress=None) -> list[NativeDS]:
         out.append(ds)
     if cache_file:
         try:
-            cache_file.write_text(json.dumps(fresh))
+            cache.update(fresh)                         # keep what other folders (and earlier, older scans) learned
+            cache_file.write_text(json.dumps(cache))
         except OSError:
             pass
     out.sort(key=lambda d: (d.when, d.seq or 0))

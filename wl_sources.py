@@ -95,42 +95,80 @@ class Session:
         return f"{self.patient}|{self.when:%Y%m%d%H%M%S}"
 
 
-def scan_epid_folder(folder: str | Path, cache_dir: Path, progress=None, max_files: int = 200000) -> list[Session]:
-    """All Daily WL sessions found under `folder` (newest first). `progress(i, n)` is called while headers are read."""
+STATE_NAME = "epid_scan_state.json"
+SAFETY_S = 3 * 86400            # folders changed within 3 days before the last mark are looked at again (late images, clock differences)
+
+
+def _state(cache_dir) -> dict:
+    try:
+        return json.loads((Path(cache_dir) / STATE_NAME).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def scan_mark(folder, cache_dir) -> float | None:
+    """The time before which everything in `folder` has been handled (None = never scanned, or the scan must be complete)."""
+    return (_state(cache_dir).get(str(folder)) or {}).get("mark")
+
+
+def save_scan_mark(folder, cache_dir, sessions, newest: float, since_ok: bool = True) -> None:
+    """Remember how far this folder has been dealt with: the newest file seen, but never beyond the oldest session still waiting (new or incomplete),
+    so what is not yet imported is offered again next time. Everything older is skipped by the next scan."""
+    mark = newest
+    for x in sessions:
+        if x.status == "new":
+            for p in list(x.files.values()) + ([x.pf] if x.pf else []):
+                try:
+                    mark = min(mark, Path(p).stat().st_mtime)
+                except OSError:
+                    mark = min(mark, 0.0)
+    st = _state(cache_dir)
+    st[str(folder)] = {"mark": mark, "saved": dt.datetime.now().isoformat(timespec="seconds")}
+    try:
+        (Path(cache_dir) / STATE_NAME).write_text(json.dumps(st))
+    except OSError:
+        pass
+
+
+def scan_epid_folder(folder: str | Path, cache_dir: Path, progress=None, max_files: int = 200000, since: float | None = None) -> list[Session]:
+    """All Daily WL sessions found under `folder` (newest first). `progress(i, n)` is called while headers are read.
+    `since` (see scan_mark): look only at folders and files changed at or after `since` - the rest was imported already; None reads everything.
+    The newest file time seen is left in `scan_epid_folder.newest` for save_scan_mark."""
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"EPID folder not found: {folder}")
+    import iview_native
+    cut = None if since is None else since - SAFETY_S
+    tree = iview_native.walk_tree(folder, cut)
+    scan_epid_folder.newest = tree[2]
     cache_file = Path(cache_dir) / CACHE_NAME
     try:
         cache = json.loads(cache_file.read_text())
     except (OSError, ValueError):
         cache = {}
-    files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() not in (".jpg", ".jpeg", ".xml", ".rllf")][:max_files]
+    files = [(p, m, sz) for p, m, sz in tree[0] if p.suffix.lower() not in (".jpg", ".jpeg", ".xml", ".rllf")][:max_files]
     heads: list[tuple[Path, dict]] = []
     fresh = {}
-    for i, p in enumerate(files):
+    for i, (p, mt, sz) in enumerate(files):
         if progress and i % 25 == 0:
             progress(i, len(files))
-        try:
-            st = p.stat()
-        except OSError:
-            continue
         key = str(p)
         c = cache.get(key)
-        if c and c.get("m") == st.st_mtime and c.get("s") == st.st_size:
+        if c and c.get("m") == mt and c.get("s") == sz:
             h = c.get("h")
         else:
-            h = read_header(p) if st.st_size > 10_000 else None
-        fresh[key] = {"m": st.st_mtime, "s": st.st_size, "h": h}
+            h = read_header(p) if sz > 10_000 else None
+        fresh[key] = {"m": mt, "s": sz, "h": h}
         if h:
             heads.append((p, h))
     try:
-        cache_file.write_text(json.dumps(fresh))
+        cache.update(fresh)                                       # earlier, older files stay known
+        cache_file.write_text(json.dumps(cache))
     except OSError:
         pass
     try:                                                           # native iView exports (img_<uid> folders): classified from the image, no patient id
         import iview_native
-        for d in iview_native.scan_native(folder, cache_dir):
+        for d in iview_native.scan_native(folder, cache_dir, since=cut, tree=tree):
             if d.kind in ("wl", "pf"):
                 heads.append((d.folder, {"sop": d.SOPInstanceUID, "patient": "", "label": "WL" if d.kind == "wl" else "PF", "series": "",
                                          "gantry": float(d.GantryAngle), "when": d.when.isoformat()}))

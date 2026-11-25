@@ -13,7 +13,8 @@ First use
 
 Your data
   The history database (wl_qa_history.db) and settings (wl_qa_config.json) are kept in the  app  folder, beside the program. To update to a newer version, unzip it to a NEW folder and copy
-  those two files into its  app  folder (or unzip over the old folder: the zip contains neither file). backup-data.bat copies both to a dated folder.
+  those two files - and epid_scan_cache.json, native_scan_cache.json and epid_scan_state.json, which remember what was already read from the EPID folder (without them the next check
+  reads the whole folder again) - into its  app  folder. Easiest: unzip over the old folder; the zip contains none of these files. backup-data.bat copies both to a dated folder.
 
 Pass / fail
   Winston-Lutz: the largest displacement of any beam from the isocenter (after the static phantom offset is removed) must be 1.0 mm or less (TG-198 / MPPG, SRS). Change TOLERANCE_MM in app\wl_qa_tool.py for other limits.

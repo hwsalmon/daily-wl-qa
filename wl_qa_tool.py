@@ -31,11 +31,11 @@ try:
         QComboBox, QTabWidget, QFrame, QDialog, QScrollArea,
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
         QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
-        QHeaderView, QDoubleSpinBox, QListWidget, QListWidgetItem,
+        QHeaderView, QTreeWidget, QTreeWidgetItem, QDoubleSpinBox, QListWidget, QListWidgetItem,
         QLineEdit, QInputDialog, QStackedWidget, QCheckBox, QProgressDialog, QFormLayout, QGroupBox, QDateEdit, QTextEdit,
     )
     from PySide6.QtCore import Qt, QDate, QUrl
-    from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush, QDesktopServices
+    from PySide6.QtGui import QPixmap, QIcon, QColor, QBrush, QDesktopServices, QFont
 except ImportError:
     _missing.append("PySide6")
 
@@ -121,7 +121,7 @@ MACHINE_NAME = "Elekta Versa HD"
 PHANTOM_NAME = "Standard Imaging MIMI"
 
 APP_NAME = "Daily QA - WL - DLG - Picket Fence"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 MACHINES = [
     "Elekta VersaHD 153991",
@@ -1651,87 +1651,129 @@ def _apply_dark_theme(app: QApplication) -> None:
 
 
 class EpidSessionsDialog(QDialog):
-    """New Daily WL sessions found in the EPID folder: open one for review (it is then saved to the history with its report as usual), or set it aside."""
+    """New Daily WL sessions found in the EPID folder, grouped by day. Review each session in the main window (images, results, report), one after another, or import them all."""
 
     def __init__(self, parent, sessions, machine):
         super().__init__(parent)
         self._app, self._machine = parent, machine
         self._all = sessions
         self.setWindowTitle(f"EPID folder — {machine}")
-        self.resize(760, 460)
+        self.resize(980, 560)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Daily WL sessions found in the EPID folder. Open one to analyse it (then save the report as usual), or set it aside."))
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lay.addWidget(self._summary)
+        lay.addWidget(QLabel("Sessions are grouped by day. Select one and open it to review its images and results and to save its report; "
+                             "\"Review next\" in the main window then steps through the rest."))
         self._show_done = QCheckBox("Show sessions already processed or set aside")
         self._show_done.toggled.connect(self._fill)
         lay.addWidget(self._show_done)
-        self._table = QTableWidget(0, 8)
-        self._table.setHorizontalHeaderLabels(["Date / time", "Images", "Max displacement", "MLC size (Δ ref)", "Jaw size (Δ ref)", "Picket fence max", "Machine log", "Status"])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SingleSelection)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.cellDoubleClicked.connect(lambda *_: self._open())
-        lay.addWidget(self._table, 1)
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(8)
+        self._tree.setHeaderLabels(["Day / session", "Images", "Max displacement", "MLC size (Δ ref)", "Jaw size (Δ ref)", "Picket fence max", "Machine log", "Status"])
+        self._tree.header().setSectionResizeMode(QHeaderView.Stretch)
+        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self._tree.setRootIsDecorated(True)
+        self._tree.itemDoubleClicked.connect(lambda *_: self._open())
+        lay.addWidget(self._tree, 1)
         row = QHBoxLayout()
         b_all = QPushButton("Import all new sessions…"); b_all.clicked.connect(self._import_all)
         b_all.setToolTip("Analyse and save every new, complete session in the list (no report PDFs): the Winston-Lutz record, field sizes and the picket fence go into the trend history. "
                          "Can be stopped and resumed; sessions that cannot be analysed reliably are listed and left here for review.")
         b_open = QPushButton("Open selected"); b_open.clicked.connect(self._open)
-        b_skip = QPushButton("Set aside"); b_skip.setToolTip("Do not offer this session again"); b_skip.clicked.connect(self._skip)
+        b_open.setToolTip("Analyse the selected session (or the first of the selected day) and show it in the main window.")
+        b_rep = QPushButton("Open and save report…"); b_rep.clicked.connect(lambda: self._open(report=True))
+        b_rep.setToolTip("Open the selected session and go straight to saving its report (which also records it in the history).")
+        b_skip = QPushButton("Set aside"); b_skip.setToolTip("Do not offer this session (or every session of the selected day) again"); b_skip.clicked.connect(self._skip)
         b_close = QPushButton("Close"); b_close.clicked.connect(self.reject)
-        row.addWidget(b_all); row.addWidget(b_open); row.addWidget(b_skip); row.addStretch(); row.addWidget(b_close)
+        for wdg in (b_all, b_open, b_rep, b_skip):
+            row.addWidget(wdg)
+        row.addStretch(); row.addWidget(b_close)
         lay.addLayout(row)
         self._fill()
 
     def _rows(self):
         return [x for x in self._all if self._show_done.isChecked() or x.status == "new"]
 
+    def _days(self):
+        out = {}
+        for x in sorted(self._rows(), key=lambda x: x.when):
+            out.setdefault(x.when.date(), []).append(x)
+        return out
+
     def _fill(self, *_):
-        rows = self._rows()
-        self._table.setRowCount(len(rows))
-        for i, x in enumerate(rows):
-            imgs = "4 of 4" if x.complete else f"{4 - len(x.missing)} of 4 (missing G{', G'.join(str(a) for a in x.missing)})"
-            refs = self._app._get_field_refs(self._machine)
-            lvl = lambda dev, warn, fail: "#66bb6a" if abs(dev) <= warn else "#ffa726" if abs(dev) <= fail else "#ef5350"
-            colors_ = {}
-            if x.preview:
-                p_ = x.preview
-                res = f"{p_['displacement']:.2f} mm  {'PASS' if p_['pass'] else 'FAIL'}"
-                logs = f"{p_['logs']} of 4 images"
-                mlc = "—" if p_.get("mlc") is None else f"{p_['mlc']:.2f} ({p_['mlc'] - refs['mlc']:+.2f})"
-                jaw = "—" if p_.get("jaw") is None else f"{p_['jaw']:.2f} ({p_['jaw'] - refs['jaw']:+.2f})"
-                pfm = "—" if p_.get("pf_max") is None else f"{p_['pf_max']:.2f} mm"
-                colors_ = {2: "#66bb6a" if p_["pass"] else "#ef5350"}
-                if p_.get("mlc") is not None:
-                    colors_[3] = lvl(p_["mlc"] - refs["mlc"], FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
-                if p_.get("jaw") is not None:
-                    colors_[4] = lvl(p_["jaw"] - refs["jaw"], FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
-                if p_.get("pf_max") is not None:
-                    colors_[5] = "#66bb6a" if p_["pf_max"] < PF_WARN_MM else "#ffa726" if p_["pf_max"] < PF_TOLERANCE_MM else "#ef5350"
-            else:
-                res = logs = mlc = jaw = pfm = "—"
-            for c, t in enumerate((f"{x.when:%Y-%m-%d  %H:%M}", imgs, res, mlc, jaw, pfm, logs, x.status)):
-                it = QTableWidgetItem(t)
-                if c in colors_:
-                    it.setForeground(QBrush(QColor(colors_[c])))
-                self._table.setItem(i, c, it)
-        if rows:
-            self._table.selectRow(0)
+        self._tree.clear()
+        refs = self._app._get_field_refs(self._machine)
+        lvl = lambda dev, warn, fail: "#66bb6a" if abs(dev) <= warn else "#ffa726" if abs(dev) <= fail else "#ef5350"
+        days = self._days()
+        n_new = sum(1 for x in self._all if x.status == "new")
+        self._summary.setText(f"{n_new} new session(s) on {len([d for d, v in days.items() if any(x.status == 'new' for x in v)])} day(s) — {self._machine}")
+        bold = QFont(); bold.setBold(True)
+        for day, xs in days.items():
+            prev = [x.preview for x in xs if x.preview]
+            worst = max((p["displacement"] for p in prev), default=None)
+            head = QTreeWidgetItem([f"{day:%a %Y-%m-%d}  ({len(xs)})", "", "—" if worst is None else f"worst {worst:.2f} mm", "", "", "", "", ""])
+            for c in range(8):
+                head.setFont(c, bold)
+            if worst is not None:
+                head.setForeground(2, QBrush(QColor("#66bb6a" if worst <= TOLERANCE_MM else "#ef5350")))
+            head.setData(0, Qt.ItemDataRole.UserRole, None)
+            self._tree.addTopLevelItem(head)
+            for x in xs:
+                imgs = "4 of 4" if x.complete else f"{4 - len(x.missing)} of 4 (missing G{', G'.join(str(a) for a in x.missing)})"
+                colors_ = {}
+                if x.preview:
+                    p_ = x.preview
+                    res = f"{p_['displacement']:.2f} mm  {'PASS' if p_['pass'] else 'FAIL'}"
+                    logs = f"{p_['logs']} of 4 images"
+                    mlc = "—" if p_.get("mlc") is None else f"{p_['mlc']:.2f} ({p_['mlc'] - refs['mlc']:+.2f})"
+                    jaw = "—" if p_.get("jaw") is None else f"{p_['jaw']:.2f} ({p_['jaw'] - refs['jaw']:+.2f})"
+                    pfm = "—" if p_.get("pf_max") is None else f"{p_['pf_max']:.2f} mm"
+                    colors_ = {2: "#66bb6a" if p_["pass"] else "#ef5350"}
+                    if p_.get("mlc") is not None:
+                        colors_[3] = lvl(p_["mlc"] - refs["mlc"], FIELD_SIZE_WARN_MM, FIELD_SIZE_FAIL_MM)
+                    if p_.get("jaw") is not None:
+                        colors_[4] = lvl(p_["jaw"] - refs["jaw"], FIELD_SIZE_JAW_WARN_MM, FIELD_SIZE_JAW_FAIL_MM)
+                    if p_.get("pf_max") is not None:
+                        colors_[5] = "#66bb6a" if p_["pf_max"] < PF_WARN_MM else "#ffa726" if p_["pf_max"] < PF_TOLERANCE_MM else "#ef5350"
+                else:
+                    res = logs = mlc = jaw = pfm = "—"
+                it = QTreeWidgetItem([f"{x.when:%H:%M}", imgs, res, mlc, jaw, pfm, logs, x.status])
+                it.setData(0, Qt.ItemDataRole.UserRole, x)
+                for c, col in colors_.items():
+                    it.setForeground(c, QBrush(QColor(col)))
+                head.addChild(it)
+            head.setExpanded(True)
+        first = next((self._tree.topLevelItem(i).child(0) for i in range(self._tree.topLevelItemCount()) if self._tree.topLevelItem(i).childCount()), None)
+        if first is not None:
+            self._tree.setCurrentItem(first)
+
+    def _sessions_of(self, item):
+        """The session of a session row, or all the sessions of a day row."""
+        if item is None:
+            return []
+        x = item.data(0, Qt.ItemDataRole.UserRole)
+        if x is not None:
+            return [x]
+        return [item.child(i).data(0, Qt.ItemDataRole.UserRole) for i in range(item.childCount())]
 
     def _current(self):
-        r = self._table.currentRow()
-        rows = self._rows()
-        return rows[r] if 0 <= r < len(rows) else None
+        xs = self._sessions_of(self._tree.currentItem())
+        return xs[0] if xs else None
 
-    def _open(self):
+    def _open(self, report=False):
         x = self._current()
         if x is None:
             return
         if not x.complete:
             QMessageBox.information(self, "Incomplete session", f"This session has no image at G{', G'.join(str(a) for a in x.missing)}.")
             return
+        queue = sorted((y for y in self._all if y.status == "new" and y.complete), key=lambda y: y.when)
         self.accept()
-        self._app._open_epid_session(x)
+        self._app._open_epid_session(x, queue=queue, sessions=self._all)
+        if report:
+            self._app._generate_report()
 
     def _import_all(self):
         new = [x for x in self._all if x.status == "new"]
@@ -1746,17 +1788,20 @@ class EpidSessionsDialog(QDialog):
         import wl_sources
         conn = sqlite3.connect(DB_PATH); done = wl_sources.processed_sops(conn); conn.close()
         wl_sources.classify(self._all, done)
+        self._app._save_epid_mark(self._all)
         self._fill()
 
     def _skip(self):
-        x = self._current()
-        if x is None:
+        xs = self._sessions_of(self._tree.currentItem())
+        if not xs:
             return
         import wl_sources
         conn = sqlite3.connect(DB_PATH)
-        wl_sources.mark(conn, x.sops.values(), self._machine, "skipped")
+        for x in xs:
+            wl_sources.mark(conn, x.sops.values(), self._machine, "skipped")
+            x.status = "skipped"
         conn.close()
-        x.status = "skipped"
+        self._app._save_epid_mark(self._all)
         self._fill()
 
 
@@ -1797,6 +1842,10 @@ class HistoryDialog(QDialog):
         self._signed.setMaximumHeight(150)
         lay.addWidget(self._signed)
         row = QHBoxLayout()
+        b_open = QPushButton("Open selected session in the application"); b_open.clicked.connect(self._open_in_app)
+        b_open.setToolTip("Re-analyse the selected session's images and show them in the main window (images, per-angle results, field sizes, picket fence), as when it was first imported. "
+                          "The images are found in the machine's EPID folder; if they are not there you are asked for the folder.")
+        row0 = QHBoxLayout(); row0.addWidget(b_open); row0.addStretch(); lay.addLayout(row0)
         b_draft = QPushButton("Draft report (PDF)…"); b_sign = QPushButton("Review and sign report (PDF)…"); b_close = QPushButton("Close")
         b_draft.setToolTip("An unsigned report for the period shown, saved as a PDF and opened for printing.")
         b_sign.setToolTip("The physicist confirms having reviewed the period; the PDF carries the signature, the date and time and a digest of the data, and the sign-off is recorded.")
@@ -1807,6 +1856,7 @@ class HistoryDialog(QDialog):
         self._kind.currentIndexChanged.connect(self._refresh); self._date.dateChanged.connect(self._refresh)
         self._prev.clicked.connect(lambda: self._shift(-1)); self._next.clicked.connect(lambda: self._shift(1)); self._latest.clicked.connect(self._go_latest)
         self._table.itemSelectionChanged.connect(self._show_detail)
+        self._table.cellDoubleClicked.connect(lambda *_: self._open_in_app())
         self._signed.cellDoubleClicked.connect(self._reprint)
         self._recs = []
         self._go_latest()
@@ -1887,6 +1937,31 @@ class HistoryDialog(QDialog):
             lines.append(f"Picket fence: max {pf['max_dev_mm']:.3f} mm, RMS {pf['rms_dev_mm']:.3f} mm, worst leaf {pf['worst_leaf']} ({pf['worst_dev_mm']:+.3f} mm), tilt along the picket "
                          + ("—" if pf.get("tilt") is None else f"{pf['tilt']:+.2f} mm"))
         self._detail.setPlainText("\n".join(lines))
+
+    def _open_in_app(self):
+        """Load the selected stored session into the main window by re-analysing its images."""
+        r = self._table.currentRow()
+        if not (0 <= r < len(self._recs)):
+            QMessageBox.information(self, "Open session", "Select a session in the list first."); return
+        rec, machine = self._recs[r], self._machine.currentText()
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            sess = self._app._find_session_images(machine, rec["when"])
+        finally:
+            self.unsetCursor()
+        if sess is None:
+            QMessageBox.information(self, "Images not found",
+                                    f"The images of the {rec['when']:%Y-%m-%d %H:%M} session were not found in the EPID folder of {machine}.\n\n"
+                                    "Choose the folder that holds them (the session folder, or any folder above it).")
+            folder = QFileDialog.getExistingDirectory(self, "Folder with the session's images", self._app._config.get("last_dicom_dir", str(Path.home())))
+            if not folder:
+                return
+            self.accept()
+            self._app._machine_combo.setCurrentText(machine)
+            self._app._process_directory(folder, f"{machine}: {rec['when']:%Y-%m-%d %H:%M}")
+            return
+        self.accept()
+        self._app._open_epid_session(sess)
 
     def _fill_signed(self):
         rows = self._dr.signoffs(DB_PATH, self._machine.currentText())
@@ -2021,10 +2096,28 @@ class WLApp(QMainWindow):
         self._epid_btn = QPushButton("Check EPID Folder")
         self._epid_btn.setMinimumWidth(180)
         self._epid_btn.setToolTip("Search this machine's EPID folder (Settings > Data Folders) for Daily WL sessions not processed yet")
-        self._epid_btn.clicked.connect(self._check_epid_folder)
+        self._epid_btn.clicked.connect(lambda: self._check_epid_folder())
         top_layout.addWidget(self._epid_btn)
+        self._epid_full_btn = QPushButton("Full Rescan")
+        self._epid_full_btn.setToolTip("Read the whole EPID folder again, not only what is newer than the last check (slow on a network drive; only needed if images were added out of order).")
+        self._epid_full_btn.clicked.connect(lambda: self._check_epid_folder(full=True))
+        top_layout.addWidget(self._epid_full_btn)
 
         main_layout.addWidget(top_bar)
+
+        self._queue, self._queue_cur, self._queue_all = [], None, None
+        self._queue_bar = QWidget()
+        qb = QHBoxLayout(self._queue_bar); qb.setContentsMargins(0, 0, 0, 0)
+        self._queue_label = QLabel(""); self._queue_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4fc3f7;")
+        self._queue_prev = QPushButton("◀ Previous session"); self._queue_next = QPushButton("Review next session ▶"); b_list = QPushButton("Back to the list")
+        self._queue_prev.clicked.connect(lambda: self._queue_step(-1)); self._queue_next.clicked.connect(lambda: self._queue_step(1)); b_list.clicked.connect(self._queue_list)
+        for wdg in (self._queue_label,):
+            qb.addWidget(wdg)
+        qb.addStretch()
+        for wdg in (self._queue_prev, self._queue_next, b_list):
+            qb.addWidget(wdg)
+        self._queue_bar.setVisible(False)
+        main_layout.addWidget(self._queue_bar)
 
         # ── Selector bar ──────────────────────────────────────────────────────
         sel_bar = QWidget()
@@ -3018,7 +3111,14 @@ class WLApp(QMainWindow):
 
     # ── EPID folder ───────────────────────────────────────────────────────────
 
-    def _check_epid_folder(self):
+    def _save_epid_mark(self, sessions):
+        """Remember how far the EPID folder has been dealt with, so the next check reads only what is newer."""
+        import wl_sources
+        folder, newest = getattr(self, "_epid_scanned", (None, None))
+        if folder and newest:
+            wl_sources.save_scan_mark(folder, APP_DIR, sessions, newest)
+
+    def _check_epid_folder(self, full=False):
         import wl_sources
         machine = self._machine_combo.currentText()
         folder = self._machine_folders(machine).get("epid", "")
@@ -3027,7 +3127,9 @@ class WLApp(QMainWindow):
                                     f"No EPID image folder is set for {machine}.\n\nOpen Settings > Data Folders to set it?") == QMessageBox.StandardButton.Yes:
                 self._show_settings(tab="folders")
             return
-        prog = QProgressDialog("Reading the EPID folder...", "Cancel", 0, 100, self)
+        conn = sqlite3.connect(DB_PATH); wl_sources.init_registry(conn); n_done = len(wl_sources.processed_sops(conn, machine)); conn.close()
+        since = None if (full is True or not n_done) else wl_sources.scan_mark(folder, APP_DIR)      # nothing imported yet, or a full check asked for: read everything
+        prog = QProgressDialog("Reading the EPID folder..." if since is None else "Looking for images newer than the last check...", "Cancel", 0, 100, self)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
         prog.setMinimumDuration(0)
         cancelled = []
@@ -3041,7 +3143,8 @@ class WLApp(QMainWindow):
                 cancelled.append(1)
                 raise InterruptedError()
         try:
-            sessions = wl_sources.scan_epid_folder(folder, APP_DIR, progress=lambda i, n: _p(i, n, f"Reading image headers... {i} of {n}"))
+            sessions = wl_sources.scan_epid_folder(folder, APP_DIR, since=since, progress=lambda i, n: _p(i, n, f"Reading image headers... {i} of {n}"))
+            self._epid_scanned = (folder, getattr(wl_sources.scan_epid_folder, "newest", None))
         except InterruptedError:
             prog.close(); return
         except Exception as exc:
@@ -3054,9 +3157,10 @@ class WLApp(QMainWindow):
         for x in sessions:
             x.machine = machine
         wl_sources.classify(sessions, done)
+        self._save_epid_mark(sessions)
         new = [x for x in sessions if x.status == "new"]
         # quick result for the newest complete new sessions, so the list shows what each one would give
-        todo = [x for x in new if x.complete][:12]
+        todo = [x for x in new if x.complete][:40]
         try:
             for k, x in enumerate(todo):
                 _p(k, len(todo), f"Analysing new session {k + 1} of {len(todo)} ({x.when:%Y-%m-%d %H:%M})...")
@@ -3083,7 +3187,8 @@ class WLApp(QMainWindow):
         prog.close()
         if not new:
             QMessageBox.information(self, "EPID folder",
-                                    f"No new Daily WL sessions in\n{folder}\n\n({len(sessions)} session(s) found, all already processed or set aside.)")
+                                    f"No new Daily WL sessions in\n{folder}\n\n" + ("(Only images newer than the last check were read; use Full Rescan to read the whole folder.)" if since is not None
+                                                                                  else f"({len(sessions)} session(s) found, all already processed or set aside.)"))
             return
         if len(new) == 1 and new[0].complete:
             self._open_epid_session(new[0])
@@ -3131,13 +3236,65 @@ class WLApp(QMainWindow):
         except Exception:
             pass
 
-    def _open_epid_session(self, sess):
+    def _find_session_images(self, machine, when, tol_min=10):
+        """The EPID-folder session nearest to `when` (same day, within `tol_min` minutes), or None; used to reopen a stored result."""
         import wl_sources
+        folder = self._machine_folders(machine).get("epid", "")
+        if not folder or not Path(folder).is_dir():
+            return None
+        try:
+            sessions = wl_sources.scan_epid_folder(folder, APP_DIR, since=when.timestamp() - 86400)
+        except Exception:
+            return None
+        cand = [x for x in sessions if x.complete and x.when.date() == when.date() and abs((x.when - when).total_seconds()) <= tol_min * 60
+                and PATIENT_ID_MACHINE_MAP.get(x.patient, machine) == machine]
+        if not cand:
+            return None
+        best = min(cand, key=lambda x: abs((x.when - when).total_seconds()))
+        best.machine = machine
+        return best
+
+    def _open_epid_session(self, sess, queue=None, sessions=None):
+        import wl_sources
+        if queue is not None:
+            self._queue, self._queue_all = list(queue), sessions
+        elif not getattr(self, "_queue", None) or sess not in self._queue:
+            self._queue, self._queue_all = [], None
+        self._queue_cur = sess
+        if sess.machine:
+            self._machine_combo.setCurrentText(sess.machine)
         old = getattr(self, "_staged_dir", None)
         self._staged_dir = str(wl_sources.stage_session(sess))
         self._process_directory(self._staged_dir, f"EPID: {sess.when:%Y-%m-%d %H:%M}  ({sess.machine})")
         if old:
             shutil.rmtree(old, ignore_errors=True)
+        self._update_queue_bar()
+
+    def _update_queue_bar(self):
+        q, cur = getattr(self, "_queue", []), getattr(self, "_queue_cur", None)
+        if not q or cur not in q:
+            self._queue_bar.setVisible(False); return
+        i = q.index(cur)
+        self._queue_label.setText(f"Reviewing new session {i + 1} of {len(q)}:  {cur.when:%a %Y-%m-%d %H:%M}"
+                                  + ("" if cur.status == "new" else f"   ({cur.status})"))
+        self._queue_prev.setEnabled(i > 0); self._queue_next.setEnabled(i < len(q) - 1)
+        self._queue_bar.setVisible(True)
+
+    def _queue_step(self, n):
+        q, cur = getattr(self, "_queue", []), getattr(self, "_queue_cur", None)
+        if q and cur in q and 0 <= q.index(cur) + n < len(q):
+            self._open_epid_session(q[q.index(cur) + n])
+
+    def _queue_list(self):
+        """Back to the grouped list of sessions found in the EPID folder."""
+        sessions = getattr(self, "_queue_all", None)
+        if not sessions:
+            return
+        import wl_sources
+        conn = sqlite3.connect(DB_PATH); done = wl_sources.processed_sops(conn); conn.close()
+        wl_sources.classify(sessions, done)
+        self._queue = []; self._update_queue_bar()
+        EpidSessionsDialog(self, sessions, self._machine_combo.currentText()).exec()
 
     def _refresh_pf_display(self):
         """Update PF banner, stats card, and figure tab from self._pf_results."""
@@ -3366,7 +3523,15 @@ class WLApp(QMainWindow):
             _save_to_db(self._wl_results, self._image_results, machine, physicist, when=_when, pf_results=self._pf_results)
             QMessageBox.information(self, "Report Saved", f"Report saved to:\n{save_path}")
         except Exception as exc:
-            QMessageBox.critical(self, "Report Error", str(exc))
+            QMessageBox.critical(self, "Report Error", str(exc)); return
+        cur, q = getattr(self, "_queue_cur", None), getattr(self, "_queue", [])
+        if q and cur in q:
+            cur.status = "processed"
+            rest = [y for y in q[q.index(cur) + 1:] if y.status == "new"]
+            if rest and QMessageBox.question(self, "Next session", f"{len(rest)} more new session(s) to review.\n\nOpen the next one ({rest[0].when:%a %Y-%m-%d %H:%M})?") == QMessageBox.StandardButton.Yes:
+                self._open_epid_session(rest[0])
+            else:
+                self._update_queue_bar()
 
     # ── Settings dialog ──────────────────────────────────────────────────────
 

@@ -265,7 +265,85 @@ def test_the_import_list_shows_field_sizes_and_picket_fence(tmp_path, monkeypatc
     s = SimpleNamespace(when=dt.datetime(2026, 11, 9, 7, 0), complete=True, missing=[], status="new", sops={}, files={},
                         preview={"displacement": 0.62, "pass": True, "logs": 0, "mlc": 40.3, "jaw": 40.9, "pf_max": 0.14})
     dlg = w.EpidSessionsDialog(win, [s], "Elekta VersaHD 153991")
-    heads = [dlg._table.horizontalHeaderItem(i).text() for i in range(dlg._table.columnCount())]
+    heads = [dlg._tree.headerItem().text(i) for i in range(dlg._tree.columnCount())]
     assert "MLC size (Δ ref)" in heads and "Jaw size (Δ ref)" in heads and "Picket fence max" in heads
-    row = [dlg._table.item(0, i).text() for i in range(dlg._table.columnCount())]
+    day = dlg._tree.topLevelItem(0); assert "2026-11-09" in day.text(0) and "(1)" in day.text(0)
+    ch = day.child(0)
+    row = [ch.text(i) for i in range(dlg._tree.columnCount())]
     assert "0.62 mm  PASS" in row and "40.30 (+0.30)" in row and "40.90 (+0.90)" in row and "0.14 mm" in row
+
+
+def test_sessions_are_grouped_by_day_and_reviewed_in_turn(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(w, "DB_PATH", tmp_path / "t.db"); monkeypatch.setattr(w, "CONFIG_PATH", tmp_path / "c.json")
+    win = w.WLApp()
+    mk = lambda d, h: SimpleNamespace(when=dt.datetime(2026, 11, d, h, 0), complete=True, missing=[], status="new", sops={}, files={}, machine="M", preview=None)
+    ss = [mk(24, 7), mk(23, 7), mk(23, 8), mk(25, 7)]
+    dlg = w.EpidSessionsDialog(win, ss, "M")
+    assert dlg._tree.topLevelItemCount() == 3
+    assert [dlg._tree.topLevelItem(i).childCount() for i in range(3)] == [2, 1, 1]
+    opened = []
+    monkeypatch.setattr(win, "_process_directory", lambda *a, **k: opened.append(a))
+    monkeypatch.setattr("wl_sources.stage_session", lambda s: tmp_path)
+    dlg._tree.setCurrentItem(dlg._tree.topLevelItem(0))             # a day row opens its first session
+    dlg._open()
+    assert opened and win._queue_bar.isVisibleTo(win) and "1 of 4" in win._queue_label.text()
+    win._queue_step(1); assert "2 of 4" in win._queue_label.text()
+    win._queue_step(1); win._queue_step(1); assert "4 of 4" in win._queue_label.text() and not win._queue_next.isEnabled()
+
+
+def test_history_opens_the_selected_session_in_the_application(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    import wl_sources
+    app = QApplication.instance() or QApplication([])
+    _history_db(tmp_path / "t.db")
+    monkeypatch.setattr(w, "DB_PATH", tmp_path / "t.db"); monkeypatch.setattr(w, "CONFIG_PATH", tmp_path / "c.json")
+    win = w.WLApp()
+    epid = tmp_path / "epid"; epid.mkdir()
+    monkeypatch.setattr(win, "_machine_folders", lambda m=None: {"epid": str(epid)})
+    d = w.HistoryDialog(win)
+    d._machine.setCurrentText("M"); d._kind.setCurrentIndex(d._kind.findData("day")); d._go_latest()
+    d._table.selectRow(d._table.rowCount() - 1)
+    when = d._recs[d._table.currentRow()]["when"]
+    near = SimpleNamespace(when=when + dt.timedelta(minutes=2), complete=True, patient="", machine="")
+    far = SimpleNamespace(when=when + dt.timedelta(hours=3), complete=True, patient="", machine="")
+    monkeypatch.setattr(wl_sources, "scan_epid_folder", lambda *a, **k: [far, near])
+    assert win._find_session_images("M", when) is near and near.machine == "M"
+    assert win._find_session_images("M", when + dt.timedelta(days=1)) is None
+    opened = []
+    monkeypatch.setattr(win, "_open_epid_session", lambda s: opened.append(s))
+    d._open_in_app()
+    assert opened == [near]
+
+
+def test_epid_check_reads_only_what_is_newer_than_the_last_mark(tmp_path):
+    import os, time, iview_native as inn, wl_sources as ws
+    root = tmp_path / "epid"; old = root / "2026-06-01"; new = root / "2026-06-20"
+    old.mkdir(parents=True); new.mkdir()
+    f_old, f_new = old / "a.dcm", new / "b.dcm"
+    f_old.write_bytes(b"x"); f_new.write_bytes(b"y")
+    t_old, t_new = time.time() - 60 * 86400, time.time() - 10 * 86400
+    for p, t in ((f_old, t_old), (f_new, t_new), (old, t_old), (new, t_new)):
+        os.utime(p, (t, t))
+    os.utime(root, (t_new, t_new))
+    files, dirs, newest = inn.walk_tree(root)
+    assert {p.name for p, *_ in files} == {"a.dcm", "b.dcm"} and abs(newest - t_new) < 2
+    files, dirs, _ = inn.walk_tree(root, since=t_new - ws.SAFETY_S)
+    assert {p.name for p, *_ in files} == {"b.dcm"}                 # the old day folder is not even read
+    # the mark stays behind a session that is still waiting, and moves on once nothing waits
+    f = tmp_path / "f.dcm"; f.write_bytes(b"z"); os.utime(f, (t_old, t_old))
+    waiting = SimpleNamespace(status="new", files={0: f}, pf=None)
+    ws.save_scan_mark(root, tmp_path, [waiting], t_new)
+    assert abs(ws.scan_mark(root, tmp_path) - t_old) < 2
+    waiting.status = "processed"
+    ws.save_scan_mark(root, tmp_path, [waiting], t_new)
+    assert abs(ws.scan_mark(root, tmp_path) - t_new) < 2
+
+
+def test_scan_caches_keep_older_entries(tmp_path):
+    import json, iview_native as inn
+    (tmp_path / "c").mkdir(); (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / inn.CACHE_NAME).write_text(json.dumps({"elsewhere": {"m": 1, "s": 1, "kind": "wl"}}))
+    inn.scan_native(tmp_path / "c", tmp_path / "cache")
+    assert "elsewhere" in json.loads((tmp_path / "cache" / inn.CACHE_NAME).read_text())

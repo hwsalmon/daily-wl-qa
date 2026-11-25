@@ -1,3 +1,8 @@
+## v2.2.0 - 2026-11-25
+- Check EPID Folder reads only what is new: folders and files older than the last check are skipped (a mark is kept in epid_scan_state.json, held back behind any session still waiting). "Full Rescan" reads everything.
+- The native-image scan cache no longer loses earlier entries when another folder is scanned (this made later checks slow).
+- Sessions found are grouped by day; review them in turn with Previous / Next, open and report each one; History can reopen a stored session in the main window.
+
 # Changelog
 
 All notable changes to the Daily WL QA Tool are documented here.
